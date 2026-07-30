@@ -195,6 +195,18 @@ PYTHONPATH=src python3 -m coordinate \
   --base-branch main
 ```
 
+为该 workspace 注册 agent 所在 host 的执行路径映射；request preflight 会据此构建 fail-closed
+execution context：
+
+```bash
+PYTHONPATH=src python3 -m coordinate \
+  --db data/coordinator.sqlite3 \
+  workspace host-profile set mac-smoke \
+  --host-id mac \
+  --workspace-path "$PWD" \
+  --harness-root "$SMOKE_HARNESS_ROOT"
+```
+
 注册 agentd。这还会创建同 id 的 `agentd` runner profile：
 
 ```bash
