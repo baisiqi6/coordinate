@@ -720,7 +720,8 @@ class RuntimeBindingIntegrationTests(unittest.TestCase):
         self.assertEqual(result.job["runner_profile_id"], "mac-omp")
         self.assertTrue(binding["binding_id"].startswith("sha256:"))
 
-    def test_legacy_untyped_submit_has_null_binding(self):
+    def test_legacy_untyped_submit_omits_binding_field(self):
+        """A2: legacy untyped job payload must omit executor_binding entirely."""
         register_agent(self.conn, agent_id="mac-claude", host_id="mac", capabilities={})
         result = submit_request(
             self.conn,
@@ -730,7 +731,7 @@ class RuntimeBindingIntegrationTests(unittest.TestCase):
             origin={"platform": "discord", "destination": "ch", "message_id": "m1", "session_scope_id": "discord:test"},
             reply={"platform": "discord", "destination": "ch"},
         )
-        self.assertIsNone(result.job["payload"]["executor_binding"])
+        self.assertNotIn("executor_binding", result.job["payload"])
 
     def test_replay_returns_same_binding_when_unchanged(self):
         origin = {"platform": "discord", "destination": "ch", "message_id": "m1", "session_scope_id": "discord:test"}
@@ -795,6 +796,7 @@ class RuntimeBindingIntegrationTests(unittest.TestCase):
         result = claim_job(self.conn, agent_id="mac-omp")
         self.assertTrue(result.claimed)
         self.assertEqual(result.job["status"], "running")
+        self.assertIsInstance(result.to_dict()["execution_lease"], dict)
 
     def test_claim_rejects_binding_mismatch(self):
         result = submit_request(

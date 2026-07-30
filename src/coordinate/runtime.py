@@ -121,8 +121,9 @@ class RuntimeClaimResult:
             "claimed": self.claimed,
             "attempt_token": self.attempt_token,
             "execution_context": self.execution_context,
-            "execution_lease": self.execution_lease,
         }
+        if self.execution_lease is not None:
+            result["execution_lease"] = self.execution_lease
         if self.reason is not None:
             result["reason"] = self.reason
         if self.oldest_blocked_job_id is not None:
@@ -927,6 +928,15 @@ def _submit_exact_request(
                 job_id=job_id,
                 job_worktree_path=worktree_path,
             )
+            job_payload: dict[str, Any] = {
+                "prompt": prompt,
+                "origin": origin,
+                "reply": reply,
+                "request_event_id": event.row["id"],
+                "execution_context": ctx.to_dict(),
+            }
+            if executor_binding is not None:
+                job_payload["executor_binding"] = executor_binding
             job = create_job(
                 conn,
                 workspace_id=workspace_id,
@@ -934,14 +944,7 @@ def _submit_exact_request(
                 runner_profile_id=runner_profile_id,
                 assigned_agent=target_agent,
                 worktree_path=worktree_path,
-                payload={
-                    "prompt": prompt,
-                    "origin": origin,
-                    "reply": reply,
-                    "request_event_id": event.row["id"],
-                    "execution_context": ctx.to_dict(),
-                    "executor_binding": executor_binding,
-                },
+                payload=job_payload,
                 job_id=job_id,
                 commit=False,
             )

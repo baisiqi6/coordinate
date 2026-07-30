@@ -169,6 +169,7 @@ class RuntimeServiceTests(unittest.TestCase):
         self.assertTrue(first.claimed)
         self.assertEqual(first.job["status"], "running")
         self.assertEqual(first.job["attempt_count"], 1)
+        self.assertNotIn("execution_lease", first.to_dict())
         self.assertFalse(second.claimed)
         self.assertIsNone(second.job)
         events = [row_to_dict(row) for row in list_events(self.conn, "demo")]
@@ -1269,6 +1270,7 @@ class RoutedRuntimeTests(unittest.TestCase):
         self._routed_request()
         claim = claim_job(self.conn, agent_id="mac-omp")
         self.assertTrue(claim.claimed)
+        self.assertIsInstance(claim.to_dict()["execution_lease"], dict)
         events = [row_to_dict(e) for e in list_events(self.conn, "demo")]
         claimed = [e for e in events if e["event_type"] == "job.claimed"]
         self.assertEqual(len(claimed), 1)
