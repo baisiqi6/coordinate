@@ -10,6 +10,34 @@ scripts/harness/harnessctl doctor
 scripts/harness/harnessctl session-init
 ```
 
+## 本地 fresh install
+
+标准安装步骤：
+
+```bash
+git clone https://github.com/baisiqi6/coordinate.git
+cd coordinate
+python3 -m venv .venv
+
+# macOS / Linux
+source .venv/bin/activate
+
+# Windows
+.venv\Scripts\activate
+
+pip install .
+```
+
+安装后 console script 位于：
+
+- macOS / Linux：`.venv/bin/coordinate`
+- Windows：`.venv\Scripts\coordinate.exe`
+
+该绝对路径可直接作为 MultiNexus 的 `coordinator_cli_path` 使用；对应的
+`coordinator_db_path` 必须是同一宿主机可访问的绝对 SQLite 路径，不可被多台宿主机共享。
+
+---
+
 ## 新 Workspace 初始化顺序
 
 1. 在 coordinator 中注册 workspace：`workspace add <id> --path ... --harness-root ...`
@@ -173,6 +201,10 @@ CI 说明：没有配置 GitHub checks 的开放 PR 是 pending 状态。此时
 其他非 JSON 失败仍然 fail closed。
 
 ## Runtime Bridge / Agentd 冒烟验证
+
+本地 fresh install 后使用 `.venv/bin/coordinate`（Windows：`.venv\Scripts\coordinate.exe`）
+作为 CLI。以下示例按源码模式 `PYTHONPATH=src python3 -m coordinate` 给出，开发 worktree
+中两者等价。
 
 Phase 7 运行时命令为以下链路提供第一个 CLI 形态的服务边界：
 

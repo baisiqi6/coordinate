@@ -74,6 +74,41 @@ PYTHONPATH=src python3 -m coordinate runtime --help
 PYTHONPATH=src python3 -m coordinate assignment --help
 ```
 
+## 本地安装（fresh install）
+
+标准 Coordinate 安装只需克隆仓库、创建虚拟环境并从仓库根目录安装：
+
+```bash
+git clone https://github.com/baisiqi6/coordinate.git
+cd coordinate
+python3 -m venv .venv
+
+# macOS / Linux
+source .venv/bin/activate
+
+# Windows
+.venv\Scripts\activate
+
+pip install .
+```
+
+安装完成后，console script `coordinate` 会被写入虚拟环境：
+
+- macOS / Linux：`.venv/bin/coordinate`
+- Windows：`.venv\Scripts\coordinate.exe`
+
+**把该绝对可执行路径原样填到 MultiNexus 的 `coordinator_cli_path`**，例如：
+
+```toml
+agentd_mode = true
+coordinator_cli_path = "/absolute/path/to/coordinate/.venv/bin/coordinate"
+coordinator_db_path = "/absolute/path/to/coordinate/data/coordinator.sqlite3"
+```
+
+- `coordinator_db_path` 必须是**绝对路径**，并且只能由当前这台宿主机上的进程访问；
+- 不要把本地 SQLite 文件挂载给多台宿主机共享，也不要使用相对路径依赖运行时当前目录；
+- 多宿主机部署通常通过受控 wrapper 调用 Coordinate；本地 console script 路径仅用于同一宿主机的直接运行。
+
 ## 本地开发
 
 ```bash
