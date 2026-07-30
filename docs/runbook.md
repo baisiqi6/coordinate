@@ -180,6 +180,21 @@ Phase 7 运行时命令为以下链路提供第一个 CLI 形态的服务边界�
 bridge -> coordinate -> agentd
 ```
 
+> 前置条件：真实项目应先完成上文[新 Workspace 初始化顺序](#新-workspace-初始化顺序)。以下最小
+> runtime smoke 只注册 `mac-smoke` workspace，并为必填的 harness root 使用临时目录；它不替代
+> `workspace init-harness`，也不把临时目录当作长期项目状态。
+
+```bash
+mkdir -p data
+SMOKE_HARNESS_ROOT="$(mktemp -d)"
+PYTHONPATH=src python3 -m coordinate \
+  --db data/coordinator.sqlite3 \
+  workspace add mac-smoke \
+  --path "$PWD" \
+  --harness-root "$SMOKE_HARNESS_ROOT" \
+  --base-branch main
+```
+
 注册 agentd。这还会创建同 id 的 `agentd` runner profile：
 
 ```bash
