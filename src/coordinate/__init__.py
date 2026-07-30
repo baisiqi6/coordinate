@@ -1,3 +1,3 @@
 """Local durable coordinator for file-backed multi-agent harness projects."""
 
-__version__ = "0.1.2"
+__version__ = "0.1.3"

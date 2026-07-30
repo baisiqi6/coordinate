@@ -218,7 +218,9 @@ PYTHONPATH=src python3 -m coordinate \
   --capabilities-json '{"models":["codex"]}'
 ```
 
-提交规范化的 bridge 请求：
+提交规范化的 bridge 请求。non-task request 必须携带 bounded、稳定、可跨消息复用的
+session scope；同一 Discord channel 的连续消息应复用同一个 scope。本示例与
+`destination=channel-1` 对齐：
 
 ```bash
 PYTHONPATH=src python3 -m coordinate \
@@ -226,7 +228,7 @@ PYTHONPATH=src python3 -m coordinate \
   runtime request submit mac-smoke \
   --target-agent mac-codex \
   --prompt "hello from bridge" \
-  --origin-json '{"platform":"discord","destination":"channel-1","message_id":"msg-1"}' \
+  --origin-json '{"platform":"discord","destination":"channel-1","message_id":"msg-1","session_scope_id":"discord:channel-1"}' \
   --reply-json '{"platform":"discord","destination":"channel-1"}'
 ```
 
