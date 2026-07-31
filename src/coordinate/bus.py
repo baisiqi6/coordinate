@@ -252,7 +252,13 @@ def pump_deliveries(
         recover_sending_deliveries(conn, platform=platform)
     pending = list_deliveries(conn, status="pending", platform=platform)
     retryable_failed = list_deliveries(conn, status="failed", platform=platform)
-    retryable = (pending + retryable_failed)[:limit]
+    retryable = pending + retryable_failed
+    if platform is None:
+        # ``none`` is a durable audit sink used when another component already
+        # delivered the visible reply.  An unscoped transport pump must not
+        # treat those ledger rows as sendable work.
+        retryable = [delivery for delivery in retryable if delivery["platform"] != "none"]
+    retryable = retryable[:limit]
     sent_count = 0
     failed_count = 0
     results: list[dict[str, Any]] = []

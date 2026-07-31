@@ -131,6 +131,10 @@ $MAC worker delivery --platform stdout --once --limit 20
 $MAC worker delivery --platform stdout --interval 5 --limit 20
 ```
 
+`delivery list` 不带过滤器时列出完整 ledger，因此也可能包含
+`platform=none,status=pending` 的 audit-only 记录。判断可发送 backlog 时同时指定
+`--status` 与 transport `--platform`；不要把 `none` 记录计入积压。
+
 ## Runtime: Executor / Capacity
 
 ```bash

@@ -39,17 +39,19 @@ $MAC runtime job claim --agent-id AGENT_ID --recoverable --recovery-reason '...'
 
 ```bash
 $MAC policy pump-events --workspace-id WORKSPACE --platform stdout --destination local
-$MAC delivery list --status pending
+$MAC delivery list --status pending --platform stdout
 ```
 
 如果事件类型不受支持，policy pump 会跳过它。
+查询真实 backlog 时始终指定目标 transport platform。`platform=none,status=pending`
+是“可见回复已由其他组件发送”的 durable audit record，不是待发送消息。
 
 ## Delivery 失败
 
 运行：
 
 ```bash
-$MAC delivery list --status failed
+$MAC delivery list --status failed --platform stdout
 $MAC worker delivery --platform stdout --once
 ```
 

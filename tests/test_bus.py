@@ -115,6 +115,53 @@ class BusTests(unittest.TestCase):
         self.assertEqual(result.sent, 2)
         self.assertEqual([delivery["status"] for delivery in deliveries], ["sent", "sent", "pending"])
 
+    def test_unscoped_pump_skips_none_platform_audit_delivery(self):
+        conn = self.make_conn()
+        audit, _ = create_delivery(
+            conn,
+            platform="none",
+            destination="channel-1",
+            message_key="demo:audit:1",
+            payload={"text": "already delivered by bridge"},
+        )
+        visible, _ = create_delivery(
+            conn,
+            platform="stdout",
+            destination="local",
+            message_key="demo:message:1",
+            payload={"text": "send me"},
+        )
+
+        result = pump_deliveries(conn, bus=StdoutBus(io.StringIO()))
+
+        deliveries = {
+            row["id"]: row_to_dict(row)
+            for row in list_deliveries(conn)
+        }
+        self.assertEqual(result.processed, 1)
+        self.assertEqual(result.sent, 1)
+        self.assertEqual(deliveries[audit["id"]]["status"], "pending")
+        self.assertEqual(deliveries[audit["id"]]["attempt_count"], 0)
+        self.assertEqual(deliveries[visible["id"]]["status"], "sent")
+
+    def test_explicit_none_platform_pump_still_fails_closed(self):
+        conn = self.make_conn()
+        audit, _ = create_delivery(
+            conn,
+            platform="none",
+            destination="channel-1",
+            message_key="demo:audit:1",
+            payload={"text": "already delivered by bridge"},
+        )
+
+        with self.assertRaisesRegex(BusError, "unsupported bus platform: none"):
+            pump_deliveries(conn, platform="none")
+
+        delivery = row_to_dict(list_deliveries(conn)[0])
+        self.assertEqual(delivery["id"], audit["id"])
+        self.assertEqual(delivery["status"], "pending")
+        self.assertEqual(delivery["attempt_count"], 0)
+
     def test_pump_retries_failed_deliveries_until_dead(self):
         conn = self.make_conn()
         row, _ = create_delivery(

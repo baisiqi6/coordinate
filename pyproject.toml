@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "coordinate"
-version = "0.1.5"
+version = "0.1.6"
 description = "Deterministic coordination kernel and durable control plane for multi-agent harness systems"
 readme = "README.md"
 license = { file = "LICENSE" }
