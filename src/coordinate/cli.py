@@ -126,6 +126,7 @@ from .planning_cli import (
     handle_plan_approve,
     handle_plan_reject,
     handle_plan_review_request,
+    handle_plan_revise,
     handle_task_create,
     handle_task_create_files,
     handle_task_create_record,

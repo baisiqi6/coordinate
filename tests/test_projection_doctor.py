@@ -2559,6 +2559,7 @@ class AdditionalRequiredChecksTest(ProjectionDoctorTestBase):
             self.assertEqual(f.severity, SEVERITY_ERROR)
 
     def test_non_split_record_event_includes_full_plan_sha256_and_supersedes(self):
+        from coordinate.db import upsert_task_mirror
         from coordinate.onboarding import create_plan_task_record
         conn = self._make_conn()
         with tempfile.TemporaryDirectory() as tmp:
@@ -2566,6 +2567,24 @@ class AdditionalRequiredChecksTest(ProjectionDoctorTestBase):
             plan = Path(tmp, "plans", "plan.md")
             plan.parent.mkdir(parents=True, exist_ok=True)
             plan.write_bytes(b"# v1\n")
+            # The revision entry requires a pre-registered mirror (U2: it must
+            # never create DB-only tasks); register it explicitly first.
+            upsert_task_mirror(
+                conn,
+                workspace_id="demo",
+                task_id="task-ns",
+                phase="ready",
+                owner=None,
+                branch=None,
+                pr=None,
+                payload={
+                    "task_id": "task-ns",
+                    "title": "Task NS",
+                    "plan_doc": str(plan),
+                    "absolute_plan_doc": str(plan.resolve()),
+                    "status": "ready",
+                },
+            )
             create_plan_task_record(
                 conn,
                 workspace_id="demo",

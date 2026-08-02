@@ -21,7 +21,11 @@ from .db import (
 from .doctor import diagnose_workspace
 from .harness import HarnessAdapter, HarnessError
 from .onboarding import init_file_harness, init_full_harness
-from .reconcile import reconcile_workspace
+from .reconcile import (
+    ReconcileConflictError,
+    ReconcileTaskNotFoundError,
+    reconcile_workspace,
+)
 
 
 # Compatibility aliases so handlers read like the originals.
@@ -285,7 +289,16 @@ def handle_reconcile(args: argparse.Namespace) -> int:
         if workspace is None:
             print(f"error: unknown workspace: {args.workspace_id}", file=sys.stderr)
             return 1
-        result = reconcile_workspace(conn, workspace, refresh=not args.no_refresh)
+        try:
+            result = reconcile_workspace(
+                conn,
+                workspace,
+                refresh=not args.no_refresh,
+                task_id=args.task_id,
+            )
+        except (ReconcileTaskNotFoundError, ReconcileConflictError) as exc:
+            print(f"error: {exc}", file=sys.stderr)
+            return 1
     _print_json({"reconciliation": result.to_dict()})
     return 0
 
@@ -394,4 +407,5 @@ def register_reconcile_command(subcommands) -> None:
     reconcile = subcommands.add_parser("reconcile", help="Sync coordinator task mirror from harness state")
     reconcile.add_argument("workspace_id")
     reconcile.add_argument("--no-refresh", action="store_true", help="Read state without running harnessctl state")
+    reconcile.add_argument("--task-id", help="Reconcile only this task mirror (targeted); full reconcile when omitted")
     reconcile.set_defaults(handler=handle_reconcile)

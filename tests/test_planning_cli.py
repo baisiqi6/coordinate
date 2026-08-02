@@ -17,12 +17,14 @@ from types import SimpleNamespace
 from unittest.mock import Mock, patch
 
 import argparse
+import sqlite3
 
 import coordinate.cli
 import coordinate.planning_cli
 from coordinate.cli import build_parser, main
 from coordinate.db import append_event, initialize, upsert_task_mirror, upsert_workspace
 from coordinate.planning_cli import (
+    handle_plan_revise,
     handle_task_handoff,
     register_operator_command,
     register_planning_commands,
@@ -42,6 +44,7 @@ MOVED_HANDLER_NAMES = frozenset(
         "handle_task_create_record",
         "handle_task_handoff",
         "handle_plan_review_request",
+        "handle_plan_revise",
         "handle_plan_approve",
         "handle_plan_reject",
         "handle_operator_pending",
@@ -56,6 +59,7 @@ PLANNING_LEAF_PATHS = {
     "task create-record",
     "task handoff",
     "plan review-request",
+    "plan revise",
     "plan approve",
     "plan reject",
     "operator pending",
@@ -229,7 +233,7 @@ class PlanningRegistrationTests(unittest.TestCase):
         parser = build_parser()
         handlers = self._leaf_handlers(parser)
         planning_handlers = {p: h for p, h in handlers.items() if p in PLANNING_LEAF_PATHS}
-        self.assertEqual(len(planning_handlers), 10)
+        self.assertEqual(len(planning_handlers), 11)
         for path, handler in planning_handlers.items():
             with self.subTest(path=path):
                 self.assertEqual(handler.__module__, "coordinate.planning_cli")
@@ -554,6 +558,194 @@ class PlanningBehaviorTests(unittest.TestCase):
             self.assertIn("pending_actions", payload)
             self.assertIn("snapshot", payload)
             self.assertIsNotNone(payload["snapshot"]["task_mirror_updated_at"])
+
+
+class PlanReviseTests(unittest.TestCase):
+    """Behavior of the plan revise entry (no-operation revision branch)."""
+
+    def run_cli(self, *args):
+        code, stdout, _ = self.run_cli_raw(*args)
+        return code, json.loads(stdout)
+
+    def run_cli_raw(self, *args):
+        stdout = io.StringIO()
+        stderr = io.StringIO()
+        with contextlib.redirect_stdout(stdout), contextlib.redirect_stderr(stderr):
+            code = main(list(args))
+        return code, stdout.getvalue(), stderr.getvalue()
+
+    def _setup_workspace(self, tmp, db_path):
+        self.run_cli(
+            "--db", db_path,
+            "workspace", "add", "demo",
+            "--path", tmp,
+            "--harness-root", tmp,
+        )
+
+    def _create_split_task(self, tmp, db_path, task_id="phase-001"):
+        """File half (create-files) + DB half (create-record); return (plan, operation_id, record_payload)."""
+        plan = Path(tmp) / "plan.md"
+        plan.write_text("# Plan v1\n", encoding="utf-8")
+        checklist = Path(tmp) / "mvp-checklist.json"
+        checklist.write_text(
+            json.dumps({"project": "demo", "harness_root": ".", "version": 1, "updated_at": "2026-07-13", "items": []}),
+            encoding="utf-8",
+        )
+        operation_id = str(uuid.uuid4())
+        _, files_payload = self.run_cli(
+            "--db", ":memory:",
+            "task", "create-files",
+            "--workspace-path", tmp,
+            "--harness-root", tmp,
+            "--workspace-id", "demo",
+            "--operation-id", operation_id,
+            "--task-id", task_id,
+            "--plan-doc", "plan.md",
+            "--title", "Phase 001",
+        )
+        files = files_payload["result"]
+        code, payload = self.run_cli(
+            "--db", db_path,
+            "task", "create-record", "demo",
+            "--operation-id", operation_id,
+            "--input-fingerprint", files["input_fingerprint"],
+            "--before-fingerprint", files["before_fingerprint"],
+            "--after-fingerprint", files["after_fingerprint"],
+            "--task-id", task_id,
+            "--plan-doc", "plan.md",
+            "--title", "Phase 001",
+        )
+        self.assertEqual(code, 0)
+        return plan, operation_id, payload
+
+    def _plan_ready_events(self, db_path):
+        conn = sqlite3.connect(db_path)
+        rows = conn.execute(
+            "SELECT id, payload_json FROM events "
+            "WHERE event_type = 'plan.ready' ORDER BY rowid"
+        ).fetchall()
+        conn.close()
+        return [{"id": r[0], "payload_json": r[1]} for r in rows]
+
+    def test_plan_revise_parser_defaults_and_help(self) -> None:
+        parser = build_parser()
+        ns = parser.parse_args([
+            "plan", "revise", "demo",
+            "--task-id", "t1",
+            "--plan-doc", "plan.md",
+        ])
+        self.assertEqual(ns.plan_command, "revise")
+        self.assertEqual(ns.handler, handle_plan_revise)
+        self.assertEqual(ns.workspace_id, "demo")
+        self.assertEqual(ns.task_id, "t1")
+        self.assertEqual(ns.plan_doc, "plan.md")
+        self.assertIsNone(ns.title)
+        self.assertIsNone(ns.owner)
+        self.assertIsNone(ns.branch)
+        self.assertEqual(ns.phase, "ready")
+        self.assertEqual(ns.actor, "operator")
+        self.assertEqual(ns.target, "worker")
+        self.assertIsNone(ns.payload_json)
+        self.assertIsNone(ns.idempotency_key)
+
+        with contextlib.redirect_stdout(io.StringIO()):
+            with self.assertRaises(SystemExit) as cm:
+                parser.parse_args(["plan", "revise", "--help"])
+            self.assertEqual(cm.exception.code, 0)
+
+    def test_plan_revise_split_task_supersedes_and_preserves_metadata(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            db_path = str(Path(tmp) / "coordinator.sqlite3")
+            self._setup_workspace(tmp, db_path)
+            plan, operation_id, first = self._create_split_task(tmp, db_path)
+            self.assertTrue(first["result"]["event_created"])
+
+            plan.write_text("# Plan v2 revised\n", encoding="utf-8")
+            code, payload = self.run_cli(
+                "--db", db_path,
+                "plan", "revise", "demo",
+                "--task-id", "phase-001",
+                "--plan-doc", "plan.md",
+                "--title", "Phase 001 (revised)",
+                "--owner", "mac-codex",
+            )
+            self.assertEqual(code, 0)
+            self.assertEqual(payload["result"]["event"]["event_type"], "plan.ready")
+            self.assertTrue(payload["result"]["event_created"])
+
+            events = self._plan_ready_events(db_path)
+            self.assertEqual(len(events), 2)
+            first_payload = json.loads(events[0]["payload_json"])
+            second_payload = json.loads(events[1]["payload_json"])
+            self.assertIsNone(first_payload["supersedes_plan_ready_event_id"])
+            self.assertEqual(
+                second_payload["supersedes_plan_ready_event_id"],
+                events[0]["id"],
+            )
+            self.assertNotEqual(
+                first_payload["plan_sha256"],
+                second_payload["plan_sha256"],
+            )
+
+            conn = sqlite3.connect(db_path)
+            row = conn.execute(
+                "SELECT payload_json FROM tasks "
+                "WHERE workspace_id = 'demo' AND task_id = 'phase-001'"
+            ).fetchone()
+            conn.close()
+            mirror = json.loads(row[0])
+            self.assertEqual(mirror["split_operation"]["operation_id"], operation_id)
+            self.assertEqual(mirror["split_operation"]["operation_kind"], "task.create")
+            self.assertEqual(mirror["title"], "Phase 001 (revised)")
+
+    def test_plan_revise_same_revision_idempotent(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            db_path = str(Path(tmp) / "coordinator.sqlite3")
+            self._setup_workspace(tmp, db_path)
+            plan, _, _ = self._create_split_task(tmp, db_path)
+
+            plan.write_text("# Plan v2 revised\n", encoding="utf-8")
+            args = [
+                "--db", db_path,
+                "plan", "revise", "demo",
+                "--task-id", "phase-001",
+                "--plan-doc", "plan.md",
+            ]
+            code, payload = self.run_cli(*args)
+            self.assertEqual(code, 0)
+            self.assertTrue(payload["result"]["event_created"])
+            self.assertEqual(len(self._plan_ready_events(db_path)), 2)
+
+            code, payload = self.run_cli(*args)
+            self.assertEqual(code, 0)
+            self.assertFalse(payload["result"]["event_created"])
+            events = self._plan_ready_events(db_path)
+            self.assertEqual(len(events), 2)
+
+    def test_plan_revise_fail_closed_zero_mutation(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            db_path = str(Path(tmp) / "coordinator.sqlite3")
+            plan = Path(tmp) / "plan.md"
+            plan.write_text("# Plan\n", encoding="utf-8")
+            self._setup_workspace(tmp, db_path)
+
+            cases = [
+                ("invalid json", ["demo", "--task-id", "t1", "--plan-doc", "plan.md", "--payload-json", "not-json"], "invalid --payload-json"),
+                ("non-object", ["demo", "--task-id", "t1", "--plan-doc", "plan.md", "--payload-json", "[]"], "must decode to an object"),
+                ("missing plan", ["demo", "--task-id", "t1", "--plan-doc", "does-not-exist.md"], "plan_doc is not a regular readable file"),
+                ("unknown workspace", ["ghost", "--task-id", "t1", "--plan-doc", "plan.md"], "unknown workspace"),
+            ]
+            for name, argv, needle in cases:
+                with self.subTest(case=name):
+                    code, stdout, stderr = self.run_cli_raw(
+                        "--db", db_path, "plan", "revise", *argv
+                    )
+                    self.assertEqual(code, 1)
+                    self.assertIn(needle, stdout + stderr)
+                    conn = sqlite3.connect(db_path)
+                    self.assertEqual(conn.execute("SELECT COUNT(*) FROM events").fetchone()[0], 0)
+                    self.assertEqual(conn.execute("SELECT COUNT(*) FROM tasks").fetchone()[0], 0)
+                    conn.close()
 
 
 if __name__ == "__main__":

@@ -53,6 +53,15 @@ $MAC state WORKSPACE --no-refresh
 $MAC reconcile WORKSPACE --no-refresh
 ```
 
+```bash
+# 单任务定向收敛：只同步目标 task mirror，不读取/触碰其他 task。
+# 适用边界：completion receipt 已 consumed、该 active task 只剩目标 mirror
+# drift，且 target-repo 的 checklist/state 已显式刷新（用 --no-refresh 时不得
+# 再有 checklist 写入）。已明确 out-of-scope 的历史 drift 可以同时存在，但本
+# 命令不会修复或改写它们；目标自身 branch/PR/publish conflict 仍 fail closed。
+$MAC reconcile WORKSPACE --no-refresh --task-id TASK
+```
+
 ## Channel Binding
 
 Coordinate 是 `(platform, channel_id) -> workspace_id` 的唯一持久权威；MultiNexus 在把任何
@@ -130,6 +139,28 @@ $MAC task create-record WORKSPACE \
 
 `create-files` / `create-record` 与 combined `create` 使用同一 split-operation contract；
 完整 flags 以 CLI 帮助为准。
+
+plan 修订（同一 task，不新建 checklist item、不新建 split operation、不自动批准）：
+
+```bash
+$MAC plan revise WORKSPACE \
+  --task-id TASK \
+  --plan-doc docs/path/to/phase-plan.md \
+  [--title TITLE] [--owner OWNER] [--branch BRANCH] [--phase ready] \
+  [--actor operator] [--target worker] [--payload-json '{"k":"v"}'] [--idempotency-key KEY]
+```
+
+`plan revise` 复用 `create_plan_task_record` service 的 no-operation revision branch：**task 必须已登记**
+（不存在 mirror 时 fail closed，绝不 INSERT DB-only task），且 `--plan-doc` 必须与登记时的 plan identity
+相同（旧 mirror 只有 workspace-relative `plan_doc` 时自动解析兼容；不同 plan 文件仍 fail closed）。
+省略的 `--title`/`--owner`/`--branch`/`--payload-json` 保留既有值（含 `tasks.pr`；显式空字符串与省略
+同语义）；显式传入的 `--payload-json` object 在既有 payload 上 overlay，`task_id`/plan identity/`status`
+等 canonical 字段由系统值覆盖；仅不匹配的 `split_operation`（reserved metadata）会 fail closed。
+`--phase` 不保留 stored 值：始终重置为所给值，省略时默认 `ready`，因此 revision 后的 plan 必须重新经过
+`plan review-request` → `plan approve`。它保留原 task mirror 的 `split_operation` metadata，追加新的幂等
+`plan.ready`，其 `supersedes_plan_ready_event_id` 指向上一个 ready；相同 plan 内容重复执行幂等，
+显式 `--idempotency-key` 冲突（intent 不同）整体回滚。mirror upsert 与事件写入在单个 SAVEPOINT 内
+原子完成。`plan revise` 本身不自动 approve。
 
 ## Operator 待办
 
@@ -278,11 +309,15 @@ $MAC assignment mark-done WORKSPACE --task-id TASK
 # 1) control plane 签发一次性 receipt
 $MAC assignment mark-done-prepare WORKSPACE --task-id TASK
 
+# 1a) （可选，只读）control plane 核验 receipt 的权威 workspace/task/status/expiry。
+#     receipt ID 是位置参数，不是 --receipt 选项
+$MAC assignment mark-done-preflight RECEIPT_ID
+
 # 2) coding host 验证 receipt 并更新本地 checklist（resolver-selected：
 #    harness-checklist.json 或 legacy mvp-checklist.json，恰好一个存在）
 $MAC assignment mark-done-files WORKSPACE \
   --workspace-path /path/to/repo \
-  --harness-root docs/project-harness \
+  --harness-root /path/to/repo/docs/project-harness \
   --task-id TASK \
   --receipt RECEIPT \
   --event-cli-path "$HOME/.local/bin/coord-ssh"
@@ -291,6 +326,11 @@ $MAC assignment mark-done-files WORKSPACE \
 #    再写入 task.done 并消费 receipt
 $MAC assignment mark-done-record WORKSPACE --task-id TASK --receipt RECEIPT
 ```
+
+`mac.sh` 会先 `cd` 到 Coordinate repo 再执行 CLI（见
+`skills/coordinate-operator/scripts/mac.sh`），service 层按进程 cwd 解析相对路径。
+因此跨 repo 操作（如 `mark-done-files` 指向目标仓库）必须使用 absolute
+`--harness-root`（上例 `/path/to/repo/docs/project-harness`），不能使用相对路径。
 
 Harness 写操作必须通过这些命令或相应服务进行。不要手动编辑 harness JSON。
 

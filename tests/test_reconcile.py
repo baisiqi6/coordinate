@@ -1,4 +1,5 @@
 import unittest
+from unittest import mock
 
 from coordinate.db import (
     append_event,
@@ -9,7 +10,12 @@ from coordinate.db import (
     upsert_task_mirror,
     upsert_workspace,
 )
-from coordinate.reconcile import ReconcileConflictError, reconcile_workspace
+import coordinate.reconcile
+from coordinate.reconcile import (
+    ReconcileConflictError,
+    ReconcileTaskNotFoundError,
+    reconcile_workspace,
+)
 
 
 class FakeHarnessAdapter:
@@ -327,6 +333,356 @@ class ReconcileTests(unittest.TestCase):
         tasks = list_task_mirrors(conn, workspace_id="demo")
         self.assertEqual(tasks[0]["phase"], "closed",
                          "awaiting_operator should be cleared when harness says closed")
+
+class TargetedReconcileTests(unittest.TestCase):
+    """Completion 后单任务 mirror 定向收敛（plan §6）。"""
+
+    def _workspace(self, conn):
+        return upsert_workspace(
+            conn,
+            workspace_id="demo",
+            name="Demo",
+            path=".",
+            harness_root=".",
+        )
+
+    def _make_target_reconcile_env(self):
+        """Fresh env for a targeted reconcile of a brand-new mvp-001 mirror."""
+        conn = initialize(":memory:")
+        workspace = self._workspace(conn)
+        adapter = FakeHarnessAdapter(
+            state={"project": "demo"},
+            checklist={
+                "project": "demo",
+                "items": [
+                    {
+                        "id": "mvp-001",
+                        "title": "Build core",
+                        "status": "doing",
+                        "workflow": {"status": "running"},
+                    },
+                ],
+            },
+        )
+        return conn, workspace, adapter
+
+    def test_targeted_updates_only_target_mirror(self):
+        conn = initialize(":memory:")
+        workspace = self._workspace(conn)
+        upsert_task_mirror(
+            conn,
+            workspace_id="demo",
+            task_id="mvp-001",
+            phase="todo",
+            owner="codex",
+            branch=None,
+            pr=None,
+            payload={"id": "mvp-001", "status": "todo"},
+        )
+        upsert_task_mirror(
+            conn,
+            workspace_id="demo",
+            task_id="mvp-002",
+            phase="todo",
+            owner="codex",
+            branch=None,
+            pr=None,
+            payload={"id": "mvp-002", "status": "todo"},
+        )
+        before_002 = row_to_dict(list_task_mirrors(conn, "demo")[1])
+        adapter = FakeHarnessAdapter(
+            state={"project": "demo", "generated_at": "2026-05-17T00:00:00Z"},
+            checklist={
+                "project": "demo",
+                "items": [
+                    {
+                        "id": "mvp-001",
+                        "title": "Build core",
+                        "status": "doing",
+                        "owner": "codex",
+                        "workflow": {"status": "running"},
+                    },
+                    {
+                        "id": "mvp-002",
+                        "title": "Review core",
+                        "status": "doing",
+                        "owner": "codex",
+                        "workflow": {"status": "running"},
+                    },
+                ],
+            },
+        )
+
+        result = reconcile_workspace(conn, workspace, adapter=adapter, task_id="mvp-001")
+
+        mirrors = {
+            m["task_id"]: m
+            for m in (row_to_dict(row) for row in list_task_mirrors(conn, "demo"))
+        }
+        self.assertEqual(mirrors["mvp-001"]["phase"], "running")
+        # 无关 item 保持字节不变。
+        self.assertEqual(mirrors["mvp-002"], before_002)
+        # 输出只反映目标 item。
+        self.assertEqual(result.created, 0)
+        self.assertEqual(result.updated, 1)
+        self.assertEqual(result.unchanged, 0)
+        self.assertEqual(len(result.tasks), 1)
+        self.assertEqual(result.tasks[0]["task_id"], "mvp-001")
+        self.assertEqual(result.scope, {"kind": "task", "task_id": "mvp-001"})
+        self.assertEqual(result.to_dict()["scope"], {"kind": "task", "task_id": "mvp-001"})
+
+    def test_targeted_ignores_unrelated_conflict(self):
+        conn = initialize(":memory:")
+        workspace = self._workspace(conn)
+        upsert_task_mirror(
+            conn,
+            workspace_id="demo",
+            task_id="mvp-001",
+            phase="todo",
+            owner="codex",
+            branch=None,
+            pr=None,
+            payload={},
+        )
+        upsert_task_mirror(
+            conn,
+            workspace_id="demo",
+            task_id="mvp-002",
+            phase="doing",
+            owner="codex",
+            branch="agents/keep",
+            pr=None,
+            payload={},
+        )
+        adapter = FakeHarnessAdapter(
+            state={"project": "demo"},
+            checklist={
+                "project": "demo",
+                "items": [
+                    {
+                        "id": "mvp-001",
+                        "title": "Build core",
+                        "status": "doing",
+                        "workflow": {"status": "running"},
+                    },
+                    {
+                        "id": "mvp-002",
+                        "title": "Review core",
+                        "status": "doing",
+                        "workflow": {
+                            "status": "running",
+                            "branch": "agents/other",
+                        },
+                    },
+                ],
+            },
+        )
+
+        # 无关 item 的 branch conflict 不阻塞目标。
+        result = reconcile_workspace(conn, workspace, adapter=adapter, refresh=False, task_id="mvp-001")
+        self.assertEqual(result.updated, 1)
+        self.assertEqual(result.tasks[0]["task_id"], "mvp-001")
+        mirror_002 = row_to_dict(list_task_mirrors(conn, "demo")[1])
+        self.assertEqual(mirror_002["branch"], "agents/keep")
+
+        # full reconcile 仍 fail closed。
+        with self.assertRaises(ReconcileConflictError):
+            reconcile_workspace(conn, workspace, adapter=adapter, refresh=False)
+
+    def test_targeted_target_conflict_fails_closed(self):
+        conn = initialize(":memory:")
+        workspace = self._workspace(conn)
+        upsert_task_mirror(
+            conn,
+            workspace_id="demo",
+            task_id="mvp-001",
+            phase="running",
+            owner="codex",
+            branch="agents/mvp-001",
+            pr=None,
+            payload={},
+        )
+        adapter = FakeHarnessAdapter(
+            state={"project": "demo"},
+            checklist={
+                "project": "demo",
+                "items": [
+                    {
+                        "id": "mvp-001",
+                        "title": "Build core",
+                        "status": "doing",
+                        "workflow": {
+                            "status": "running",
+                            "branch": "agents/other",
+                        },
+                    },
+                ],
+            },
+        )
+
+        with self.assertRaises(ReconcileConflictError):
+            reconcile_workspace(conn, workspace, adapter=adapter, refresh=False, task_id="mvp-001")
+
+        # 零 mutation：mirror 原样，零事件。
+        mirror = row_to_dict(list_task_mirrors(conn, "demo")[0])
+        self.assertEqual(mirror["branch"], "agents/mvp-001")
+        self.assertEqual(list(list_events(conn, "demo")), [])
+
+    def test_targeted_missing_id_zero_mutation(self):
+        conn = initialize(":memory:")
+        workspace = self._workspace(conn)
+        upsert_task_mirror(
+            conn,
+            workspace_id="demo",
+            task_id="mvp-001",
+            phase="todo",
+            owner="codex",
+            branch=None,
+            pr=None,
+            payload={},
+        )
+        adapter = FakeHarnessAdapter(
+            state={"project": "demo"},
+            checklist={
+                "project": "demo",
+                "items": [{"id": "mvp-001", "title": "Build core", "status": "todo"}],
+            },
+        )
+
+        with self.assertRaises(ReconcileTaskNotFoundError):
+            reconcile_workspace(conn, workspace, adapter=adapter, refresh=False, task_id="mvp-999")
+
+        self.assertEqual(list(list_events(conn, "demo")), [])
+        self.assertEqual(list_task_mirrors(conn, "demo")[0]["task_id"], "mvp-001")
+
+    def test_targeted_event_key_scoped_and_idempotent(self):
+        conn = initialize(":memory:")
+        workspace = self._workspace(conn)
+        state = {"project": "demo", "generated_at": "2026-05-17T00:00:00Z"}
+        checklist_a = {
+            "project": "demo",
+            "items": [
+                {"id": "mvp-001", "title": "Build core", "status": "todo"},
+                {"id": "mvp-002", "title": "Review core", "status": "todo"},
+            ],
+        }
+        checklist_b = {
+            "project": "demo",
+            "items": [
+                {
+                    "id": "mvp-001",
+                    "title": "Build core",
+                    "status": "doing",
+                    "workflow": {"status": "running"},
+                },
+                {"id": "mvp-002", "title": "Review core", "status": "todo"},
+            ],
+        }
+        checklist_c = {
+            "project": "demo",
+            "items": [
+                {
+                    "id": "mvp-001",
+                    "title": "Build core",
+                    "status": "doing",
+                    "workflow": {"status": "running"},
+                },
+                {
+                    "id": "mvp-002",
+                    "title": "Review core",
+                    "status": "doing",
+                    "workflow": {"status": "running"},
+                },
+            ],
+        }
+
+        full = reconcile_workspace(
+            conn, workspace, adapter=FakeHarnessAdapter(state, checklist_a), refresh=False
+        )
+        self.assertNotIn("scope", full.to_dict())
+
+        # 目标自身变化 → targeted 只更新目标。
+        adapter_b = FakeHarnessAdapter(state, checklist_b)
+        first = reconcile_workspace(conn, workspace, adapter=adapter_b, refresh=False, task_id="mvp-001")
+        self.assertEqual(first.updated, 1)
+        self.assertEqual(first.unchanged, 0)
+
+        # 重放（同 state + 同目标 item）幂等，不新增 summary 事件。
+        second = reconcile_workspace(conn, workspace, adapter=adapter_b, refresh=False, task_id="mvp-001")
+        self.assertEqual(second.updated, 0)
+        self.assertEqual(second.unchanged, 1)
+        events = [row_to_dict(e) for e in list_events(conn, "demo")]
+        summaries = [e for e in events if e["event_type"] == "reconciliation.completed"]
+        self.assertEqual(len(summaries), 2)
+        full_key = next(e["idempotency_key"] for e in summaries if "mvp-001" not in e["idempotency_key"])
+        scoped_key = next(e["idempotency_key"] for e in summaries if "mvp-001" in e["idempotency_key"])
+        self.assertNotEqual(full_key, scoped_key)
+        self.assertTrue(scoped_key.startswith("demo:reconcile:mvp-001:"))
+
+        # fingerprint 只覆盖 state + 目标 item：无关 item 变化后重放，key 不变、不新增事件。
+        adapter_c = FakeHarnessAdapter(state, checklist_c)
+        third = reconcile_workspace(conn, workspace, adapter=adapter_c, refresh=False, task_id="mvp-001")
+        self.assertEqual(third.unchanged, 1)
+        events = [row_to_dict(e) for e in list_events(conn, "demo")]
+        summaries = [e for e in events if e["event_type"] == "reconciliation.completed"]
+        self.assertEqual(len(summaries), 2)
+        self.assertIn(scoped_key, [e["idempotency_key"] for e in summaries])
+
+    def test_targeted_rolls_back_mirror_when_event_fails(self):
+        conn, workspace, adapter = self._make_target_reconcile_env()
+
+        with mock.patch(
+            "coordinate.reconcile.append_event",
+            side_effect=RuntimeError("event write failed"),
+        ):
+            with self.assertRaises(RuntimeError):
+                reconcile_workspace(conn, workspace, adapter=adapter, refresh=False, task_id="mvp-001")
+
+        # 事件写入失败 → 目标 mirror 与本轮 events 均回滚。
+        self.assertEqual(list(list_task_mirrors(conn, "demo")), [])
+        self.assertEqual(list(list_events(conn, "demo")), [])
+
+    def test_targeted_rolls_back_mirror_when_summary_event_fails(self):
+        conn, workspace, adapter = self._make_target_reconcile_env()
+        real_append = coordinate.reconcile.append_event
+
+        def flaky(*args, **kwargs):
+            if kwargs.get("event_type") == "reconciliation.completed":
+                raise RuntimeError("summary write failed")
+            return real_append(*args, **kwargs)
+
+        with mock.patch("coordinate.reconcile.append_event", side_effect=flaky):
+            with self.assertRaises(RuntimeError):
+                reconcile_workspace(conn, workspace, adapter=adapter, refresh=False, task_id="mvp-001")
+
+        # mirror 已 upsert 但 summary 失败 → 整体回滚，可观察状态不变。
+        self.assertEqual(list(list_task_mirrors(conn, "demo")), [])
+        self.assertEqual(list(list_events(conn, "demo")), [])
+
+    def test_full_output_keeps_key_set(self):
+        conn = initialize(":memory:")
+        workspace = self._workspace(conn)
+        adapter = FakeHarnessAdapter(
+            state={"project": "demo"},
+            checklist={
+                "project": "demo",
+                "items": [{"id": "mvp-001", "title": "Build core", "status": "todo"}],
+            },
+        )
+        result = reconcile_workspace(conn, workspace, adapter=adapter)
+        self.assertEqual(
+            set(result.to_dict().keys()),
+            {
+                "workspace_id",
+                "project",
+                "created",
+                "updated",
+                "unchanged",
+                "events_created",
+                "tasks",
+            },
+        )
+
 
 if __name__ == "__main__":
     unittest.main()

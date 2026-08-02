@@ -2,6 +2,7 @@
 import hashlib
 import json
 import os
+import sqlite3
 import subprocess
 import tempfile
 import unittest
@@ -23,6 +24,7 @@ from coordinate.db import (
     list_split_operations,
     list_task_mirrors,
     row_to_dict,
+    upsert_task_mirror,
     upsert_workspace,
 )
 from coordinate.onboarding import (
@@ -246,7 +248,27 @@ class SplitOperationPreservationTests(unittest.TestCase):
         return files
 
     def _create_legacy_task(self, content="# Legacy plan\n"):
+        # Legacy tasks are pre-registered mirrors; the revision branch must
+        # never be used as a task-create path (U2 root cause regression).
+        # Register the mirror explicitly, then author its initial plan.ready
+        # through the revision entry.
         self.plan_path.write_text(content)
+        upsert_task_mirror(
+            self.conn,
+            workspace_id="demo",
+            task_id="task-1",
+            phase="ready",
+            owner=None,
+            branch=None,
+            pr=None,
+            payload={
+                "task_id": "task-1",
+                "title": "Legacy task",
+                "plan_doc": "plan.md",
+                "absolute_plan_doc": str(self.plan_path.resolve()),
+                "status": "ready",
+            },
+        )
         create_plan_task_record(
             self.conn,
             workspace_id="demo",
@@ -497,6 +519,238 @@ class SplitOperationPreservationTests(unittest.TestCase):
             reason="needs rework",
         )
         self.assertEqual(self._task_payload()["split_operation"], stored)
+
+    def test_revision_unknown_task_fails_closed_zero_mutation(self):
+        # U2 root-cause regression: the revision entry must never INSERT a
+        # DB-only task mirror for an unregistered task.
+        with self.assertRaises(ValueError):
+            create_plan_task_record(
+                self.conn,
+                workspace_id="demo",
+                task_id="never-registered",
+                plan_doc="plan.md",
+                title="Ghost",
+                phase="ready",
+            )
+        self.assertEqual(list_task_mirrors(self.conn, "demo"), [])
+        self.assertEqual(self._plan_ready_events(), [])
+
+    def test_revision_different_plan_doc_fails_closed_state_unchanged(self):
+        self._create_split_task()
+        before_events = self._plan_ready_events()
+        before_payload = self._task_payload()
+        (Path(self.tmp.name) / "other.md").write_text("# Other plan\n")
+
+        with self.assertRaises(ValueError):
+            create_plan_task_record(
+                self.conn,
+                workspace_id="demo",
+                task_id="task-1",
+                plan_doc="other.md",
+                title="Task 1",
+                phase="ready",
+            )
+
+        self.assertEqual(self._plan_ready_events(), before_events)
+        self.assertEqual(self._task_payload(), before_payload)
+
+    def test_revision_explicit_key_conflict_rolls_back_atomically(self):
+        self._create_split_task()
+        self.plan_path.write_text("# Plan v1 revised\n")
+        create_plan_task_record(
+            self.conn,
+            workspace_id="demo",
+            task_id="task-1",
+            plan_doc="plan.md",
+            title="Task 1",
+            phase="ready",
+            idempotency_key="demo:task-1:revise:round-1",
+        )
+        before_events = self._plan_ready_events()
+        before_payload = self._task_payload()
+        before_last_event_id = list_task_mirrors(self.conn, "demo")[0]["last_event_id"]
+
+        # Reuse the same key with a different intent: must fail closed and roll
+        # back the mirror upsert performed before the conflicting event write.
+        self.plan_path.write_text("# Plan v1 revised again\n")
+        with self.assertRaises(ValueError):
+            create_plan_task_record(
+                self.conn,
+                workspace_id="demo",
+                task_id="task-1",
+                plan_doc="plan.md",
+                title="Changed title",
+                phase="ready",
+                idempotency_key="demo:task-1:revise:round-1",
+            )
+
+        self.assertEqual(self._plan_ready_events(), before_events)
+        self.assertEqual(self._task_payload(), before_payload)
+        self.assertEqual(
+            list_task_mirrors(self.conn, "demo")[0]["last_event_id"],
+            before_last_event_id,
+        )
+
+    def test_revision_explicit_key_exact_replay_idempotent(self):
+        self._create_split_task()
+        self.plan_path.write_text("# Plan v1 revised\n")
+        kwargs = dict(
+            workspace_id="demo",
+            task_id="task-1",
+            plan_doc="plan.md",
+            title="Task 1",
+            phase="ready",
+            idempotency_key="demo:task-1:revise:round-1",
+        )
+        first = create_plan_task_record(self.conn, **kwargs)
+        second = create_plan_task_record(self.conn, **kwargs)
+
+        self.assertTrue(first.event_created)
+        self.assertFalse(second.event_created)
+        self.assertEqual(second.event["id"], first.event["id"])
+        self.assertEqual(len(self._plan_ready_events()), 2)
+
+    def test_revision_relative_legacy_identity_no_drift(self):
+        # Legacy mirror stores only a workspace-relative plan_doc; the
+        # revision must resolve it against the workspace and keep the
+        # registered expression (no drift from equivalent ./x or absolute
+        # spellings).
+        self.plan_path.write_text("# Legacy plan\n")
+        upsert_task_mirror(
+            self.conn,
+            workspace_id="demo",
+            task_id="task-1",
+            phase="ready",
+            owner=None,
+            branch=None,
+            pr=None,
+            payload={
+                "task_id": "task-1",
+                "title": "Legacy task",
+                "plan_doc": "plan.md",
+                "status": "ready",
+            },
+        )
+
+        self.plan_path.write_text("# Legacy plan revised\n")
+        create_plan_task_record(
+            self.conn,
+            workspace_id="demo",
+            task_id="task-1",
+            plan_doc="./plan.md",
+            title="Legacy task",
+            phase="ready",
+        )
+        after = self._task_payload()
+        self.assertEqual(after["plan_doc"], "plan.md")
+        self.assertEqual(after["absolute_plan_doc"], str(self.plan_path.resolve()))
+        self.assertEqual(len(self._plan_ready_events()), 1)
+
+    def test_revision_omitted_optional_args_preserve_metadata(self):
+        self._create_split_task()
+        payload = self._task_payload()
+        payload.update({"custom_field": "keep-me", "title": "Custom Title"})
+        self.conn.execute(
+            "UPDATE tasks SET payload_json = ?, owner = ?, branch = ?, pr = ? "
+            "WHERE workspace_id = ? AND task_id = ?",
+            (json.dumps(payload), "owner-a", "agents/owner-a/task-1", "owner-a/task-1#1", "demo", "task-1"),
+        )
+        self.conn.commit()
+
+        self.plan_path.write_text("# Plan v1 revised\n")
+        create_plan_task_record(
+            self.conn,
+            workspace_id="demo",
+            task_id="task-1",
+            plan_doc="plan.md",
+            phase="ready",
+            # no title/owner/branch/payload: stored values must survive.
+        )
+        row = list_task_mirrors(self.conn, "demo")[0]
+        after = json.loads(row["payload_json"])
+        self.assertEqual(after["title"], "Custom Title")
+        self.assertEqual(after["custom_field"], "keep-me")
+        self.assertEqual(after["split_operation"], payload["split_operation"])
+        self.assertEqual(row["owner"], "owner-a")
+        self.assertEqual(row["branch"], "agents/owner-a/task-1")
+        self.assertEqual(row["pr"], "owner-a/task-1#1")
+        self.assertEqual(len(self._plan_ready_events()), 2)
+
+        # Explicit empty strings normalize like omission: stored values stay.
+        self.plan_path.write_text("# Plan v1 revised again\n")
+        create_plan_task_record(
+            self.conn,
+            workspace_id="demo",
+            task_id="task-1",
+            plan_doc="plan.md",
+            title="",
+            owner="",
+            branch="",
+            phase="ready",
+        )
+        row = list_task_mirrors(self.conn, "demo")[0]
+        after = json.loads(row["payload_json"])
+        self.assertEqual(after["title"], "Custom Title")
+        self.assertEqual(row["owner"], "owner-a")
+        self.assertEqual(row["branch"], "agents/owner-a/task-1")
+        self.assertEqual(len(self._plan_ready_events()), 3)
+
+    def test_revision_explicit_overlay_updates_only_specified_fields(self):
+        self._create_split_task()
+        payload_before = self._task_payload()
+        self.plan_path.write_text("# Plan v1 revised\n")
+        create_plan_task_record(
+            self.conn,
+            workspace_id="demo",
+            task_id="task-1",
+            plan_doc="plan.md",
+            title="New Title",
+            owner="owner-b",
+            branch="agents/owner-b/task-1",
+            payload={
+                "custom_field": "overlaid",
+                "task_id": "forged",
+                "status": "forged",
+            },
+        )
+        row = list_task_mirrors(self.conn, "demo")[0]
+        after = json.loads(row["payload_json"])
+        self.assertEqual(after["title"], "New Title")
+        self.assertEqual(after["custom_field"], "overlaid")
+        # Reserved/canonical fields stay system-controlled.
+        self.assertEqual(after["task_id"], "task-1")
+        self.assertEqual(after["status"], "ready")
+        self.assertEqual(after["split_operation"], payload_before["split_operation"])
+        self.assertEqual(row["owner"], "owner-b")
+        self.assertEqual(row["branch"], "agents/owner-b/task-1")
+
+    def test_revision_savepoint_failure_not_masked_by_rollback(self):
+        # External failure while establishing the SAVEPOINT: the rollback
+        # branch must not mask the original exception (no savepoint exists).
+        # Single-point fault injection, not a second SQLite state machine.
+        self._create_split_task()
+        original_execute = self.conn.execute
+
+        def failing_execute(sql, *args, **kwargs):
+            if sql == "SAVEPOINT plan_revise":
+                raise sqlite3.OperationalError("simulated external failure")
+            return original_execute(sql, *args, **kwargs)
+
+        self.plan_path.write_text("# Plan v1 revised\n")
+        with patch.object(self.conn, "execute", side_effect=failing_execute):
+            with self.assertRaisesRegex(
+                sqlite3.OperationalError, "simulated external failure"
+            ):
+                create_plan_task_record(
+                    self.conn,
+                    workspace_id="demo",
+                    task_id="task-1",
+                    plan_doc="plan.md",
+                    title="Task 1",
+                    phase="ready",
+                )
+        # No partial writes escaped the failed revision.
+        self.assertEqual(len(self._plan_ready_events()), 1)
 
 
 def _valid_empty_checklist_body() -> str:

@@ -83,6 +83,25 @@ $MAC policy pump-events --workspace-id WORKSPACE --platform stdout --destination
 $MAC worker delivery --platform stdout --once
 ```
 
+### 单任务定向收敛（targeted reconcile）
+
+completion receipt 已 consumed、该 active task 只剩目标 mirror drift 时，可只同步
+该 task mirror，不受已明确 out-of-scope 的历史 task drift/conflict 阻塞：
+
+```bash
+$MAC workspace audit WORKSPACE --no-refresh
+$MAC reconcile WORKSPACE --no-refresh --task-id TASK
+```
+
+适用边界：
+
+- “只剩目标 mirror drift”限定于本次 active task，不要求整个历史 workspace 零 drift；
+  已明确 out-of-scope 的历史 drift 可以保留，但不得被本命令修复或改写。不得用它
+  掩盖目标 task 自身的 branch/PR/publish conflict —— 目标自身 conflict 仍 fail closed。
+- `--task-id` 只同步目标 item；full reconcile（不传 `--task-id`）行为与输出不变。
+- 生产使用须先显式刷新 state（或 `--no-refresh` 前已刷新），refresh 与 targeted
+  reconcile 之间不得写入 checklist，否则由 freshness guard fail closed。
+
 `workspace audit --no-refresh` 将 file-backed 状态能力与 `harnessctl` 能力分开报告。如果 `assignment_lifecycle_available=false`，还不要使用 assignment mutation 命令；在 harness 运行时存在之前，使用 `task create`、events、jobs 和 deliveries。
 
 ## 登记重要任务（managed）
@@ -97,6 +116,12 @@ $MAC worker delivery --platform stdout --once
 
 入口矩阵与 old/new resolver、部分失败恢复、freshness、migration acknowledgement 规则见
 `SKILL.md` 的“Checklist 与任务权威矩阵”；完整 flags 见 `command-reference.md`。
+
+已登记 task 的 plan 修订顺序：`plan revise`（追加 superseding `plan.ready`，保留 split metadata）→
+`plan review-request` → `plan approve`。`plan revise` 不自动批准，也不改 checklist 文件半边；
+重复相同 revision 幂等。task 必须先经 `task create`/`create-record` 登记（revision 不能新建 DB-only
+task），`--plan-doc` 必须与登记值一致（旧相对路径数据自动兼容），省略的可选参数保留既有值，
+冲突 fail closed 且整体回滚。
 
 ## 将 Event 转为可见消息
 

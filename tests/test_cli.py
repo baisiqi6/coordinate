@@ -1154,6 +1154,92 @@ class CliTests(unittest.TestCase):
             self.assertEqual(payload["reconciliation"]["created"], 1)
             self.assertEqual(payload["reconciliation"]["tasks"][0]["phase"], "running")
 
+    def test_reconcile_targeted_task_id_scopes_output_and_mirror(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            db_path = str(Path(tmp) / "coordinator.sqlite3")
+            root = Path(tmp)
+            (root / "mvp-checklist.json").write_text(
+                json.dumps(
+                    {
+                        "project": "demo",
+                        "harness_root": ".",
+                        "updated_at": "2026-07-13",
+                        "items": [_audit_item(), _audit_item(task_id="mvp-002")],
+                    }
+                ),
+                encoding="utf-8",
+            )
+            _write_harness_state_with_source(root)
+            self.run_cli(
+                "--db",
+                db_path,
+                "workspace",
+                "add",
+                "demo",
+                "--path",
+                tmp,
+                "--harness-root",
+                tmp,
+            )
+
+            code, payload = self.run_cli(
+                "--db",
+                db_path,
+                "reconcile",
+                "demo",
+                "--no-refresh",
+                "--task-id",
+                "mvp-002",
+            )
+
+            self.assertEqual(code, 0)
+            reconciliation = payload["reconciliation"]
+            self.assertEqual(reconciliation["scope"], {"kind": "task", "task_id": "mvp-002"})
+            self.assertEqual(reconciliation["created"], 1)
+            self.assertEqual(len(reconciliation["tasks"]), 1)
+            self.assertEqual(reconciliation["tasks"][0]["task_id"], "mvp-002")
+
+    def test_reconcile_targeted_missing_task_id_fails_closed(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            db_path = str(Path(tmp) / "coordinator.sqlite3")
+            root = Path(tmp)
+            (root / "mvp-checklist.json").write_text(
+                json.dumps(
+                    {
+                        "project": "demo",
+                        "harness_root": ".",
+                        "updated_at": "2026-07-13",
+                        "items": [_audit_item()],
+                    }
+                ),
+                encoding="utf-8",
+            )
+            _write_harness_state_with_source(root)
+            self.run_cli(
+                "--db",
+                db_path,
+                "workspace",
+                "add",
+                "demo",
+                "--path",
+                tmp,
+                "--harness-root",
+                tmp,
+            )
+
+            code, _, stderr = self.run_cli_raw(
+                "--db",
+                db_path,
+                "reconcile",
+                "demo",
+                "--no-refresh",
+                "--task-id",
+                "mvp-999",
+            )
+
+            self.assertEqual(code, 1)
+            self.assertIn("not found", stderr)
+
     def test_job_create_run_and_list(self):
         with tempfile.TemporaryDirectory() as tmp:
             db_path = str(Path(tmp) / "coordinator.sqlite3")

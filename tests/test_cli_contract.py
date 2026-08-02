@@ -378,6 +378,116 @@ _S4C2_WORKSPACE_DOCTOR_NODE_SHA256 = (
 # Historical help strings captured from the S4-B1 baseline fixture.
 
 
+# Pre-targeted-reconcile ``reconcile`` help, extracted from the baseline
+# commit 1aeadbaa43405208b76f3b24f2f848dc4219f059 before ``reconcile`` gained
+# ``--task-id``. Restoring it keeps historical rewind SHA proofs free of the
+# later targeted-reconcile CLI addition.
+_PRE_TARGETED_RECONCILE_HELP = (
+    "usage: coordinate reconcile [-h] [--no-refresh] workspace_id\n"
+    "\n"
+    "positional arguments:\n"
+    "  workspace_id\n"
+    "\n"
+    "options:\n"
+    "  -h, --help    show this help message and exit\n"
+    "  --no-refresh  Read state without running harnessctl state\n"
+)
+
+# SHA-256 of the canonical baseline fixture (commit
+# 1aeadbaa43405208b76f3b24f2f848dc4219f059) before ``reconcile --task-id``.
+_PRE_TARGETED_BASELINE_FIXTURE_SHA256 = (
+    "4393fc12facaa3bb6dd9bf6116cb74ee22c8a4ce3c25b627e317d4e29698a0e3"
+)
+
+
+def _remove_targeted_reconcile_delta(contract: dict[str, object]) -> dict[str, object]:
+    """Return a copy of *contract* with the targeted-reconcile ``--task-id``
+    parser delta removed, restoring the pre-targeted baseline help.
+
+    No-op only when the reconcile node exists without the ``task_id`` action;
+    fails closed on structural surprises (missing or multiple reconcile
+    nodes, unexpected task_id action).
+    """
+    historical = copy.deepcopy(contract)
+    matches = [node for node in historical["nodes"] if node["path"] == ["reconcile"]]
+    if not matches:
+        raise AssertionError("missing reconcile parser node; cannot strip targeted delta")
+    if len(matches) != 1:
+        raise AssertionError("unexpected reconcile parser node cardinality")
+    node = matches[0]
+    removed = [action for action in node["actions"] if action.get("dest") == "task_id"]
+    if not removed:
+        return historical
+    if len(removed) != 1 or removed[0].get("option_strings") != ["--task-id"]:
+        raise AssertionError("unexpected targeted reconcile parser delta")
+    node["actions"] = [
+        action for action in node["actions"] if action.get("dest") != "task_id"
+    ]
+    node["help"] = _PRE_TARGETED_RECONCILE_HELP
+    return historical
+
+
+# Pre-plan-revise ``plan`` parent help, extracted from the committed fixture
+# that predates the ``plan revise`` leaf.  Restoring it keeps historical
+# rewind SHA proofs free of the later CLI addition.
+_PRE_PLAN_REVISE_PLAN_HELP = (
+    "usage: coordinate plan [-h] {review-request,approve,reject} ...\n\n"
+    "positional arguments:\n"
+    "  {review-request,approve,reject}\n"
+    "    review-request      Request plan review\n"
+    "    approve             Approve a plan\n"
+    "    reject              Reject a plan\n\n"
+    "options:\n"
+    "  -h, --help            show this help message and exit\n"
+)
+
+
+def _remove_plan_revise_delta(contract: dict[str, object]) -> dict[str, object]:
+    """Return a copy of *contract* with the ``plan revise`` parser delta removed.
+
+    Restores the pre-revision ``plan`` subparser choices/help and the leaf/node
+    counts so historical baseline rewinds are not polluted by the later CLI
+    addition.  No-op when the delta is already absent.
+    """
+    historical = copy.deepcopy(contract)
+    revise_path = ["plan", "revise"]
+    has_revise = any(node["path"] == revise_path for node in historical["nodes"])
+    if not has_revise:
+        return historical
+
+    historical["nodes"] = [
+        node for node in historical["nodes"] if node["path"] != revise_path
+    ]
+    historical["leaf_paths"] = [
+        path for path in historical["leaf_paths"] if path != "plan revise"
+    ]
+    historical["metadata"]["leaf_count"] = int(
+        historical["metadata"]["leaf_count"]
+    ) - 1
+    historical["metadata"]["node_count"] = int(
+        historical["metadata"]["node_count"]
+    ) - 1
+
+    found = set()
+    for node in historical["nodes"]:
+        if node["path"] == ["plan"]:
+            subparsers = [
+                action
+                for action in node["actions"]
+                if action["action_class"] == "_SubParsersAction"
+            ]
+            if len(subparsers) != 1 or "revise" not in subparsers[0]["choices"]:
+                raise AssertionError("unexpected plan subparser delta")
+            subparsers[0]["choices"] = [
+                choice for choice in subparsers[0]["choices"] if choice != "revise"
+            ]
+            node["help"] = _PRE_PLAN_REVISE_PLAN_HELP
+            found.add("plan")
+    if found != {"plan"}:
+        raise AssertionError(f"incomplete plan revise CLI delta: {sorted(found)}")
+    return historical
+
+
 def _serialize_contract(contract: dict[str, object]) -> bytes:
     """Serialize a normalized contract dict using the canonical fixture format."""
     return json.dumps(contract, ensure_ascii=False, sort_keys=True, indent=2).encode("utf-8") + b"\n"
@@ -386,8 +496,15 @@ def _serialize_contract(contract: dict[str, object]) -> bytes:
 def _rewrite_contract_to_p9_3c1_p1_baseline(
     contract: dict[str, object],
 ) -> dict[str, object]:
-    """Remove only the P9-3C1 P1 parser delta from a generated contract."""
-    historical = copy.deepcopy(contract)
+    """Remove only the P9-3C1 P1 parser delta from a generated contract.
+
+    Any later delta (targeted-reconcile ``--task-id``, ``plan revise``) is
+    stripped first so historical baseline rewinds stay free of post-P9-3C1
+    CLI additions. This function is the shared entry of every cumulative
+    rewind chain.
+    """
+    historical = _remove_targeted_reconcile_delta(contract)
+    historical = _remove_plan_revise_delta(historical)
     deactivate_path = ["runtime", "agent", "deactivate"]
     has_deactivate = any(node["path"] == deactivate_path for node in historical["nodes"])
     if not has_deactivate:
@@ -920,10 +1037,22 @@ class CLIContractTests(unittest.TestCase):
         contract = _build_contract()
         metadata = contract["metadata"]
         self.assertEqual(len(metadata["top_level_commands"]), 21)
-        self.assertEqual(metadata["leaf_count"], 89)
-        self.assertEqual(metadata["node_count"], 117)
-        self.assertEqual(len(contract["leaf_paths"]), 89)
-        self.assertEqual(len(contract["nodes"]), 117)
+        self.assertEqual(metadata["leaf_count"], 90)
+        self.assertEqual(metadata["node_count"], 118)
+        self.assertEqual(len(contract["leaf_paths"]), 90)
+        self.assertEqual(len(contract["nodes"]), 118)
+
+    def test_plan_revise_present_exactly_once(self) -> None:
+        contract = _build_contract()
+        revise_nodes = [
+            node for node in contract["nodes"] if node["path"] == ["plan", "revise"]
+        ]
+        self.assertEqual(len(revise_nodes), 1)
+        self.assertEqual(
+            revise_nodes[0]["defaults"]["handler"],
+            "coordinate.planning_cli.handle_plan_revise",
+        )
+        self.assertEqual(contract["leaf_paths"].count("plan revise"), 1)
 
     def test_no_duplicate_leaf_paths(self) -> None:
         contract = _build_contract()
@@ -1122,6 +1251,56 @@ class CLIContractTests(unittest.TestCase):
             hashlib.sha256(hist_bytes).hexdigest(),
             _S4C2_WORKSPACE_DOCTOR_NODE_SHA256,
             "Workspace doctor node with --no-projections removed must match the pre-D baseline node",
+        )
+
+    def test_contract_targeted_reconcile_delta_matches_baseline(self) -> None:
+        """Targeted-reconcile delta proof: the current contract carries the
+        optional ``--task-id`` action, and stripping it restores the canonical
+        pre-targeted baseline fixture bytes (baseline commit 1aeadbaa)."""
+        contract = _build_contract()
+        reconcile_node = next(
+            node for node in contract["nodes"] if node["path"] == ["reconcile"]
+        )
+        task_id_action = next(
+            action
+            for action in reconcile_node["actions"]
+            if action.get("dest") == "task_id"
+        )
+        self.assertEqual(task_id_action["option_strings"], ["--task-id"])
+        self.assertFalse(task_id_action["required"])
+
+        historical = _remove_targeted_reconcile_delta(contract)
+        self.assertEqual(
+            hashlib.sha256(_serialize_contract(historical)).hexdigest(),
+            _PRE_TARGETED_BASELINE_FIXTURE_SHA256,
+            "Fixture with the targeted-reconcile delta removed must match the "
+            "pre-targeted baseline commit fixture SHA-256",
+        )
+
+    def test_remove_targeted_reconcile_delta_structure_contract(self) -> None:
+        """Delta removal fails closed on a missing or duplicate reconcile node
+        and no-ops when the node exists without the ``task_id`` action."""
+        base = _build_contract()
+        reconcile_node = next(n for n in base["nodes"] if n["path"] == ["reconcile"])
+
+        missing = copy.deepcopy(base)
+        missing["nodes"] = [
+            node for node in missing["nodes"] if node["path"] != ["reconcile"]
+        ]
+        with self.assertRaises(AssertionError):
+            _remove_targeted_reconcile_delta(missing)
+
+        duplicate = copy.deepcopy(base)
+        duplicate["nodes"].append(copy.deepcopy(reconcile_node))
+        with self.assertRaises(AssertionError):
+            _remove_targeted_reconcile_delta(duplicate)
+
+        stripped = _remove_targeted_reconcile_delta(base)
+        again = _remove_targeted_reconcile_delta(stripped)
+        self.assertEqual(
+            _serialize_contract(again),
+            _serialize_contract(stripped),
+            "Stripping an already-stripped contract must no-op",
         )
 
     def test_contract_s4c2_rewind_matches_baseline(self) -> None:

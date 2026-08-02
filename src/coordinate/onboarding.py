@@ -259,6 +259,50 @@ def _carry_split_operation_metadata(
     return stored
 
 
+def _validate_plan_ready_exact_replay(
+    event_row: sqlite3.Row,
+    *,
+    workspace_id: str,
+    task_id: str,
+    actor: str,
+    target: str | None,
+    expected_payload: dict[str, Any],
+) -> None:
+    """Fail closed unless a pre-existing plan.ready event is an exact replay.
+
+    Called when ``append_event`` reports ``created=False`` inside the revision
+    SAVEPOINT: a colliding idempotency key must not be linked into this
+    revision as if it were this round's event.  An exact replay (same event
+    type, workspace, task, actor, target and canonical payload) is idempotent;
+    anything else raises so the SAVEPOINT rolls back every effect.
+    """
+    if event_row["event_type"] != "plan.ready":
+        raise ValueError(
+            f"idempotency key {event_row['idempotency_key']!r} is already used "
+            f"by event type {event_row['event_type']!r}, not plan.ready"
+        )
+    if (
+        event_row["workspace_id"] != workspace_id
+        or event_row["task_id"] != task_id
+        or event_row["actor"] != actor
+        or event_row["target"] != target
+    ):
+        raise ValueError(
+            "idempotency key was already used by a different plan revision "
+            "intent (workspace/task/actor/target mismatch); refusing to link "
+            "the conflicting event"
+        )
+    try:
+        stored_payload = json.loads(event_row["payload_json"])
+    except json.JSONDecodeError:
+        stored_payload = None
+    if not isinstance(stored_payload, dict) or stored_payload != expected_payload:
+        raise ValueError(
+            "idempotency key was already used by a different plan revision "
+            "intent (payload mismatch); refusing to link the conflicting event"
+        )
+
+
 @dataclass(frozen=True)
 class TaskCreateRecovery:
     """Structured recovery material for a record-half failure.
@@ -630,9 +674,13 @@ def create_plan_task_record(
     ``operation_id`` + fingerprints select the split-path record half. The
     no-operation branch is the explicit plan-revision authoring entry (backlog
     #9c: a revised plan produces a new plan.ready event with a supersede link
-    while preserving split-operation metadata). The combined ``create_plan_task``
-    NEVER calls this branch: combined create is file-first and uses the split
-    half exclusively.
+    while preserving split-operation metadata). It requires an already-registered
+    task mirror whose registered ``plan_doc`` identity matches the call, and it
+    performs the mirror upserts + ``append_event`` inside a single SAVEPOINT so
+    a conflicting idempotency key or any gate failure rolls back atomically
+    (exact replays stay idempotent). The combined ``create_plan_task`` NEVER
+    calls this branch: combined create is file-first and uses the split half
+    exclusively.
     """
     if operation_id is not None:
         split_result = apply_task_create_record(
@@ -682,82 +730,187 @@ def create_plan_task_record(
             f"plan_doc is not a readable file: {plan_doc} ({plan_abs})"
         ) from exc
     plan_content_hash = plan_sha256[:16]
+    resolved_plan_doc = str(plan_abs)
 
-    # Validate and preserve an existing task mirror's split-operation metadata
-    # before any DB write.  Caller cannot forge or replace this reserved key.
-    stored_split_operation = _carry_split_operation_metadata(
-        conn, workspace_id, task_id, extra_payload
-    )
+    # Revision gate, metadata carry and all three writes share one SAVEPOINT:
+    # reads and writes see the same committed state (no TOCTOU against a
+    # concurrent create/revise), and any failure rolls back every effect.
+    try:
+        conn.execute("SAVEPOINT plan_revise")
 
-    task_payload = {
-        **extra_payload,
-        "task_id": task_id,
-        "title": title or task_id,
-        "plan_doc": plan_doc,
-        "absolute_plan_doc": str(plan_abs),
-        "status": phase,
-    }
-    if branch:
-        task_payload["branch"] = branch
-    if owner:
-        task_payload["owner"] = owner
-    if stored_split_operation is not None:
-        task_payload["split_operation"] = stored_split_operation
-        # The split path writes "phase" into the payload; carry it so the
-        # projection doctor's mirror-vs-deployed record check does not flag
-        # a phase mismatch after a legacy revision.  Ordinary legacy tasks
-        # without split metadata are unaffected.
-        task_payload["phase"] = phase
+        # Gate 1: the task must already be registered.  A revision expresses
+        # "the same registered task's plan content changed"; it is not another
+        # task-create path and must never INSERT a DB-only mirror.
+        stored_row = conn.execute(
+            "SELECT * FROM tasks WHERE workspace_id = ? AND task_id = ?",
+            (workspace_id, task_id),
+        ).fetchone()
+        if stored_row is None:
+            raise ValueError(
+                f"task {task_id} has no existing task mirror; plan revision "
+                "requires a task registered via task create / create-record"
+            )
+        try:
+            stored_payload = json.loads(stored_row["payload_json"])
+        except json.JSONDecodeError:
+            stored_payload = None
+        if not isinstance(stored_payload, dict):
+            raise ValueError(
+                "stored task mirror payload must be a dict, "
+                f"got {type(stored_payload).__name__}"
+            )
+        # Gate 2: the revised plan must keep the registered plan identity.
+        # Prefer the canonical absolute identity; legacy mirrors that only
+        # store a workspace-relative plan_doc resolve it against the workspace.
+        stored_identity = stored_payload.get("absolute_plan_doc")
+        if not isinstance(stored_identity, str) or not stored_identity:
+            stored_raw = stored_payload.get("plan_doc")
+            if isinstance(stored_raw, str) and stored_raw:
+                stored_identity = str(_resolve_workspace_path(workspace, stored_raw))
+            else:
+                raise ValueError(
+                    f"task {task_id} mirror has no registered plan_doc identity; "
+                    "cannot revise"
+                )
+        if stored_identity != resolved_plan_doc:
+            raise ValueError(
+                f"plan_doc {plan_doc!r} does not match the registered plan "
+                f"identity {stored_identity!r} of task {task_id}; a revision "
+                "cannot change plan identity"
+            )
 
-    task_row, _ = upsert_task_mirror(
-        conn,
-        workspace_id=workspace_id,
-        task_id=task_id,
-        phase=phase,
-        owner=owner,
-        branch=branch,
-        pr=None,
-        payload=task_payload,
-    )
-    resolved_idempotency_key = idempotency_key or f"{workspace_id}:{task_id}:plan.ready:{plan_content_hash}"
-    prior_ready = conn.execute(
-        "SELECT id FROM events WHERE workspace_id = ? AND task_id = ? AND event_type = 'plan.ready' "
-        "AND idempotency_key != ?"
-        "ORDER BY rowid DESC LIMIT 1",
-        (workspace_id, task_id, resolved_idempotency_key),
-    ).fetchone()
-    supersedes_plan_ready_event_id = prior_ready["id"] if prior_ready else None
-    event_payload = {
-        **task_payload,
-        "workspace_path": workspace.path,
-        "current_branch": workspace.base_branch,
-        "allocated_branch": branch,
-        "status": "ready_for_worker" if phase in {"ready", "planned"} else phase,
-        "plan_content_hash": plan_content_hash,
-        "plan_sha256": plan_sha256,
-        "supersedes_plan_ready_event_id": supersedes_plan_ready_event_id,
-    }
-    event_result = append_event(
-        conn,
-        workspace_id=workspace_id,
-        event_type="plan.ready",
-        actor=actor,
-        target=target,
-        task_id=task_id,
-        idempotency_key=resolved_idempotency_key,
-        payload=event_payload,
-    )
-    task_row, _ = upsert_task_mirror(
-        conn,
-        workspace_id=workspace_id,
-        task_id=task_id,
-        phase=phase,
-        owner=owner,
-        branch=branch,
-        pr=None,
-        payload=task_payload,
-        last_event_id=event_result.row["id"],
-    )
+        # Validate and preserve an existing task mirror's split-operation
+        # metadata.  Caller cannot forge or replace this reserved key.
+        stored_split_operation = _carry_split_operation_metadata(
+            conn, workspace_id, task_id, extra_payload
+        )
+
+        # Omitted optional fields keep the stored values; explicit values
+        # (and an explicit --payload-json object) overlay them.  Explicit
+        # empty strings normalize the same way as omission (preserve stored)
+        # so title is never written empty while owner/branch get dropped.
+        # Canonical fields are always system-controlled.
+        effective_title = title or stored_payload.get("title") or task_id
+        effective_owner = owner or stored_row["owner"]
+        effective_branch = branch or stored_row["branch"]
+        # A revision has no PR-modification parameters: keep the stored PR.
+        effective_pr = stored_row["pr"]
+        stored_plan_doc_expr = stored_payload.get("plan_doc")
+        if not isinstance(stored_plan_doc_expr, str) or not stored_plan_doc_expr:
+            stored_plan_doc_expr = plan_doc
+
+        merged_payload = dict(stored_payload)
+        if payload is not None:
+            for key, value in payload.items():
+                if key == "split_operation":
+                    # Reserved key: carry validation above decides; never
+                    # overlay caller-supplied metadata directly.
+                    continue
+                merged_payload[key] = value
+        merged_payload["task_id"] = task_id
+        merged_payload["title"] = effective_title
+        merged_payload["plan_doc"] = stored_plan_doc_expr
+        merged_payload["absolute_plan_doc"] = resolved_plan_doc
+        merged_payload["status"] = phase
+        if effective_branch:
+            merged_payload["branch"] = effective_branch
+        else:
+            merged_payload.pop("branch", None)
+        if effective_owner:
+            merged_payload["owner"] = effective_owner
+        else:
+            merged_payload.pop("owner", None)
+        if stored_split_operation is not None:
+            merged_payload["split_operation"] = stored_split_operation
+            # The split path writes "phase" into the payload; carry it so the
+            # projection doctor's mirror-vs-deployed record check does not flag
+            # a phase mismatch after a legacy revision.  Ordinary legacy tasks
+            # without split metadata are unaffected.
+            merged_payload["phase"] = phase
+        else:
+            merged_payload.pop("split_operation", None)
+
+        task_row, _ = upsert_task_mirror(
+            conn,
+            workspace_id=workspace_id,
+            task_id=task_id,
+            phase=phase,
+            owner=effective_owner,
+            branch=effective_branch,
+            pr=effective_pr,
+            payload=merged_payload,
+            commit=False,
+        )
+        resolved_idempotency_key = (
+            idempotency_key or f"{workspace_id}:{task_id}:plan.ready:{plan_content_hash}"
+        )
+        prior_ready = conn.execute(
+            "SELECT id FROM events WHERE workspace_id = ? AND task_id = ? AND event_type = 'plan.ready' "
+            "AND idempotency_key != ?"
+            "ORDER BY rowid DESC LIMIT 1",
+            (workspace_id, task_id, resolved_idempotency_key),
+        ).fetchone()
+        supersedes_plan_ready_event_id = prior_ready["id"] if prior_ready else None
+        event_payload = {
+            **merged_payload,
+            "workspace_path": workspace.path,
+            "current_branch": workspace.base_branch,
+            "allocated_branch": effective_branch,
+            "status": "ready_for_worker" if phase in {"ready", "planned"} else phase,
+            "plan_content_hash": plan_content_hash,
+            "plan_sha256": plan_sha256,
+            "supersedes_plan_ready_event_id": supersedes_plan_ready_event_id,
+        }
+        event_result = append_event(
+            conn,
+            workspace_id=workspace_id,
+            event_type="plan.ready",
+            actor=actor,
+            target=target,
+            task_id=task_id,
+            idempotency_key=resolved_idempotency_key,
+            payload=event_payload,
+            commit=False,
+        )
+        if not event_result.created:
+            # The key collided with a pre-existing event.  Only an exact replay
+            # of this intent may proceed; anything else fails closed and rolls
+            # back the mirror upsert above.
+            _validate_plan_ready_exact_replay(
+                event_result.row,
+                workspace_id=workspace_id,
+                task_id=task_id,
+                actor=actor,
+                target=target,
+                expected_payload=event_payload,
+            )
+        task_row, _ = upsert_task_mirror(
+            conn,
+            workspace_id=workspace_id,
+            task_id=task_id,
+            phase=phase,
+            owner=effective_owner,
+            branch=effective_branch,
+            pr=effective_pr,
+            payload=merged_payload,
+            last_event_id=event_result.row["id"],
+            commit=False,
+        )
+
+        conn.execute("RELEASE SAVEPOINT plan_revise")
+        conn.commit()
+    except Exception:
+        # The savepoint may never have been established (external failure);
+        # tolerate that so the original exception is not masked.
+        try:
+            conn.execute("ROLLBACK TO SAVEPOINT plan_revise")
+        except sqlite3.Error:
+            pass
+        try:
+            conn.execute("RELEASE SAVEPOINT plan_revise")
+        except sqlite3.Error:
+            pass
+        raise
 
     return TaskCreateResult(
         workspace=workspace,

@@ -21,6 +21,7 @@
     "task create-files",
     "task create-record",
     "task handoff",
+    "plan revise",
     "plan review-request",
     "plan approve",
     "plan reject",
@@ -92,8 +93,8 @@
   ],
   "metadata": {
     "default_db_path_sha256": "853182c0ba6a6dcd1e5a70dcb45bb3fcb80f31d53e26c28f29d4dae861a389b5",
-    "leaf_count": 89,
-    "node_count": 117,
+    "leaf_count": 90,
+    "node_count": 118,
     "prog": "coordinate",
     "top_level_commands": [
       "workspace",
@@ -2915,6 +2916,7 @@
         {
           "action_class": "_SubParsersAction",
           "choices": [
+            "revise",
             "review-request",
             "approve",
             "reject"
@@ -2931,11 +2933,203 @@
         }
       ],
       "defaults": {},
-      "help": "usage: coordinate plan [-h] {review-request,approve,reject} ...\n\npositional arguments:\n  {review-request,approve,reject}\n    review-request      Request plan review\n    approve             Approve a plan\n    reject              Reject a plan\n\noptions:\n  -h, --help            show this help message and exit\n",
+      "help": "usage: coordinate plan [-h] {revise,review-request,approve,reject} ...\n\npositional arguments:\n  {revise,review-request,approve,reject}\n    revise              Revise an existing task's plan: append a superseding plan.ready (preserves\n                        split-operation metadata; no auto-approve)\n    review-request      Request plan review\n    approve             Approve a plan\n    reject              Reject a plan\n\noptions:\n  -h, --help            show this help message and exit\n",
       "path": [
         "plan"
       ],
       "prog": "coordinate plan"
+    },
+    {
+      "actions": [
+        {
+          "action_class": "_HelpAction",
+          "choices": null,
+          "const": null,
+          "default": "==SUPPRESS==",
+          "dest": "help",
+          "help": "show this help message and exit",
+          "metavar": null,
+          "nargs": 0,
+          "option_strings": [
+            "-h",
+            "--help"
+          ],
+          "required": false,
+          "type": null
+        },
+        {
+          "action_class": "_StoreAction",
+          "choices": null,
+          "const": null,
+          "default": null,
+          "dest": "workspace_id",
+          "help": null,
+          "metavar": null,
+          "nargs": null,
+          "option_strings": [],
+          "required": true,
+          "type": null
+        },
+        {
+          "action_class": "_StoreAction",
+          "choices": null,
+          "const": null,
+          "default": null,
+          "dest": "task_id",
+          "help": null,
+          "metavar": null,
+          "nargs": null,
+          "option_strings": [
+            "--task-id"
+          ],
+          "required": true,
+          "type": null
+        },
+        {
+          "action_class": "_StoreAction",
+          "choices": null,
+          "const": null,
+          "default": null,
+          "dest": "plan_doc",
+          "help": null,
+          "metavar": null,
+          "nargs": null,
+          "option_strings": [
+            "--plan-doc"
+          ],
+          "required": true,
+          "type": null
+        },
+        {
+          "action_class": "_StoreAction",
+          "choices": null,
+          "const": null,
+          "default": null,
+          "dest": "title",
+          "help": null,
+          "metavar": null,
+          "nargs": null,
+          "option_strings": [
+            "--title"
+          ],
+          "required": false,
+          "type": null
+        },
+        {
+          "action_class": "_StoreAction",
+          "choices": null,
+          "const": null,
+          "default": null,
+          "dest": "owner",
+          "help": null,
+          "metavar": null,
+          "nargs": null,
+          "option_strings": [
+            "--owner"
+          ],
+          "required": false,
+          "type": null
+        },
+        {
+          "action_class": "_StoreAction",
+          "choices": null,
+          "const": null,
+          "default": null,
+          "dest": "branch",
+          "help": null,
+          "metavar": null,
+          "nargs": null,
+          "option_strings": [
+            "--branch"
+          ],
+          "required": false,
+          "type": null
+        },
+        {
+          "action_class": "_StoreAction",
+          "choices": null,
+          "const": null,
+          "default": "ready",
+          "dest": "phase",
+          "help": null,
+          "metavar": null,
+          "nargs": null,
+          "option_strings": [
+            "--phase"
+          ],
+          "required": false,
+          "type": null
+        },
+        {
+          "action_class": "_StoreAction",
+          "choices": null,
+          "const": null,
+          "default": "operator",
+          "dest": "actor",
+          "help": null,
+          "metavar": null,
+          "nargs": null,
+          "option_strings": [
+            "--actor"
+          ],
+          "required": false,
+          "type": null
+        },
+        {
+          "action_class": "_StoreAction",
+          "choices": null,
+          "const": null,
+          "default": "worker",
+          "dest": "target",
+          "help": null,
+          "metavar": null,
+          "nargs": null,
+          "option_strings": [
+            "--target"
+          ],
+          "required": false,
+          "type": null
+        },
+        {
+          "action_class": "_StoreAction",
+          "choices": null,
+          "const": null,
+          "default": null,
+          "dest": "payload_json",
+          "help": "Optional payload object overlaid on the stored task payload (default: keep stored fields)",
+          "metavar": null,
+          "nargs": null,
+          "option_strings": [
+            "--payload-json"
+          ],
+          "required": false,
+          "type": null
+        },
+        {
+          "action_class": "_StoreAction",
+          "choices": null,
+          "const": null,
+          "default": null,
+          "dest": "idempotency_key",
+          "help": null,
+          "metavar": null,
+          "nargs": null,
+          "option_strings": [
+            "--idempotency-key"
+          ],
+          "required": false,
+          "type": null
+        }
+      ],
+      "defaults": {
+        "handler": "coordinate.planning_cli.handle_plan_revise"
+      },
+      "help": "usage: coordinate plan revise [-h] --task-id TASK_ID --plan-doc PLAN_DOC [--title TITLE]\n                              [--owner OWNER] [--branch BRANCH] [--phase PHASE] [--actor ACTOR]\n                              [--target TARGET] [--payload-json PAYLOAD_JSON]\n                              [--idempotency-key IDEMPOTENCY_KEY]\n                              workspace_id\n\npositional arguments:\n  workspace_id\n\noptions:\n  -h, --help            show this help message and exit\n  --task-id TASK_ID\n  --plan-doc PLAN_DOC\n  --title TITLE\n  --owner OWNER\n  --branch BRANCH\n  --phase PHASE\n  --actor ACTOR\n  --target TARGET\n  --payload-json PAYLOAD_JSON\n                        Optional payload object overlaid on the stored task payload (default: keep\n                        stored fields)\n  --idempotency-key IDEMPOTENCY_KEY\n",
+      "path": [
+        "plan",
+        "revise"
+      ],
+      "prog": "coordinate plan revise"
     },
     {
       "actions": [
@@ -3609,12 +3803,27 @@
           ],
           "required": false,
           "type": null
+        },
+        {
+          "action_class": "_StoreAction",
+          "choices": null,
+          "const": null,
+          "default": null,
+          "dest": "task_id",
+          "help": "Reconcile only this task mirror (targeted); full reconcile when omitted",
+          "metavar": null,
+          "nargs": null,
+          "option_strings": [
+            "--task-id"
+          ],
+          "required": false,
+          "type": null
         }
       ],
       "defaults": {
         "handler": "coordinate.workspace_cli.handle_reconcile"
       },
-      "help": "usage: coordinate reconcile [-h] [--no-refresh] workspace_id\n\npositional arguments:\n  workspace_id\n\noptions:\n  -h, --help    show this help message and exit\n  --no-refresh  Read state without running harnessctl state\n",
+      "help": "usage: coordinate reconcile [-h] [--no-refresh] [--task-id TASK_ID] workspace_id\n\npositional arguments:\n  workspace_id\n\noptions:\n  -h, --help         show this help message and exit\n  --no-refresh       Read state without running harnessctl state\n  --task-id TASK_ID  Reconcile only this task mirror (targeted); full reconcile when omitted\n",
       "path": [
         "reconcile"
       ],

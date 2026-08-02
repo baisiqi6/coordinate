@@ -194,6 +194,42 @@ def handle_task_handoff(args: argparse.Namespace) -> int:
     return 0
 
 
+def handle_plan_revise(args: argparse.Namespace) -> int:
+    payload = None
+    if args.payload_json is not None:
+        try:
+            payload = json.loads(args.payload_json)
+        except json.JSONDecodeError as exc:
+            print(f"error: invalid --payload-json: {exc}", file=sys.stderr)
+            return 1
+        if not isinstance(payload, dict):
+            print("error: --payload-json must decode to an object", file=sys.stderr)
+            return 1
+    try:
+        with _conn(args) as conn:
+            # No operation_id/fingerprints: the existing service revision branch
+            # appends a superseding plan.ready while carrying split metadata.
+            result = create_plan_task_record(
+                conn,
+                workspace_id=args.workspace_id,
+                task_id=args.task_id,
+                plan_doc=args.plan_doc,
+                title=args.title,
+                owner=args.owner,
+                branch=args.branch,
+                phase=args.phase,
+                actor=args.actor,
+                target=args.target,
+                payload=payload,
+                idempotency_key=args.idempotency_key,
+            )
+    except ValueError as exc:
+        _print_json({"error": {"message": str(exc)}})
+        return 1
+    _print_json({"result": result.to_dict()})
+    return 0
+
+
 def handle_plan_review_request(args: argparse.Namespace) -> int:
     with _conn(args) as conn:
         result = review_request_plan(
@@ -352,6 +388,23 @@ def register_planning_commands(subcommands) -> None:
 
     plan = subcommands.add_parser("plan", help="Plan review and approval gate")
     plan_subcommands = plan.add_subparsers(dest="plan_command")
+
+    plan_revise = plan_subcommands.add_parser(
+        "revise",
+        help="Revise an existing task's plan: append a superseding plan.ready (preserves split-operation metadata; no auto-approve)",
+    )
+    plan_revise.add_argument("workspace_id")
+    plan_revise.add_argument("--task-id", required=True)
+    plan_revise.add_argument("--plan-doc", required=True)
+    plan_revise.add_argument("--title")
+    plan_revise.add_argument("--owner")
+    plan_revise.add_argument("--branch")
+    plan_revise.add_argument("--phase", default="ready")
+    plan_revise.add_argument("--actor", default="operator")
+    plan_revise.add_argument("--target", default="worker")
+    plan_revise.add_argument("--payload-json", default=None, help="Optional payload object overlaid on the stored task payload (default: keep stored fields)")
+    plan_revise.add_argument("--idempotency-key")
+    plan_revise.set_defaults(handler=handle_plan_revise)
 
     plan_review_request = plan_subcommands.add_parser("review-request", help="Request plan review")
     plan_review_request.add_argument("workspace_id")
