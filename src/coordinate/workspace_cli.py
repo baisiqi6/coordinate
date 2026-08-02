@@ -19,7 +19,7 @@ from .db import (
     upsert_workspace_host_profile,
 )
 from .doctor import diagnose_workspace
-from .harness import HarnessAdapter
+from .harness import HarnessAdapter, HarnessError
 from .onboarding import init_file_harness, init_full_harness
 from .reconcile import reconcile_workspace
 
@@ -256,7 +256,25 @@ def handle_state(args: argparse.Namespace) -> int:
         print(f"error: unknown workspace: {args.workspace_id}", file=sys.stderr)
         return 1
     adapter = HarnessAdapter(workspace)
-    state = adapter.read_state() if args.no_refresh else adapter.refresh_state()
+    if args.no_refresh:
+        # Diagnostic only: never authoritative; stale is a nonzero report.
+        state, fresh, reasons = adapter.read_state_diagnostic()
+        output = {
+            "workspace": workspace.to_dict(),
+            "state": state,
+            "authoritative": fresh,
+            "stale_reasons": reasons,
+        }
+        _print_json(output)
+        return 0 if fresh else 1
+    try:
+        state = adapter.refresh_state()
+    except HarnessError as exc:
+        _print_json({
+            "error": {"message": str(exc)},
+            "workspace": workspace.to_dict(),
+        })
+        return 1
     _print_json({"workspace": workspace.to_dict(), "state": state})
     return 0
 

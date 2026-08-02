@@ -13,7 +13,7 @@ Hermes、OhMyPi 和未来的 adapter。
 2. 进程和传输状态：PID、退出状态、终端/会话状态、provider 错误、排队、
    限流和重连。
 3. 仓库和产物状态：`git status`、diff、生成的文件、日志和结果产物。
-4. 验证状态：测试、构建、linter、运行时探测和 coordinator job/result 记录。
+4. 验证状态：测试、构建、linter、运行时探测和 Coordinate job/result 记录。
 
 没有文件变化只意味着还看不到文件变化。Worker 可能正在阅读、推理、搜索、
 等待 provider 或运行长工具。不要仅从 `git diff` 推断不活跃。

@@ -40,7 +40,7 @@ _CANONICAL_AST_HASHES = {
     "handle_assignment_unblock": "73c59722e4c49205d9056e7a775bb3149e7177b929a0aa86dd014e447afb4d0c",
     "handle_assignment_closeout": "6dc9a56745ea1d437edf53740136ed88c11f630f28100a4956de4d5817de35af",
     "handle_assignment_review_result": "e6fd179a7a4c0ef1eef6a21240518dfbe9cc8d12e86878de20a3bebdc521473d",
-    "handle_assignment_mark_done": "3e5f232439eaa1a499437177f8210dd4687266e1b5dd52346d3c2d82f11b4010",
+    "handle_assignment_mark_done": "686a82cccdcaba4f82c1de7dc92d2df2d4919f6f122a5f3166799cd3ffc4dcb7",
 }
 
 _WORKFLOW_HANDLER_NAMES = list(_CANONICAL_AST_HASHES.keys())
@@ -769,7 +769,8 @@ class WorkflowCLIAssignmentDelegationTests(unittest.TestCase):
 
     def test_assignment_mark_done_gate_failure_returns_one(self) -> None:
         args = SimpleNamespace(
-            workspace_id="ws1", task_id="t1", actor="operator", idempotency_hint=None,
+            workspace_id="ws1", task_id="t1", actor="operator",
+            idempotency_hint=None, verification=None,
         )
         result = Mock(
             to_dict=Mock(return_value={"ok": False}),
@@ -787,7 +788,8 @@ class WorkflowCLIAssignmentDelegationTests(unittest.TestCase):
 
     def test_assignment_mark_done_mutation_failure_returns_one(self) -> None:
         args = SimpleNamespace(
-            workspace_id="ws1", task_id="t1", actor="operator", idempotency_hint=None,
+            workspace_id="ws1", task_id="t1", actor="operator",
+            idempotency_hint=None, verification=None,
         )
         result = Mock(
             to_dict=Mock(return_value={"ok": True}),

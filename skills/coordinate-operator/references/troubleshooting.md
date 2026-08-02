@@ -43,8 +43,9 @@ $MAC delivery list --status pending --platform stdout
 ```
 
 如果事件类型不受支持，policy pump 会跳过它。
-查询真实 backlog 时始终指定目标 transport platform。`platform=none,status=pending`
-是“可见回复已由其他组件发送”的 durable audit record，不是待发送消息。
+查询真实 backlog 时始终指定目标 transport platform。若看到
+`platform=none,status=pending`，它是旧版本留下的 durable audit record，不是待发送消息；
+当前 runtime 在可见回复已由其他组件发送时不再创建该 delivery。
 
 ## Delivery 失败
 

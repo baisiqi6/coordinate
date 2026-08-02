@@ -48,7 +48,7 @@ def reconcile_workspace(
     checklist = harness.read_checklist()
     items = checklist.get("items", [])
     if not isinstance(items, list):
-        raise ValueError("mvp-checklist.json must contain an items array")
+        raise ValueError("checklist must contain an items array")
 
     counts = {"created": 0, "updated": 0, "unchanged": 0}
     events_created = 0

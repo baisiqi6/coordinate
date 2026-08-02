@@ -40,11 +40,11 @@ pip install .
 
 ## 新 Workspace 初始化顺序
 
-1. 在 coordinator 中注册 workspace：`workspace add <id> --path ... --harness-root ...`
+1. 在 Coordinate 中注册 workspace：`workspace add <id> --path ... --harness-root ...`
 2. 运行 `workspace init-harness <id> --mode full --source <reference-workspace-scripts/harness>` 创建完整 harness 运行时
 3. 运行 `workspace doctor <id>` 验证 full_harness_runtime 状态
-4. 在 `docs/project-harness/tasks/<task-id>/plan.md` 下创建计划
-5. 使用 coordinator `task create` 注册第一个任务
+4. 在 `<harness-root>/tasks/<task-id>/plan.md` 下创建计划
+5. 使用 Coordinate `task create` 注册第一个任务
 6. 运行 `workspace audit <id>` 确认无 drift
 
 ## Channel binding（platform channel → workspace）
@@ -96,7 +96,8 @@ coordinate workspace channel release <platform> <channel_id> \
   这里**不要**运行 `init-harness --mode full`（它会写入上游 checkout，
   且当 `harness_root` 在路径外时会被阻止）。改为将 `harness_root` 指向
   sidecar 并使用 host-aware 流程：`issue materialize-files`（coding-host 半程）
-  只同步 `harness_root/mvp-checklist.json` 并支持 `workspace.path` 之外的
+  只同步 resolver-selected checklist（`harness_root/harness-checklist.json` 或 legacy
+  `harness_root/mvp-checklist.json`，恰好一个存在）并支持 `workspace.path` 之外的
   sidecar `harness_root`；代码 checkout 保持无 harness 文件
   （由 `tests/test_issues.py::IssueMaterializeHostAwareTests::test_files_supports_sidecar_harness_root` 覆盖）。
 - **服务器 `/opt/*` 副本是部署产物，不是权威来源。** 它们由当前环境中经过审查的
@@ -291,7 +292,8 @@ PYTHONPATH=src python3 -m coordinate \
 
 ## Host-Aware Mark-Done：完成回执协议
 
-Host-aware mark-done 将 coding host 的规范 `mvp-checklist.json` mutation 与
+Host-aware mark-done 将 coding host 对 resolver-selected canonical checklist
+（`harness-checklist.json` 或 legacy `mvp-checklist.json`，恰好一个存在）的 mutation 与
 服务器端 `task.done` 事件绑定在**一个服务器签发的、一次性完成回执**之下。
 两个半程不能再独立推进：回执是唯一授权，它存在于控制面事件账本中：
 
@@ -314,7 +316,7 @@ Host-aware mark-done 将 coding host 的规范 `mvp-checklist.json` mutation 与
 
 ```bash
 # 1. 控制面：验证 closeout/review/forge gate 并签发回执。
-coord-ssh assignment mark-done-prepare discord-nexus \
+coord-ssh assignment mark-done-prepare coordinate \
   --task-id <task_id> --actor operator
 # => result.receipt_id（记录它）
 
@@ -324,27 +326,28 @@ coord-ssh assignment mark-done-prepare discord-nexus \
 #    completion_receipt 元数据 -> mark-done-apply（确认）。
 coordinate assignment mark-done-files \
   --workspace-path /path/to/<workspace> \
-  --harness-root docs/project-harness \
-  --workspace-id discord-nexus \
+  --harness-root docs \
+  --workspace-id coordinate \
   --task-id <task_id> \
   --receipt <receipt_id> \
   --event-cli-path "$HOME/.local/bin/coord-ssh" \
   --verification "completion authorized by receipt <receipt_id>"
 
 # 3. Commit + push 更新后的 checklist，然后按当前部署配置执行受审部署。
-git add docs/project-harness/mvp-checklist.json
+#    （git add 作用于 resolver-selected checklist：新名或 legacy 名，恰好一个存在）
+git add "$(python3 scripts/harness/harness_common.py --resolved-checklist)"
 git commit -m "harness: mark-done for <task_id>"
 git push
 # 部署命令由当前环境配置提供；public 文档不硬编码 private topology。
 
 # 4. 控制面：重新验证已部署的 harness，并在追加 task.done 的同时
 #    原子地消费回执。
-coord-ssh assignment mark-done-record discord-nexus \
+coord-ssh assignment mark-done-record coordinate \
   --receipt <receipt_id> --actor operator
 
 # 5. 验证状态。
-coord-ssh state discord-nexus
-coord-ssh event list discord-nexus
+coord-ssh state coordinate
+coord-ssh event list coordinate
 ```
 
 回执记录 `before_fingerprint` / `after_fingerprint`（对
@@ -376,7 +379,7 @@ coordinate assignment mark-done-files \
   --task-id <task_id> --repair-reason "drift: historical task.done by omp"
 
 # 记录侧：--repair-reason 是必需的。
-coord-ssh assignment mark-done-record discord-nexus \
+coord-ssh assignment mark-done-record coordinate \
   --task-id <task_id> --repair-reason "drift: historical task.done by omp"
 ```
 

@@ -1,9 +1,11 @@
 #!/usr/bin/env python3
 """Build machine-readable harness state from source-of-truth files.
 
-Reads: mvp-checklist.json, progress.md, current/task_plan.md, events.jsonl,
+Reads: the resolved checklist (harness-checklist.json or legacy
+mvp-checklist.json), progress.md, current/task_plan.md, events.jsonl,
 optional harness-config.json.
-Writes: harness-state.json
+Writes: harness-state.json (atomically, only after semantic validation
+of the current checklist; failures fail closed without writing state).
 """
 from __future__ import annotations
 
@@ -15,16 +17,21 @@ from typing import Any
 
 from harness_common import (
     active_lease,
+    atomic_write_json,
+    checklist_runtime_problems,
     configured_commands,
     event_log_path,
+    fail,
     harness_root,
-    load_checklist,
     load_config,
     project_root,
     read_text,
     rel,
+    resolve_checklist,
+    resolve_item_plan,
+    sha256_bytes,
     utc_now,
-    write_json,
+    validate_checklist,
 )
 
 
@@ -82,6 +89,8 @@ def _locate_item(checklist: dict[str, Any], current_text: str) -> dict[str, Any]
     }
 
     def is_active(entry: dict[str, Any]) -> bool:
+        if entry.get("status") == "done":
+            return False  # terminal items never masquerade as current
         workflow = entry.get("workflow")
         workflow_status = workflow.get("status") if isinstance(workflow, dict) else None
         return entry.get("status") in {"doing", "blocked"} or workflow_status in active_workflow_statuses
@@ -109,9 +118,9 @@ def detect_current_item(checklist: dict[str, Any], current_text: str) -> dict[st
     if item is None:
         return None
 
-    plan_path = extract_inline_value(current_text, "Active plan path")
-    if plan_path is None:
-        plan_path = extract_inline_value(current_text, "Canonical plan")
+    # The plan locator authority is the checklist (via the unified resolver);
+    # the pointer only helps locate the item and must not override it.
+    plan_path = rel(resolve_item_plan(item, require_exists=False))
 
     return {
         "id": item["id"],
@@ -125,7 +134,7 @@ def detect_current_item(checklist: dict[str, Any], current_text: str) -> dict[st
         "active_lease": active_lease(item, utc_now()),
         "artifacts": item.get("artifacts", {}),
         "review": item.get("review", {}),
-        "plan_path": plan_path or "docs/project-harness/tasks/" + item["id"] + "/plan.md",
+        "plan_path": plan_path,
     }
 
 
@@ -148,13 +157,17 @@ def workflow_summary(checklist: dict[str, Any]) -> dict[str, int]:
     return dict(sorted(statuses.items()))
 
 
-def detect_commands() -> dict[str, str]:
+def detect_commands(resolved_checklist_path: Path | None = None) -> dict[str, str]:
     commands = {
         "state": "scripts/harness/harnessctl state",
         "session_init": "scripts/harness/harnessctl session-init",
         "validate_checklist": (
             "python3 scripts/harness/validate_checklist.py "
-            "docs/project-harness/mvp-checklist.json"
+            + (
+                rel(resolved_checklist_path)
+                if resolved_checklist_path is not None
+                else "docs/harness-checklist.json"
+            )
         ),
     }
 
@@ -210,7 +223,28 @@ def recent_events(limit: int = 8) -> list[dict[str, Any]]:
 
 def build_state() -> dict[str, Any]:
     root = harness_root()
-    checklist = load_checklist()
+    # Resolve once, read once: the parsed/validated bytes are exactly the
+    # bytes the digest is computed from.
+    resolved = resolve_checklist(purpose="read")
+    original_bytes = resolved.path.read_bytes()
+    try:
+        checklist = json.loads(original_bytes)
+    except json.JSONDecodeError as exc:
+        fail(f"checklist {resolved.path} is not valid JSON: {exc}")
+    errors, _ = validate_checklist(checklist)
+    if errors:
+        fail(
+            f"checklist is invalid; refusing to derive state: {resolved.path}\n"
+            + "\n".join(f"  - {error}" for error in errors[:8])
+        )
+    runtime_problems = checklist_runtime_problems(checklist)
+    if runtime_problems:
+        fail(
+            f"checklist has runtime authority problems; refusing to derive state: {resolved.path}\n"
+            + "\n".join(f"  - {problem}" for problem in runtime_problems)
+        )
+    resolved_checklist_path = resolved.path
+    checklist_sha256 = sha256_bytes(original_bytes)
     progress_text = read_text(root / "progress.md")
     current_text = read_text(root / "current" / "task_plan.md")
     current_item = detect_current_item(checklist, current_text)
@@ -218,24 +252,28 @@ def build_state() -> dict[str, Any]:
 
     return {
         "project": checklist.get("project", project_root().name),
-        "harness_root": checklist.get("harness_root", "docs/project-harness"),
+        "harness_root": checklist.get("harness_root", "docs"),
         "generated_at": utc_now().isoformat().replace("+00:00", "Z"),
+        "source": {
+            "checklist_path": rel(resolved_checklist_path),
+            "checklist_sha256": checklist_sha256,
+        },
         "current_status": compact_text(extract_section(progress_text, "## Current Status")),
         "current_item": current_item,
         "checklist_summary": checklist_summary(checklist),
         "workflow_summary": workflow_summary(checklist),
         "paths": {
-            "scope": "docs/project-harness/scope.md",
-            "architecture": "docs/project-harness/architecture.md",
-            "domain_model": "docs/project-harness/domain-model.md",
-            "checklist": "docs/project-harness/mvp-checklist.json",
-            "progress": "docs/project-harness/progress.md",
-            "runbook": "docs/project-harness/runbook.md",
-            "config": "docs/project-harness/harness-config.json",
+            "scope": "docs/scope.md",
+            "architecture": "docs/architecture.md",
+            "domain_model": "docs/domain-model.md",
+            "checklist": rel(resolved_checklist_path),
+            "progress": "docs/progress.md",
+            "runbook": "docs/runbook.md",
+            "config": "docs/harness-config.json",
             "events": rel(event_log_path(config)),
-            "current_task_plan": "docs/project-harness/current/task_plan.md",
+            "current_task_plan": "docs/current/task_plan.md",
         },
-        "commands": detect_commands(),
+        "commands": detect_commands(resolved_checklist_path),
         "runtime": config.get("runtime", {}),
         "git": config.get("git", {}),
         "message_bus": config.get("message_bus", {}),
@@ -246,7 +284,7 @@ def build_state() -> dict[str, Any]:
 
 def write_state(state: dict[str, Any]) -> Path:
     output_path = harness_root() / "harness-state.json"
-    write_json(output_path, state)
+    atomic_write_json(output_path, state)
     return output_path
 
 

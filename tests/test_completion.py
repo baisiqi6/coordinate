@@ -79,9 +79,16 @@ def _item(task_id="mvp-001", status="doing", workflow_status="review_approved",
         "id": task_id,
         "title": f"Task {task_id}",
         "status": status,
-        "owner": None,
+        "priority": "p1",
+        "owner": "codex",
+        "selected_in_session": "session-1",
         "verification": "",
         "updated_at": "2026-01-01T00:00:00Z",
+        "dependencies": [],
+        "blocked_by": [],
+        "blocked_reason": "",
+        "acceptance": f"Acceptance for {task_id}",
+        "handoff": {"from": None, "to": None, "reason": None},
         "workflow": {"status": workflow_status, "branch": branch,
                      "updated_at": "2026-01-01T00:00:00Z"},
     }
@@ -914,7 +921,12 @@ class FingerprintTests(unittest.TestCase):
         tmp = tempfile.mkdtemp()
         self.addCleanup(lambda: __import__("shutil").rmtree(tmp, ignore_errors=True))
         Path(tmp, "mvp-checklist.json").write_text(
-            json.dumps({"items": [_item()]}), encoding="utf-8",
+            json.dumps({
+                "project": "demo",
+                "harness_root": ".",
+                "updated_at": "2026-01-01",
+                "items": [_item()],
+            }), encoding="utf-8",
         )
         fps = compute_mark_done_fingerprints(harness_root=tmp, task_id="mvp-001")
         self.assertEqual(fps.before_fingerprint, compute_item_fingerprint(_item()))

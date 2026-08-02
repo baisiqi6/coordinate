@@ -94,10 +94,42 @@ $MAC task create WORKSPACE \
   --title 'Phase title' \
   --owner worker \
   --branch agents/worker/TASK \
-  --payload-json '{"test_baseline":"python -m unittest discover tests/"}'
+  --payload-json '{"test_baseline":"python -m unittest discover tests/"}' \
+  [--phase ready] [--priority p1] [--actor operator] [--target worker] \
+  [--idempotency-key KEY] [--operation-id UUID]
 ```
 
-`task create` 写入/更新 coordinator task mirror 并追加幂等 `plan.ready` 事件。
+`task create` 是 managed **combined create**：先在 workspace 的 checklist 写 file 半边
+（新增/更新 item 及 split_operation envelope），再写 Coordinate DB record 半边
+（task mirror + 幂等 `plan.ready` 事件）。`--operation-id` 固定 split operation id
+（默认 fresh UUIDv4 或复用已部署 envelope）。file 半边已提交而 DB 半边失败时，用同一
+`--operation-id` 重跑（或按 recovery 输出重跑 `task create-record`）幂等补齐 DB 半边，
+不重复 mutation。
+
+host-aware 拆分形态（coding-host 文件半边与 server DB 半边分离）：
+
+```bash
+# coding-host：只写 checklist 文件半边（无 DB 写）
+$MAC task create-files \
+  --workspace-path /path/to/repo \
+  --harness-root docs \
+  --workspace-id WORKSPACE \
+  --operation-id OPERATION \
+  --task-id TASK \
+  --plan-doc docs/path/to/phase-plan.md
+# code/deploy boundary：commit + push checklist 半边，按部署配置部署
+# server：只写 DB task mirror + plan.ready（无 checklist 写）
+$MAC task create-record WORKSPACE \
+  --operation-id OPERATION \
+  --input-fingerprint INPUT_SHA256 \
+  --before-fingerprint BEFORE_SHA256 \
+  --after-fingerprint AFTER_SHA256 \
+  --task-id TASK \
+  --plan-doc docs/path/to/phase-plan.md
+```
+
+`create-files` / `create-record` 与 combined `create` 使用同一 split-operation contract；
+完整 flags 以 CLI 帮助为准。
 
 ## Operator 待办
 
@@ -131,9 +163,9 @@ $MAC worker delivery --platform stdout --once --limit 20
 $MAC worker delivery --platform stdout --interval 5 --limit 20
 ```
 
-`delivery list` 不带过滤器时列出完整 ledger，因此也可能包含
-`platform=none,status=pending` 的 audit-only 记录。判断可发送 backlog 时同时指定
-`--status` 与 transport `--platform`；不要把 `none` 记录计入积压。
+`delivery list` 不带过滤器时列出完整 ledger，因此也可能包含旧版本留下的
+`platform=none,status=pending` 审计记录。当前 runtime 不再新增此类行。判断可发送 backlog
+时同时指定 `--status` 与 transport `--platform`；不要把旧 `none` 记录计入积压。
 
 ## Runtime: Executor / Capacity
 
@@ -246,7 +278,8 @@ $MAC assignment mark-done WORKSPACE --task-id TASK
 # 1) control plane 签发一次性 receipt
 $MAC assignment mark-done-prepare WORKSPACE --task-id TASK
 
-# 2) coding host 验证 receipt 并更新本地 mvp-checklist.json
+# 2) coding host 验证 receipt 并更新本地 checklist（resolver-selected：
+#    harness-checklist.json 或 legacy mvp-checklist.json，恰好一个存在）
 $MAC assignment mark-done-files WORKSPACE \
   --workspace-path /path/to/repo \
   --harness-root docs/project-harness \

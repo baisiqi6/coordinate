@@ -149,6 +149,10 @@ def register_assignment_commands(subcommands) -> None:
     assignment_mark_done.add_argument("workspace_id")
     assignment_mark_done.add_argument("--task-id", required=True)
     assignment_mark_done.add_argument("--actor", default="operator")
+    assignment_mark_done.add_argument(
+        "--verification",
+        help="Non-empty completion verification committed with the terminal status",
+    )
     assignment_mark_done.add_argument("--idempotency-hint")
     assignment_mark_done.set_defaults(handler=handle_assignment_mark_done)
 
@@ -423,6 +427,7 @@ def handle_assignment_mark_done(args: argparse.Namespace) -> int:
             task_id=args.task_id,
             actor=args.actor,
             idempotency_hint=args.idempotency_hint,
+            verification=args.verification,
         )
     output = {"result": result.to_dict()}
     _print_json(output)

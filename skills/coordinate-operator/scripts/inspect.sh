@@ -46,5 +46,5 @@ else
 fi
 echo
 
-echo "deliveries (all ledger records; platform=none is audit-only, not send backlog):"
+echo "deliveries (all ledger records; legacy platform=none rows are not send backlog):"
 MAC_REPO="$REPO" MAC_DB="$DB" "$MAC" delivery list

@@ -1652,6 +1652,16 @@ class MarkDoneTaskTests(unittest.TestCase):
                     "status": "doing",
                 }
             },
+            checklist_result={
+                "items": [
+                    {
+                        "id": task_id,
+                        "workflow": {"status": "review_approved"},
+                        "status": "doing",
+                        "verification": "evidence",
+                    }
+                ]
+            },
             **kwargs,
         )
 
@@ -1668,7 +1678,57 @@ class MarkDoneTaskTests(unittest.TestCase):
         self.assertEqual(call["operation"], "mark-done")
         self.assertEqual(call["task_id"], "mvp-001")
         self.assertEqual(call["actor"], "codex")
-        self.assertEqual(call["args"], ["codex"])
+        self.assertEqual(call["args"], ["codex", "--verification", "evidence"])
+
+    def test_explicit_verification_wins_over_item_value(self):
+        conn = self._make_conn()
+        adapter = self._make_adapter(conn)
+
+        mark_done_task(
+            conn, "demo", "mvp-001", actor="codex", adapter=adapter,
+            verification="explicit evidence",
+        )
+
+        self.assertEqual(len(adapter.calls), 1)
+        self.assertEqual(
+            adapter.calls[0]["args"], ["codex", "--verification", "explicit evidence"]
+        )
+
+    def test_missing_verification_fails_closed_before_mutation(self):
+        """A new item with empty verification is rejected before harnessctl runs:
+        no checklist write, no task.done, no mutation call."""
+        conn = self._make_conn()
+        workspace = get_workspace(conn, "demo")
+        adapter = _GateFakeAdapter(
+            workspace,
+            refresh_state_result={
+                "current_item": {
+                    "id": "mvp-001",
+                    "workflow": {"status": "review_approved"},
+                    "status": "doing",
+                }
+            },
+            checklist_result={
+                "items": [
+                    {
+                        "id": "mvp-001",
+                        "workflow": {"status": "review_approved"},
+                        "status": "doing",
+                        "verification": "",
+                    }
+                ]
+            },
+        )
+
+        result = mark_done_task(conn, "demo", "mvp-001", adapter=adapter)
+
+        self.assertFalse(result.event_created)
+        self.assertEqual(result.event, {})
+        self.assertIsNone(result.mutation)
+        self.assertIsNotNone(result.gate)
+        self.assertFalse(result.gate.passed)
+        self.assertIn("verification", result.gate.reason)
+        self.assertEqual(len(adapter.calls), 0)
 
     # --- success event ---
 
@@ -1676,7 +1736,7 @@ class MarkDoneTaskTests(unittest.TestCase):
         conn = self._make_conn()
         adapter = self._make_adapter(conn)
 
-        result = mark_done_task(conn, "demo", "mvp-001", adapter=adapter)
+        result = mark_done_task(conn, "demo", "mvp-001", adapter=adapter, verification="evidence")
 
         self.assertIsInstance(result, MarkDoneTaskResult)
         self.assertIsNotNone(result.mutation)
@@ -1692,7 +1752,7 @@ class MarkDoneTaskTests(unittest.TestCase):
         conn = self._make_conn()
         adapter = self._make_adapter(conn)
 
-        result = mark_done_task(conn, "demo", "mvp-001", adapter=adapter)
+        result = mark_done_task(conn, "demo", "mvp-001", adapter=adapter, verification="evidence")
 
         self.assertEqual(result.event["actor"], "operator")
 
@@ -1908,7 +1968,7 @@ class MarkDoneGateTests(unittest.TestCase):
             },
         )
 
-        result = mark_done_task(conn, "demo", "mvp-001", adapter=adapter)
+        result = mark_done_task(conn, "demo", "mvp-001", adapter=adapter, verification="evidence")
 
         self.assertTrue(result.event_created)
         self.assertEqual(result.event["event_type"], "task.done")
@@ -1940,7 +2000,7 @@ class MarkDoneGateTests(unittest.TestCase):
             },
         )
 
-        result = mark_done_task(conn, "demo", "mvp-001", adapter=adapter)
+        result = mark_done_task(conn, "demo", "mvp-001", adapter=adapter, verification="evidence")
 
         self.assertTrue(result.event_created)
         self.assertEqual(result.event["event_type"], "task.done")
@@ -1962,7 +2022,7 @@ class MarkDoneGateTests(unittest.TestCase):
             },
         )
 
-        result = mark_done_task(conn, "demo", "mvp-001", adapter=adapter)
+        result = mark_done_task(conn, "demo", "mvp-001", adapter=adapter, verification="evidence")
 
         self.assertFalse(result.event_created)
         self.assertEqual(result.event, {})
@@ -1983,7 +2043,7 @@ class MarkDoneGateTests(unittest.TestCase):
             checklist_result={"items": []},
         )
 
-        result = mark_done_task(conn, "demo", "mvp-001", adapter=adapter)
+        result = mark_done_task(conn, "demo", "mvp-001", adapter=adapter, verification="evidence")
 
         self.assertFalse(result.event_created)
         self.assertIsNotNone(result.gate)
@@ -2000,7 +2060,7 @@ class MarkDoneGateTests(unittest.TestCase):
             refresh_state_error=HarnessError("harnessctl state failed: file missing"),
         )
 
-        result = mark_done_task(conn, "demo", "mvp-001", adapter=adapter)
+        result = mark_done_task(conn, "demo", "mvp-001", adapter=adapter, verification="evidence")
 
         # Fail-closed: harness state unavailable → gate failure
         self.assertFalse(result.event_created)
@@ -2020,7 +2080,7 @@ class MarkDoneGateTests(unittest.TestCase):
             checklist_error=HarnessError("mvp-checklist.json not found"),
         )
 
-        result = mark_done_task(conn, "demo", "mvp-001", adapter=adapter)
+        result = mark_done_task(conn, "demo", "mvp-001", adapter=adapter, verification="evidence")
 
         # Fail-closed: checklist unavailable → gate failure
         self.assertFalse(result.event_created)
@@ -2045,7 +2105,7 @@ class MarkDoneGateTests(unittest.TestCase):
                 }
             },
         )
-        first = mark_done_task(conn, "demo", "mvp-001", adapter=adapter_pass)
+        first = mark_done_task(conn, "demo", "mvp-001", adapter=adapter_pass, verification="evidence")
         self.assertTrue(first.event_created)
         self.assertEqual(len(adapter_pass.calls), 1)
 
@@ -2080,7 +2140,7 @@ class MarkDoneGateTests(unittest.TestCase):
                 }
             },
         )
-        first = mark_done_task(conn, "demo", "mvp-001", adapter=adapter_fail)
+        first = mark_done_task(conn, "demo", "mvp-001", adapter=adapter_fail, verification="evidence")
         self.assertTrue(first.event_created)
         self.assertEqual(first.event["event_type"], "harness.mutation_failed")
 
@@ -2111,7 +2171,7 @@ class MarkDoneGateTests(unittest.TestCase):
             },
         )
 
-        result = mark_done_task(conn, "demo", "mvp-001", adapter=adapter)
+        result = mark_done_task(conn, "demo", "mvp-001", adapter=adapter, verification="evidence")
 
         self.assertTrue(result.event_created)
         self.assertEqual(result.event["event_type"], "task.done")
@@ -2133,7 +2193,7 @@ class MarkDoneGateTests(unittest.TestCase):
             },
         )
 
-        result = mark_done_task(conn, "demo", "mvp-001", adapter=adapter)
+        result = mark_done_task(conn, "demo", "mvp-001", adapter=adapter, verification="evidence")
 
         self.assertFalse(result.event_created)
         self.assertIsNotNone(result.gate)
@@ -2234,7 +2294,12 @@ class MarkDoneFilesTests(unittest.TestCase):
     def _make_checklist_dir(self, items=None):
         tmp = tempfile.mkdtemp()
         self.addCleanup(lambda: __import__("shutil").rmtree(tmp, ignore_errors=True))
-        checklist = {"updated_at": "2026-01-01", "items": items or []}
+        checklist = {
+            "project": "demo",
+            "harness_root": ".",
+            "updated_at": "2026-01-01",
+            "items": items or [],
+        }
         checklist_path = Path(tmp) / "mvp-checklist.json"
         checklist_path.write_text(
             json.dumps(checklist, ensure_ascii=False, indent=2) + "\n",
@@ -2242,15 +2307,22 @@ class MarkDoneFilesTests(unittest.TestCase):
         )
         return tmp
 
-    def _make_item(self, task_id="mvp-001", status="todo", workflow_status="todo"):
+    def _make_item(self, task_id="mvp-001", status="todo", workflow_status="todo",
+                   verification=""):
         return {
             "id": task_id,
             "title": f"Task {task_id}",
             "status": status,
             "priority": "p1",
             "owner": None,
-            "verification": "",
+            "selected_in_session": None,
+            "verification": verification,
             "updated_at": "2026-01-01T00:00:00Z",
+            "dependencies": [],
+            "blocked_by": [],
+            "blocked_reason": "",
+            "acceptance": f"Acceptance for {task_id}",
+            "handoff": {"from": None, "to": None, "reason": None},
             "workflow": {"status": workflow_status, "branch": None,
                          "updated_at": "2026-01-01T00:00:00Z"},
         }
@@ -2269,7 +2341,7 @@ class MarkDoneFilesTests(unittest.TestCase):
         tmp = self._make_checklist_dir(items=[self._make_item()])
         result = mark_done_files(
             workspace_path=tmp, harness_root=tmp, task_id="mvp-001",
-            repair_reason="drift fix",
+            verification="evidence", repair_reason="drift fix",
         )
         self.assertTrue(result.checklist_changed)
         self.assertTrue(result.repair_only)
@@ -2284,7 +2356,7 @@ class MarkDoneFilesTests(unittest.TestCase):
         fps = compute_mark_done_fingerprints(harness_root=tmp, task_id="mvp-001")
         evidence = ReceiptEvidence("rec-1", fps.before_fingerprint, fps.after_fingerprint)
         result = mark_done_files(
-            workspace_path=tmp, harness_root=tmp, task_id="mvp-001", receipt=evidence,
+            workspace_path=tmp, harness_root=tmp, task_id="mvp-001", verification="evidence", receipt=evidence,
         )
         self.assertTrue(result.checklist_changed)
         self.assertEqual(result.receipt_id, "rec-1")
@@ -2301,10 +2373,10 @@ class MarkDoneFilesTests(unittest.TestCase):
         fps = compute_mark_done_fingerprints(harness_root=tmp, task_id="mvp-001")
         evidence = ReceiptEvidence("rec-1", fps.before_fingerprint, fps.after_fingerprint)
         first = mark_done_files(workspace_path=tmp, harness_root=tmp,
-                                task_id="mvp-001", receipt=evidence)
+                                task_id="mvp-001", verification="evidence", receipt=evidence)
         self.assertTrue(first.checklist_changed)
         second = mark_done_files(workspace_path=tmp, harness_root=tmp,
-                                 task_id="mvp-001", receipt=evidence)
+                                 task_id="mvp-001", verification="evidence", receipt=evidence)
         self.assertFalse(second.checklist_changed)
 
     def test_normal_path_rejects_cross_receipt_on_done_item(self):
@@ -2312,11 +2384,11 @@ class MarkDoneFilesTests(unittest.TestCase):
         tmp = self._make_checklist_dir(items=[self._make_item()])
         fps = compute_mark_done_fingerprints(harness_root=tmp, task_id="mvp-001")
         mark_done_files(workspace_path=tmp, harness_root=tmp, task_id="mvp-001",
-                        receipt=ReceiptEvidence("rec-1", fps.before_fingerprint,
+                        verification="evidence", receipt=ReceiptEvidence("rec-1", fps.before_fingerprint,
                                                 fps.after_fingerprint))
         with self.assertRaises(ValueError):
             mark_done_files(workspace_path=tmp, harness_root=tmp, task_id="mvp-001",
-                            receipt=ReceiptEvidence("rec-OTHER",
+                            verification="evidence", receipt=ReceiptEvidence("rec-OTHER",
                                                     fps.before_fingerprint,
                                                     fps.after_fingerprint))
 
@@ -2338,7 +2410,7 @@ class MarkDoneFilesTests(unittest.TestCase):
         evidence = ReceiptEvidence("rec-1", fps.before_fingerprint, fps.after_fingerprint)
         with self.assertRaises(ValueError) as ctx:
             mark_done_files(workspace_path=tmp, harness_root=tmp, task_id="mvp-001",
-                            receipt=evidence)
+                            verification="evidence", receipt=evidence)
         self.assertIn("before-fingerprint", str(ctx.exception).lower())
         # Zero mutation: file bytes unchanged, no completion_receipt metadata,
         # task still in its pre-done lifecycle state.
@@ -2358,7 +2430,7 @@ class MarkDoneFilesTests(unittest.TestCase):
         fps = compute_mark_done_fingerprints(harness_root=tmp, task_id="mvp-001")
         # Legitimately complete under rec-1 (writes done/closed + metadata).
         mark_done_files(workspace_path=tmp, harness_root=tmp, task_id="mvp-001",
-                        receipt=ReceiptEvidence("rec-1", fps.before_fingerprint,
+                        verification="evidence", receipt=ReceiptEvidence("rec-1", fps.before_fingerprint,
                                                 fps.after_fingerprint))
         # Drift the done item's branch, leaving metadata intact.
         drifted = json.loads(Path(tmp, "mvp-checklist.json").read_text())
@@ -2368,7 +2440,7 @@ class MarkDoneFilesTests(unittest.TestCase):
 
         with self.assertRaises(ValueError) as ctx:
             mark_done_files(workspace_path=tmp, harness_root=tmp, task_id="mvp-001",
-                            receipt=ReceiptEvidence("rec-1", fps.before_fingerprint,
+                            verification="evidence", receipt=ReceiptEvidence("rec-1", fps.before_fingerprint,
                                                     fps.after_fingerprint))
         self.assertIn("after-fingerprint", str(ctx.exception).lower())
         # File unchanged from drifted state.
@@ -2391,14 +2463,18 @@ class MarkDoneFilesTests(unittest.TestCase):
         opt_dir = Path(tmp) / "opt" / "multinexus" / "docs" / "project-harness"
         opt_dir.mkdir(parents=True)
         (opt_dir / "mvp-checklist.json").write_text(
-            json.dumps({"updated_at": "2026-01-01",
-                        "items": [self._make_item()]}, ensure_ascii=False, indent=2) + "\n",
+            json.dumps({
+                "project": "demo",
+                "harness_root": ".",
+                "updated_at": "2026-01-01",
+                "items": [self._make_item()],
+            }, ensure_ascii=False, indent=2) + "\n",
             encoding="utf-8",
         )
         result = mark_done_files(
             workspace_path=str(Path(tmp) / "opt" / "multinexus"),
             harness_root=str(opt_dir), task_id="mvp-001",
-            allow_runtime_copy=True, repair_reason="x",
+            verification="evidence", allow_runtime_copy=True, repair_reason="x",
         )
         self.assertTrue(result.checklist_changed)
 
@@ -2417,7 +2493,8 @@ class MarkDoneFilesTests(unittest.TestCase):
             with self.assertRaises(ValueError) as ctx:
                 mark_done_files(workspace_path=tmp, harness_root=tmp,
                                 task_id="mvp-001", repair_reason="x")
-            self.assertIn("not found", str(ctx.exception))
+            self.assertIn("checklist", str(ctx.exception).lower())
+            self.assertIn("initialize", str(ctx.exception).lower())
 
     def test_repair_idempotent_already_done_closed_noop(self):
         item = self._make_item(status="done", workflow_status="closed")

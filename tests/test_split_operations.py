@@ -12,6 +12,7 @@ import uuid
 from pathlib import Path
 from unittest.mock import patch
 
+from coordinate.checklist_io import ChecklistError, atomic_write_json
 from coordinate.db import initialize, row_to_dict, upsert_workspace
 from coordinate.split_operations import (
     CONTRACT_VERSION,
@@ -19,6 +20,7 @@ from coordinate.split_operations import (
     OPERATION_KIND_TASK_CREATE,
     REASON_FILES_NOT_DEPLOYED,
     REASON_FINGERPRINT_DRIFT,
+    REASON_LEGACY_UNBOUND_ITEM,
     REASON_LOCK_TIMEOUT,
     REASON_OPERATION_CONFLICT,
     REASON_VALIDATION_ERROR,
@@ -27,7 +29,6 @@ from coordinate.split_operations import (
     ChecklistLock,
     IssueMaterializeRecordResult,
     SplitOperationError,
-    _atomic_write_json,
     apply_issue_materialize_files,
     apply_issue_materialize_record,
     apply_task_create_files,
@@ -55,6 +56,27 @@ _KNOWN_ABSENT_FINGERPRINT = (
 def _make_plan(path: Path, content: bytes = b"# plan\n") -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_bytes(content)
+
+
+def _seed_empty_checklist(harness_root: Path, *, name: str = "mvp-checklist.json") -> Path:
+    """Write a validator-passing empty checklist (the init contract shape)."""
+    path = harness_root / name
+    path.write_text(
+        json.dumps({
+            "project": "demo",
+            "harness_root": ".",
+            "version": 1,
+            "updated_at": "2026-07-13",
+            "items": [],
+        }, ensure_ascii=False, indent=2) + "\n",
+        encoding="utf-8",
+    )
+    return path
+
+
+def _leftover_temps(harness_root: Path) -> list[Path]:
+    """Any unique-temp leftovers from the atomic writer."""
+    return sorted(harness_root.glob(".mvp-checklist.json.*.tmp"))
 
 
 class ContractValidationTests(unittest.TestCase):
@@ -198,7 +220,7 @@ class ChecklistLockTests(unittest.TestCase):
             poll_interval=0.001,
             _process_alive=lambda _pid: True,
         )
-        with self.assertRaises(SplitOperationError) as ctx:
+        with self.assertRaises(ChecklistError) as ctx:
             lock.acquire()
         self.assertEqual(ctx.exception.reason, REASON_LOCK_TIMEOUT)
 
@@ -248,7 +270,7 @@ class ChecklistLockTests(unittest.TestCase):
             _process_alive=lambda _pid: True,
         )
         with patch("time.sleep", fake_sleep):
-            with self.assertRaises(SplitOperationError) as ctx:
+            with self.assertRaises(ChecklistError) as ctx:
                 lock.acquire()
         self.assertEqual(ctx.exception.reason, REASON_LOCK_TIMEOUT)
         self.assertTrue(sleeps)
@@ -262,6 +284,7 @@ class FileHalfTests(unittest.TestCase):
         self.workspace_path.mkdir()
         self.harness_root = self.tmp / "docs"
         self.harness_root.mkdir()
+        _seed_empty_checklist(self.harness_root)
         self.plan = self.workspace_path / "plans" / "foo.md"
         _make_plan(self.plan)
         self.operation_id = str(uuid.uuid4())
@@ -334,6 +357,7 @@ class FileHalfTests(unittest.TestCase):
             "project": "p",
             "harness_root": str(self.harness_root),
             "version": 1,
+            "updated_at": "2026-07-13",
             "items": [
                 {
                     "id": "task-1",
@@ -363,7 +387,7 @@ class FileHalfTests(unittest.TestCase):
         )
         with self.assertRaises(SplitOperationError) as ctx:
             self._apply_files()
-        self.assertEqual(ctx.exception.reason, REASON_OPERATION_CONFLICT)
+        self.assertEqual(ctx.exception.reason, REASON_LEGACY_UNBOUND_ITEM)
 
     def test_same_id_drift_is_conflict(self) -> None:
         self._apply_files()
@@ -389,7 +413,7 @@ class FileHalfTests(unittest.TestCase):
 
     def test_atomic_write_preserves_target_mode(self) -> None:
         checklist_path = self.harness_root / "mvp-checklist.json"
-        checklist_path.write_text("{}")
+        _seed_empty_checklist(self.harness_root)
         os.chmod(checklist_path, 0o640)
         self._apply_files()
         self.assertEqual(stat.S_IMODE(checklist_path.stat().st_mode), 0o640)
@@ -402,8 +426,7 @@ class FileHalfTests(unittest.TestCase):
             with self.assertRaises(OSError):
                 self._apply_files()
 
-        tmp_path = self.harness_root / ".mvp-checklist.json.tmp"
-        self.assertFalse(tmp_path.exists())
+        self.assertEqual(_leftover_temps(self.harness_root), [])
 
     def test_two_tasks_are_independent(self) -> None:
         plan2 = self.workspace_path / "plans" / "bar.md"
@@ -435,6 +458,7 @@ class RecordHalfTests(unittest.TestCase):
         self.workspace_path.mkdir()
         self.harness_root = self.tmp / "docs"
         self.harness_root.mkdir()
+        _seed_empty_checklist(self.harness_root)
         self.plan = self.workspace_path / "plans" / "foo.md"
         _make_plan(self.plan)
 
@@ -1011,6 +1035,7 @@ class CrossTaskTests(unittest.TestCase):
         self.workspace_path.mkdir()
         self.harness_root = self.tmp / "docs"
         self.harness_root.mkdir()
+        _seed_empty_checklist(self.harness_root)
 
         self.conn = initialize(":memory:")
         upsert_workspace(
@@ -1084,15 +1109,15 @@ class AtomicWriteTests(unittest.TestCase):
         shutil.rmtree(self.tmp, ignore_errors=True)
 
     def test_open_failure_leaves_target_unchanged_and_cleans_temp(self) -> None:
-        def fail_open(path: str, *args: object, **kwargs: object) -> object:
+        def fail_mkstemp(*args: object, **kwargs: object) -> object:
             raise OSError("open refused")
 
-        with patch("builtins.open", fail_open):
+        with patch("tempfile.mkstemp", fail_mkstemp):
             with self.assertRaises(OSError):
-                _atomic_write_json(self.target, {"items": []})
+                atomic_write_json(self.target, {"items": []})
 
         self.assertEqual(self.target.read_text(), "ORIGINAL\n")
-        self.assertFalse((self.tmp / ".mvp-checklist.json.tmp").exists())
+        self.assertEqual(_leftover_temps(self.tmp), [])
 
     def test_fsync_failure_leaves_target_unchanged_and_cleans_temp(self) -> None:
         def fail_fsync(fd: int) -> None:
@@ -1100,10 +1125,10 @@ class AtomicWriteTests(unittest.TestCase):
 
         with patch("os.fsync", fail_fsync):
             with self.assertRaises(OSError):
-                _atomic_write_json(self.target, {"items": []})
+                atomic_write_json(self.target, {"items": []})
 
         self.assertEqual(self.target.read_text(), "ORIGINAL\n")
-        self.assertFalse((self.tmp / ".mvp-checklist.json.tmp").exists())
+        self.assertEqual(_leftover_temps(self.tmp), [])
 
     def test_replace_failure_leaves_target_unchanged_and_cleans_temp(self) -> None:
         def boom(_src: str, _dst: str) -> None:
@@ -1111,10 +1136,10 @@ class AtomicWriteTests(unittest.TestCase):
 
         with patch("os.replace", boom):
             with self.assertRaises(OSError):
-                _atomic_write_json(self.target, {"items": []})
+                atomic_write_json(self.target, {"items": []})
 
         self.assertEqual(self.target.read_text(), "ORIGINAL\n")
-        self.assertFalse((self.tmp / ".mvp-checklist.json.tmp").exists())
+        self.assertEqual(_leftover_temps(self.tmp), [])
 
 
 class IssueMaterializeOperationTests(unittest.TestCase):
@@ -1126,6 +1151,7 @@ class IssueMaterializeOperationTests(unittest.TestCase):
         self.workspace_path.mkdir()
         self.harness_root = self.tmp / "docs"
         self.harness_root.mkdir()
+        _seed_empty_checklist(self.harness_root)
         self.plan = self.workspace_path / "plans" / "foo.md"
         _make_plan(self.plan)
         self.operation_id = str(uuid.uuid4())
@@ -1289,6 +1315,8 @@ class IssueMaterializeOperationTests(unittest.TestCase):
     def test_files_preexisting_unbound_task_conflicts(self) -> None:
         checklist = {
             "project": "p",
+            "harness_root": ".",
+            "updated_at": "2026-07-13",
             "items": [
                 {
                     "id": "task-1",
@@ -1318,7 +1346,7 @@ class IssueMaterializeOperationTests(unittest.TestCase):
         )
         with self.assertRaises(SplitOperationError) as ctx:
             self._apply_files()
-        self.assertEqual(ctx.exception.reason, REASON_OPERATION_CONFLICT)
+        self.assertEqual(ctx.exception.reason, REASON_LEGACY_UNBOUND_ITEM)
 
     def test_files_different_operation_conflicts(self) -> None:
         self._apply_files()
@@ -1596,6 +1624,8 @@ class IssueMaterializeOperationTests(unittest.TestCase):
         )
         checklist = {
             "project": "p",
+            "harness_root": ".",
+            "updated_at": "2026-07-13",
             "items": [
                 {
                     "id": "task-1",
@@ -1650,14 +1680,14 @@ class IssueMaterializeOperationTests(unittest.TestCase):
         original = (self.harness_root / "mvp-checklist.json").read_bytes()
 
         with patch(
-            "coordinate.split_operations.os.replace",
+            "coordinate.checklist_io.os.replace",
             side_effect=OSError("replace refused"),
         ):
             with self.assertRaises(OSError):
                 self._apply_files(task_id="task-2", plan_doc="plans/foo.md")
 
         self.assertEqual((self.harness_root / "mvp-checklist.json").read_bytes(), original)
-        self.assertFalse((self.harness_root / ".mvp-checklist.json.tmp").exists())
+        self.assertEqual(_leftover_temps(self.harness_root), [])
 
     # -----------------------------------------------------------------------
     # Record-half boundary tests beyond the baseline 19.

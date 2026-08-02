@@ -15,6 +15,16 @@
 本仓库文档可以概述共享产品定义，但不得创建另一个可编辑的 Operator、Coordinate、
 MultiNexus、Harness 或 Executor 定义。
 
+## Checklist authority 规则
+
+- 每个 workspace 只能存在一份 checklist authority：新名称 `harness-checklist.json`，或兼容旧名称
+  `mvp-checklist.json`；两者同时存在时 mutation fail closed。
+- `harness-state.json` 与 `current/*` 是可重建 derived cache/pointer，不是 authority；与 checklist
+  bytes 不一致时以 checklist 为准，并重新运行 `scripts/harness/harnessctl state`。
+- 当前 active item 必须从实际 checklist / derived state 读取，本索引不硬编码瞬时任务状态。
+- 重要或跨 session 任务经 Coordinate 入口登记（见 `skills/coordinate-operator/SKILL.md` 的
+  “Checklist 与任务权威矩阵”）；普通小任务不强制创建节点。
+
 ## 当前 Coordinate 文档
 
 - `scope.md` — 仓库范围与非目标。

@@ -1,6 +1,6 @@
 # GitHub 集成
 
-GitHub 仍然是 branch、PR、CI、review 和 merge 的权威来源。Coordinator 记录并暴露本地接入的状态。
+GitHub 仍然是 branch、PR、CI、review 和 merge 的权威来源。Coordinate 记录并暴露本地接入的状态。
 
 ## Branch 分配
 
@@ -8,7 +8,7 @@ GitHub 仍然是 branch、PR、CI、review 和 merge 的权威来源。Coordinat
 $MAC branch allocate WORKSPACE --task-id TASK --owner OWNER
 ```
 
-这在 coordinator 状态中记录稳定的 branch 名称。它不创建 git branch。
+这在 Coordinate 状态中记录稳定的 branch 名称。它不创建 git branch。
 
 ## PR 链接
 

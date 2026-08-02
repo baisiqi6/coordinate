@@ -202,14 +202,29 @@ def _utc_now_str(now: str | None) -> str:
 
 
 def _read_checklist(workspace: Workspace) -> dict[str, Any] | None:
-    path = Path(workspace.harness_root) / "mvp-checklist.json"
-    if not path.is_file():
+    """Parse-only read of the resolved checklist (new/legacy; none -> None)."""
+    from .checklist_io import ChecklistError, read_checklist_bytes
+
+    try:
+        raw, _resolved = read_checklist_bytes(workspace.harness_root, purpose="read")
+    except (ChecklistError, OSError):
         return None
     try:
-        data = json.loads(path.read_text(encoding="utf-8"))
-    except (OSError, json.JSONDecodeError):
+        data = json.loads(raw.decode("utf-8"))
+    except (UnicodeDecodeError, json.JSONDecodeError):
         return None
     return data if isinstance(data, dict) else None
+
+
+def _checklist_authority_label(workspace: Workspace) -> str:
+    """The actual checklist filename (or the new default when absent) for
+    finding evidence labels — never a hardcoded legacy name."""
+    from .checklist_io import CHECKLIST_LEGACY_NAME, CHECKLIST_NEW_NAME, checklist_candidates
+
+    candidates = checklist_candidates(workspace.harness_root)
+    if candidates["legacy"].is_file() and not candidates["new"].is_file():
+        return CHECKLIST_LEGACY_NAME
+    return CHECKLIST_NEW_NAME
 
 
 def _items_from_checklist(checklist: dict[str, Any] | None) -> list[dict[str, Any]]:
@@ -584,7 +599,7 @@ def _diagnose_split_operations(
                 workspace_id=workspace.id,
                 task_id=task_id,
                 operation_id=op_id,
-                authority="mvp-checklist.json",
+                authority=_checklist_authority_label(workspace),
                 evidence=_evidence(
                     operation_id=op_id,
                     operation_kind=op_kind,
@@ -610,7 +625,7 @@ def _diagnose_split_operations(
             workspace_id=workspace.id,
             task_id=task_id,
             operation_id=op_id,
-            authority="mvp-checklist.json",
+            authority=_checklist_authority_label(workspace),
             evidence=_evidence(
                 operation_id=op_id,
                 operation_kind=op_kind,
@@ -810,7 +825,7 @@ def _diagnose_one_split_operation(
             workspace_id=workspace.id,
             task_id=task_id,
             operation_id=op_id,
-            authority="mvp-checklist.json",
+            authority=_checklist_authority_label(workspace),
             evidence=_evidence(errors=item_errors),
             repairable=False,
             next_action="Escalate: ledger target/envelope is missing.",
@@ -829,7 +844,7 @@ def _diagnose_one_split_operation(
             workspace_id=workspace.id,
             task_id=task_id,
             operation_id=op_id,
-            authority="mvp-checklist.json",
+            authority=_checklist_authority_label(workspace),
             evidence=_evidence(reason="deployed_item_has_no_split_operation_envelope"),
             repairable=False,
             next_action="Escalate: ledger target/envelope is missing.",
@@ -847,7 +862,7 @@ def _diagnose_one_split_operation(
             workspace_id=workspace.id,
             task_id=task_id,
             operation_id=op_id,
-            authority="mvp-checklist.json",
+            authority=_checklist_authority_label(workspace),
             evidence=_evidence(
                 ledger_operation_id=op_id,
                 envelope_operation_id=envelope.get("operation_id"),
@@ -891,7 +906,7 @@ def _diagnose_one_split_operation(
             workspace_id=workspace.id,
             task_id=task_id,
             operation_id=op_id,
-            authority="mvp-checklist.json",
+            authority=_checklist_authority_label(workspace),
             evidence=_evidence(shape_errors=shape_errors),
             repairable=False,
             next_action="Escalate: deployed envelope shape or identity fields drift from ledger.",
@@ -944,7 +959,7 @@ def _diagnose_one_split_operation(
             workspace_id=workspace.id,
             task_id=task_id,
             operation_id=op_id,
-            authority="mvp-checklist.json",
+            authority=_checklist_authority_label(workspace),
             evidence=_evidence(identity_errors=identity_errors),
             repairable=False,
             next_action="Escalate: immutable creation identity field has drifted.",
@@ -973,7 +988,7 @@ def _diagnose_one_split_operation(
             workspace_id=workspace.id,
             task_id=task_id,
             operation_id=op_id,
-            authority="mvp-checklist.json",
+            authority=_checklist_authority_label(workspace),
             evidence=_evidence(plan_doc=plan_doc, reason="plan_file_unavailable_for_fingerprint_check"),
             repairable=False,
             next_action="Deploy the referenced plan file, then re-run doctor.",
@@ -1021,7 +1036,7 @@ def _diagnose_one_split_operation(
                 workspace_id=workspace.id,
                 task_id=task_id,
                 operation_id=op_id,
-                authority="mvp-checklist.json",
+                authority=_checklist_authority_label(workspace),
                 evidence=_evidence(
                     plan_doc=plan_doc,
                     historical_plan_sha256=ready_payload["plan_sha256"],

@@ -1,4 +1,5 @@
 import json
+import subprocess
 import tempfile
 import unittest
 from pathlib import Path
@@ -61,6 +62,8 @@ class HandoffServiceTests(unittest.TestCase):
         task_id="t1",
         scope="implementation plan",
         plan_payload=None,
+        checklist_name="mvp-checklist.json",
+        harness_root_rel="docs/project-harness",
     ):
         plan_payload = plan_payload or {
             "task_id": task_id,
@@ -70,23 +73,51 @@ class HandoffServiceTests(unittest.TestCase):
         tmp = tempfile.TemporaryDirectory()
         self.addCleanup(tmp.cleanup)
         workspace_path = Path(tmp.name)
-        harness_root = workspace_path / "docs" / "project-harness"
+        harness_root = workspace_path / harness_root_rel
         harness_root.mkdir(parents=True)
+        (harness_root / checklist_name).write_text(
+            json.dumps(
+                {
+                    "project": "demo",
+                    "harness_root": ".",
+                    "updated_at": "2026-07-13",
+                    "items": [
+                        {
+                            "id": task_id,
+                            "title": f"Task {task_id}",
+                            "status": "todo",
+                            "priority": "p1",
+                            "owner": None,
+                            "selected_in_session": None,
+                            "verification": "",
+                            "updated_at": "2026-01-01T00:00:00Z",
+                            "dependencies": [],
+                            "blocked_by": [],
+                            "blocked_reason": "",
+                            "acceptance": "Acceptance",
+                            "handoff": {"from": None, "to": None, "reason": None},
+                            "workflow": {"status": "todo", "branch": None,
+                                         "updated_at": "2026-01-01T00:00:00Z"},
+                        }
+                    ],
+                }
+            ),
+            encoding="utf-8",
+        )
+        import hashlib as _hashlib
+        checklist_rel = str((harness_root / checklist_name).relative_to(workspace_path))
         (harness_root / "harness-state.json").write_text(
             json.dumps(
                 {
                     "project": "demo",
                     "current_item": {"id": task_id, "status": "ready"},
                     "items": [{"id": task_id, "status": "ready"}],
-                }
-            ),
-            encoding="utf-8",
-        )
-        (harness_root / "mvp-checklist.json").write_text(
-            json.dumps(
-                {
-                    "project": "demo",
-                    "items": [{"id": task_id, "status": "pending"}],
+                    "source": {
+                        "checklist_path": checklist_rel,
+                        "checklist_sha256": _hashlib.sha256(
+                            (harness_root / checklist_name).read_bytes()
+                        ).hexdigest(),
+                    },
                 }
             ),
             encoding="utf-8",
@@ -155,7 +186,37 @@ class HandoffServiceTests(unittest.TestCase):
         conn = self._make_conn()
         _, harness_root = self._setup_workspace_with_approved_plan(conn)
         (harness_root / "mvp-checklist.json").write_text(
-            json.dumps({"project": "demo", "items": [{"id": "other-task"}]}),
+            json.dumps({
+                "project": "demo",
+                "harness_root": ".",
+                "updated_at": "2026-07-13",
+                "items": [{"id": "other-task", "title": "Other", "status": "todo",
+                           "priority": "p1", "owner": None,
+                           "selected_in_session": None, "verification": "",
+                           "updated_at": "2026-01-01T00:00:00Z",
+                           "dependencies": [], "blocked_by": [], "blocked_reason": "",
+                           "acceptance": "Acceptance",
+                           "handoff": {"from": None, "to": None, "reason": None},
+                           "workflow": {"status": "todo", "branch": None,
+                                        "updated_at": "2026-01-01T00:00:00Z"}}]}),
+            encoding="utf-8",
+        )
+        # Refresh the state source so the preflight reaches the checklist gate.
+        import hashlib as _hashlib
+        checklist_bytes = (harness_root / "mvp-checklist.json").read_bytes()
+        checklist_rel = str(
+            (harness_root / "mvp-checklist.json").relative_to(
+                Path(harness_root).parent.parent
+            )
+        )
+        (harness_root / "harness-state.json").write_text(
+            json.dumps({
+                "project": "demo",
+                "source": {
+                    "checklist_path": checklist_rel,
+                    "checklist_sha256": _hashlib.sha256(checklist_bytes).hexdigest(),
+                },
+            }),
             encoding="utf-8",
         )
 
@@ -185,8 +246,24 @@ class HandoffServiceTests(unittest.TestCase):
     def test_prepare_handoff_allows_state_summary_without_task_id(self):
         conn = self._make_conn()
         _, harness_root = self._setup_workspace_with_approved_plan(conn)
+        # A rewritten summary must still carry the checklist source.
+        import hashlib as _hashlib
+        checklist_bytes = (harness_root / "mvp-checklist.json").read_bytes()
+        checklist_rel = str(
+            (harness_root / "mvp-checklist.json").relative_to(
+                Path(harness_root).parent.parent
+            )
+        )
         (harness_root / "harness-state.json").write_text(
-            json.dumps({"project": "demo", "current_item": None, "recent_events": []}),
+            json.dumps({
+                "project": "demo",
+                "current_item": None,
+                "recent_events": [],
+                "source": {
+                    "checklist_path": checklist_rel,
+                    "checklist_sha256": _hashlib.sha256(checklist_bytes).hexdigest(),
+                },
+            }),
             encoding="utf-8",
         )
 
@@ -475,6 +552,9 @@ class HandoffServiceTests(unittest.TestCase):
         self.assertIn("No deploy", result.handoff_text)
 
     def test_handoff_text_includes_recovery_commands(self):
+        """Legacy-only checklist: the recovery block renders the RESOLVED
+        authority (mvp-checklist.json) and never a compat candidate
+        (harness-checklist.json) that does not exist."""
         conn = self._make_conn()
         self._setup_workspace_with_approved_plan(conn)
 
@@ -485,9 +565,141 @@ class HandoffServiceTests(unittest.TestCase):
             "git branch --show-current",
             "git log --oneline -8",
             "harness-state.json",
-            "mvp-checklist.json",
+            "docs/project-harness/mvp-checklist.json",
         ]:
             self.assertIn(cmd, result.handoff_text, f"missing recovery command: {cmd}")
+        self.assertNotIn("harness-checklist.json", result.handoff_text)
+
+    def test_handoff_text_new_only_renders_harness_checklist(self):
+        """New-only checklist: the recovery block renders
+        harness-checklist.json and never the legacy candidate."""
+        conn = self._make_conn()
+        self._setup_workspace_with_approved_plan(
+            conn, checklist_name="harness-checklist.json"
+        )
+
+        result = prepare_handoff(conn, workspace_id="demo", task_id="t1", role="worker")
+
+        self.assertIn(
+            "docs/project-harness/harness-checklist.json", result.handoff_text
+        )
+        self.assertNotIn("mvp-checklist.json", result.handoff_text)
+
+    def _recovery_bash_block(self, handoff_text):
+        marker = "```bash\n"
+        start = handoff_text.index(marker) + len(marker)
+        end = handoff_text.index("\n```", start)
+        return handoff_text[start:end]
+
+    def test_handoff_recovery_bash_block_syntax_clean(self):
+        """The fenced recovery shell block must pass `bash -n` for both the
+        legacy-only and the new-only checklist authority."""
+        for checklist_name in ("mvp-checklist.json", "harness-checklist.json"):
+            with self.subTest(checklist_name=checklist_name):
+                conn = self._make_conn()
+                self._setup_workspace_with_approved_plan(
+                    conn, checklist_name=checklist_name
+                )
+                result = prepare_handoff(
+                    conn, workspace_id="demo", task_id="t1", role="worker"
+                )
+                block = self._recovery_bash_block(result.handoff_text)
+                proc = subprocess.run(
+                    ["bash", "-n"], input=block, capture_output=True, text=True
+                )
+                self.assertEqual(
+                    proc.returncode,
+                    0,
+                    f"bash -n rejected the recovery block for "
+                    f"{checklist_name}: {proc.stderr}",
+                )
+
+    def test_handoff_checklist_path_is_shlex_quoted(self):
+        """The recovery `cat <checklist>` command is rendered through
+        shlex.quote(): a harness root containing shell metacharacters stays a
+        single argument instead of being spliced raw into the block."""
+        import shlex
+
+        conn = self._make_conn()
+        self._setup_workspace_with_approved_plan(
+            conn, harness_root_rel="docs/project harness"
+        )
+
+        result = prepare_handoff(conn, workspace_id="demo", task_id="t1", role="worker")
+
+        expected = "cat " + shlex.quote("docs/project harness/mvp-checklist.json")
+        self.assertIn(expected, result.handoff_text)
+        self.assertNotIn(
+            "cat docs/project harness/mvp-checklist.json", result.handoff_text
+        )
+
+    def test_prepare_handoff_invalid_checklist_fails_closed(self):
+        """P1-4: full checklist validation (not just the stale-state digest)
+        gates the normal handoff caller: a parseable checklist missing a
+        required field fails closed with a refreshed state source, no new
+        worker.handoff.prepared event, and unchanged task/event/ledger rows."""
+        conn = self._make_conn()
+        _, harness_root = self._setup_workspace_with_approved_plan(conn)
+        checklist_path = harness_root / "mvp-checklist.json"
+        checklist = json.loads(checklist_path.read_text(encoding="utf-8"))
+        del checklist["items"]  # still parseable JSON, contract-invalid
+        checklist_path.write_text(json.dumps(checklist), encoding="utf-8")
+        # Refresh the state source digest so the failure comes from full
+        # checklist validation, not the stale-digest gate.
+        import hashlib as _hashlib
+        checklist_rel = str(
+            checklist_path.relative_to(Path(harness_root).parent.parent)
+        )
+        (harness_root / "harness-state.json").write_text(
+            json.dumps({
+                "project": "demo",
+                "current_item": {"id": "t1", "status": "ready"},
+                "source": {
+                    "checklist_path": checklist_rel,
+                    "checklist_sha256": _hashlib.sha256(
+                        checklist_path.read_bytes()
+                    ).hexdigest(),
+                },
+            }),
+            encoding="utf-8",
+        )
+        before = (
+            conn.execute(
+                "SELECT COUNT(*) FROM events WHERE workspace_id = 'demo'"
+            ).fetchone()[0],
+            conn.execute(
+                "SELECT COUNT(*) FROM tasks WHERE workspace_id = 'demo'"
+            ).fetchone()[0],
+            conn.execute(
+                "SELECT COUNT(*) FROM split_operations WHERE workspace_id = 'demo'"
+            ).fetchone()[0],
+        )
+
+        with self.assertRaises(ValueError) as ctx:
+            prepare_handoff(conn, workspace_id="demo", task_id="t1", role="worker")
+
+        self.assertIn("workspace harness preflight failed", str(ctx.exception))
+        self.assertIn("items", str(ctx.exception))
+        self.assertEqual(
+            conn.execute(
+                "SELECT * FROM events WHERE event_type = 'worker.handoff.prepared'"
+            ).fetchall(),
+            [],
+        )
+        self.assertEqual(
+            (
+                conn.execute(
+                    "SELECT COUNT(*) FROM events WHERE workspace_id = 'demo'"
+                ).fetchone()[0],
+                conn.execute(
+                    "SELECT COUNT(*) FROM tasks WHERE workspace_id = 'demo'"
+                ).fetchone()[0],
+                conn.execute(
+                    "SELECT COUNT(*) FROM split_operations WHERE workspace_id = 'demo'"
+                ).fetchone()[0],
+            ),
+            before,
+        )
 
     def test_handoff_text_uses_dynamic_harness_root(self):
         conn = self._make_conn()
@@ -1147,13 +1359,27 @@ class IssueMaterializeHandoffTests(unittest.TestCase):
         harness_root = workspace_path / "docs" / "project-harness"
         harness_root.mkdir(parents=True)
         (harness_root / "mvp-checklist.json").write_text(
-            json.dumps({"project": "demo", "items": []}), encoding="utf-8"
+            json.dumps({
+                "project": "demo",
+                "harness_root": ".",
+                "updated_at": "2026-07-13",
+                "items": [],
+            }),
+            encoding="utf-8",
         )
+        import hashlib as _hashlib
+        checklist_rel = str((harness_root / "mvp-checklist.json").relative_to(workspace_path))
         (harness_root / "harness-state.json").write_text(
             json.dumps({
                 "project": "demo",
                 "current_item": {"id": task_id, "status": "ready"},
                 "items": [{"id": task_id, "status": "ready"}],
+                "source": {
+                    "checklist_path": checklist_rel,
+                    "checklist_sha256": _hashlib.sha256(
+                        (harness_root / "mvp-checklist.json").read_bytes()
+                    ).hexdigest(),
+                },
             }), encoding="utf-8"
         )
         plan_abs = workspace_path / "docs" / "plan.md"
@@ -1211,6 +1437,7 @@ class IssueMaterializeHandoffTests(unittest.TestCase):
         materialize_issue(
             conn, workspace_id="demo", event_id=triage_id, plan_doc=plan_doc
         )
+        self._refresh_state_source(conn)
         workspace = get_workspace(conn, "demo")
         _require_harness_task(workspace, task_id)  # must not raise
 
@@ -1221,10 +1448,32 @@ class IssueMaterializeHandoffTests(unittest.TestCase):
         materialize_issue(
             conn, workspace_id="demo", event_id=triage_id, plan_doc=plan_doc
         )
+        self._refresh_state_source(conn)
         self._approve_plan(conn, task_id)
         result = prepare_handoff(conn, workspace_id="demo", task_id=task_id, role="worker")
         self.assertTrue(result.event_created)
         self.assertEqual(result.event["event_type"], "worker.handoff.prepared")
+
+    def _refresh_state_source(self, conn):
+        """Rewrite harness-state.json with a source matching the materialized checklist."""
+        import hashlib as _hashlib
+        ws = get_workspace(conn, "demo")
+        harness_root = Path(ws.harness_root)
+        checklist_bytes = (harness_root / "mvp-checklist.json").read_bytes()
+        checklist_rel = str(
+            (harness_root / "mvp-checklist.json").relative_to(Path(ws.path))
+        )
+        (harness_root / "harness-state.json").write_text(
+            json.dumps({
+                "project": "demo",
+                "current_item": None,
+                "source": {
+                    "checklist_path": checklist_rel,
+                    "checklist_sha256": _hashlib.sha256(checklist_bytes).hexdigest(),
+                },
+            }),
+            encoding="utf-8",
+        )
 
 
 class WorkerBootstrapSectionTests(unittest.TestCase):

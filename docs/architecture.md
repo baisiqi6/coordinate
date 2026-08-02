@@ -76,9 +76,10 @@ Coordinate 不直接手动编辑 harness JSON。如果 harness mutation 成功�
 Events 和 deliveries 分离，这样平台故障不会抹除行动记录。
 平台消息记录是持久化状态的人类可见投影。
 
-`platform=none` 是保留的 audit-only sink：当 MultiNexus bridge 等调用方已经发送可见回复时，
-Coordinate 仍保存 delivery ledger 行用于幂等与审计，但不会把它当作 transport backlog。
-无 platform 过滤的 ledger 查询仍显示这些记录；批量 pump 默认跳过它们，显式发送则 fail-closed。
+当 MultiNexus bridge 等调用方已经发送可见回复并指定 `reply.platform=none` 时，Coordinate
+只保留 job result 与 `job.completed` event，不再创建没有发送消费者的 delivery。
+旧版本创建的 `platform=none,status=pending` 行可能仍存在于 ledger；它们只是历史审计记录，
+批量 pump 默认跳过，显式发送则 fail-closed。不要把这些旧行视为当前 transport backlog。
 
 ## 权威和投影规则
 

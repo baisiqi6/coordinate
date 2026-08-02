@@ -1,7 +1,7 @@
 """Slice 3: completion authorization receipt protocol.
 
 This module owns the receipt lifecycle that binds a coding host's canonical
-``mvp-checklist.json`` mutation to the control-plane ``task.done`` terminal
+resolved checklist mutation to the control-plane ``task.done`` terminal
 under one server-issued, one-time authorization. It also owns the gate check
 and the lifecycle fingerprint helpers shared with ``transitions``.
 
@@ -33,11 +33,11 @@ import sqlite3
 import uuid
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
-from pathlib import Path
 from typing import Any
 
 from .db import append_event, find_events, get_workspace, latest_event, row_to_dict
 from .harness import HarnessAdapter, HarnessError
+from .checklist_io import ChecklistError, load_checklist
 
 
 # --------------------------------------------------------------------------
@@ -177,17 +177,11 @@ def read_checklist_item(harness_root: str, task_id: str) -> dict[str, Any]:
 
 
 def _read_checklist_item(harness_root: str, task_id: str) -> dict[str, Any]:
-    checklist_path = Path(harness_root) / "mvp-checklist.json"
-    if not checklist_path.is_file():
-        raise CompletionReceiptError(
-            f"mvp-checklist.json not found at {checklist_path}",
-            reason="harness_fingerprint_unavailable",
-        )
     try:
-        checklist = json.loads(checklist_path.read_text(encoding="utf-8"))
-    except (OSError, json.JSONDecodeError) as exc:
+        checklist, resolved = load_checklist(harness_root, purpose="read")
+    except (ChecklistError, OSError) as exc:
         raise CompletionReceiptError(
-            f"mvp-checklist.json at {checklist_path} cannot be read: {exc}",
+            f"checklist at {harness_root} cannot be read: {exc}",
             reason="harness_fingerprint_unavailable",
         ) from exc
     items = checklist.get("items") if isinstance(checklist, dict) else None
@@ -196,7 +190,7 @@ def _read_checklist_item(harness_root: str, task_id: str) -> dict[str, Any]:
             if isinstance(item, dict) and item.get("id") == task_id:
                 return item
     raise CompletionReceiptError(
-        f"task {task_id} not found in mvp-checklist.json at {checklist_path}",
+        f"task {task_id} not found in checklist at {resolved.path}",
         reason="harness_item_missing",
     )
 

@@ -115,7 +115,7 @@ class BusTests(unittest.TestCase):
         self.assertEqual(result.sent, 2)
         self.assertEqual([delivery["status"] for delivery in deliveries], ["sent", "sent", "pending"])
 
-    def test_unscoped_pump_skips_none_platform_audit_delivery(self):
+    def test_unscoped_pump_skips_legacy_none_platform_delivery(self):
         conn = self.make_conn()
         audit, _ = create_delivery(
             conn,

@@ -6,19 +6,26 @@ special-cased target column.
 """
 from __future__ import annotations
 
-import errno
 import hashlib
 import json
-import os
 import re
 import sqlite3
-import time
 import uuid
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Callable
 
+from .checklist_io import (
+    REASON_CHECKLIST_MISSING,
+    ChecklistError,
+    ChecklistLock,
+    initial_projection,
+    load_checklist,
+    mutate_checklist,
+    read_checklist_bytes,
+    reconstruct_projection,
+)
 from .db import (
     Workspace,
     append_event,
@@ -43,17 +50,37 @@ REASON_OPERATION_CONFLICT = "operation_conflict"
 REASON_FINGERPRINT_DRIFT = "fingerprint_drift"
 REASON_LOCK_TIMEOUT = "lock_timeout"
 REASON_VALIDATION_ERROR = "validation_error"
+REASON_LEGACY_UNBOUND_ITEM = "legacy_unbound_item"
 
 
-class SplitOperationError(ValueError):
+def _require_creatable_phase(phase: str) -> None:
+    """Fail closed before any file/DB work when *phase* is not creatable.
+
+    Wraps the boundary's initial projection so the file half always raises
+    ``SplitOperationError`` with the same stable reason.
+    """
+    try:
+        initial_projection(phase)
+    except ChecklistError as exc:
+        raise SplitOperationError(str(exc), exc.reason) from exc
+
+
+def validate_task_create_contract(*, phase: str, priority: str) -> None:
+    """The create-time contract shared by every create/init entry point.
+
+    Checks the initial phase projection and the p0|p1|p2 priority before any
+    file/DB work, so minimal init fails identically to ``apply_task_create_files``
+    and always with zero mutation. Raises ``SplitOperationError``.
+    """
+    _require_creatable_phase(phase)
+    _validate_priority(priority)
+
+
+class SplitOperationError(ChecklistError):
     """A split-operation half refused to apply.
 
     ``reason`` is a stable machine-readable classification string.
     """
-
-    def __init__(self, message: str, reason: str):
-        super().__init__(message)
-        self.reason = reason
 
 
 # ---------------------------------------------------------------------------
@@ -353,220 +380,12 @@ def build_issue_materialize_envelope(
 # ---------------------------------------------------------------------------
 
 
-def _process_alive_default(pid: int) -> bool:
-    """Best-effort check that *pid* names a live process.
-
-    On Unix this uses ``os.kill(pid, 0)``. On Windows it tries ``psutil`` if
-    available; otherwise it conservatively returns ``True`` so a stale lock is
-    never deleted without explicit stale-owner evidence.
-    """
-    if pid == os.getpid():
-        return True
-    try:
-        import psutil  # type: ignore[import-untyped]
-        return psutil.pid_exists(pid)
-    except Exception:
-        pass
-    try:
-        os.kill(pid, 0)
-    except ProcessLookupError:
-        return False
-    except PermissionError:
-        return True
-    except OSError:
-        return False
-    return True
-
-
-class ChecklistLock:
-    """Advisory per-checklist process lock using an exclusive lock file.
-
-    Acquisition uses ``O_CREAT | O_EXCL`` so two processes cannot both create
-    the lock file. If the lock file already exists, the owner PID is inspected;
-    dead owners are safe to break, live owners block up to *timeout* seconds.
-    """
-
-    def __init__(
-        self,
-        checklist_path: Path,
-        *,
-        timeout: float = 30.0,
-        poll_interval: float = 0.05,
-        _now: Callable[[], float] | None = None,
-        _pid: int | None = None,
-        _process_alive: Callable[[int], bool] | None = None,
-    ):
-        self.checklist_path = Path(checklist_path)
-        self.lock_path = self.checklist_path.with_suffix(".json.lock")
-        self.timeout = timeout
-        self.poll_interval = poll_interval
-        self._now = _now or time.monotonic
-        self._pid = _pid or os.getpid()
-        self._process_alive = _process_alive or _process_alive_default
-        self._owned = False
-
-    def _lock_content(self) -> bytes:
-        return _canonical_json({
-            "owner_pid": self._pid,
-            "created_at": _utc_now(),
-        }).encode("utf-8")
-
-    def _read_owner_pid(self) -> int | None:
-        try:
-            data = json.loads(self.lock_path.read_text(encoding="utf-8"))
-        except (OSError, json.JSONDecodeError):
-            return None
-        pid = data.get("owner_pid")
-        return int(pid) if isinstance(pid, int) else None
-
-    def _try_create(self) -> bool:
-        try:
-            fd = os.open(
-                str(self.lock_path),
-                os.O_CREAT | os.O_EXCL | os.O_WRONLY,
-                0o644,
-            )
-        except FileExistsError:
-            return False
-        except OSError as exc:
-            if exc.errno == errno.EEXIST:
-                return False
-            raise
-        try:
-            with os.fdopen(fd, "wb") as f:
-                f.write(self._lock_content())
-                f.flush()
-                os.fsync(f.fileno())
-        except Exception:
-            try:
-                os.close(fd)
-            except OSError:
-                pass
-            try:
-                self.lock_path.unlink()
-            except OSError:
-                pass
-            raise
-        return True
-
-    def acquire(self) -> None:
-        deadline = self._now() + self.timeout
-        while True:
-            if self._try_create():
-                self._owned = True
-                return
-            owner_pid = self._read_owner_pid()
-            if owner_pid is not None and not self._process_alive(owner_pid):
-                # Stale lock from a dead owner: remove and retry immediately.
-                try:
-                    self.lock_path.unlink()
-                except FileNotFoundError:
-                    pass
-                except OSError:
-                    pass
-                continue
-            if self._now() >= deadline:
-                raise SplitOperationError(
-                    f"timed out waiting for checklist lock {self.lock_path}",
-                    REASON_LOCK_TIMEOUT,
-                )
-            time.sleep(self.poll_interval)
-
-    def release(self) -> None:
-        if self._owned:
-            try:
-                self.lock_path.unlink()
-            except FileNotFoundError:
-                pass
-            self._owned = False
-
-    def __enter__(self) -> "ChecklistLock":
-        self.acquire()
-        return self
-
-    def __exit__(self, exc_type, exc, tb) -> None:
-        self.release()
-
-
-# ---------------------------------------------------------------------------
-# Atomic file write
-# ---------------------------------------------------------------------------
-
-
-def _atomic_write_json(target_path: Path, data: dict[str, Any]) -> None:
-    """Write *data* to *target_path* atomically with fsync and mode preservation."""
-    target_path = Path(target_path)
-    parent = target_path.parent
-    parent.mkdir(parents=True, exist_ok=True)
-    tmp_path = parent / f".{target_path.name}.tmp"
-    try:
-        with open(tmp_path, "w", encoding="utf-8") as f:
-            f.write(json.dumps(data, ensure_ascii=False, indent=2) + "\n")
-            f.flush()
-            os.fsync(f.fileno())
-        if target_path.exists():
-            mode = target_path.stat().st_mode
-            tmp_path.chmod(mode)
-        os.replace(tmp_path, target_path)
-    except Exception:
-        try:
-            tmp_path.unlink()
-        except OSError:
-            pass
-        raise
-
-
 # ---------------------------------------------------------------------------
 # Checklist defaults and file-half helpers
+#
+# The lock, atomic writer, resolver, and mutation pipeline live in
+# ``checklist_io``; the file half consumes that boundary only.
 # ---------------------------------------------------------------------------
-
-
-def _checklist_status_for_phase(phase: str) -> str:
-    if phase in {"done", "closed", "released"}:
-        return "done"
-    if phase == "blocked":
-        return "blocked"
-    if phase in {
-        "accepted",
-        "awaiting_operator",
-        "running",
-        "handoff_requested",
-        "review_requested",
-        "ready_for_review",
-        "closeout_requested",
-        "review_approved",
-        "changes_requested",
-        "unblocked",
-    }:
-        return "doing"
-    return "todo"
-
-
-def _workflow_status_for_phase(phase: str) -> str:
-    if phase in {"ready", "planned"}:
-        return "todo"
-    if phase == "done":
-        return "closed"
-    allowed = {
-        "todo",
-        "assigned",
-        "accepted",
-        "awaiting_operator",
-        "running",
-        "handoff_requested",
-        "review_requested",
-        "ready_for_review",
-        "closeout_requested",
-        "review_approved",
-        "changes_requested",
-        "blocked",
-        "unblocked",
-        "released",
-        "closed",
-    }
-    if phase in allowed:
-        return phase
-    return "todo"
 
 
 def _build_checklist_item(
@@ -578,10 +397,15 @@ def _build_checklist_item(
     phase: str,
     now: str,
     envelope: dict[str, Any],
+    _projection: Callable[[str], tuple[str, str]] = initial_projection,
 ) -> dict[str, Any]:
-    """Build a deterministic checklist item including the split-operation envelope."""
-    coarse_status = _checklist_status_for_phase(phase)
-    workflow_status = _workflow_status_for_phase(phase)
+    """Build a deterministic checklist item including the split-operation envelope.
+
+    Authoring uses the initial projection: create only produces todo/todo, and
+    reserved lifecycle/terminal phases fail closed before any file or DB work.
+    Read-only historical reconstruction passes ``reconstruct_projection``.
+    """
+    coarse_status, workflow_status = _projection(phase)
     return {
         "id": task_id,
         "title": title,
@@ -630,6 +454,7 @@ def reconstruct_creation_time_checklist_item(
         phase=phase,
         now=files_applied_at,
         envelope=envelope,
+        _projection=reconstruct_projection,
     )
 
 
@@ -642,7 +467,7 @@ STANDARD_CREATION_ITEM_FIELDS: frozenset[str] = frozenset(
         title="",
         plan_doc="",
         priority="",
-        phase="",
+        phase="todo",
         now="1970-01-01T00:00:00Z",
         envelope={},
     ).keys()
@@ -707,18 +532,6 @@ def _prior_plan_ready_id_before_rowid(
     return row["id"] if row else None
 
 
-def _read_checklist(checklist_path: Path) -> dict[str, Any]:
-    if not checklist_path.is_file():
-        return {"project": "", "harness_root": "", "version": 1, "items": []}
-    try:
-        return json.loads(checklist_path.read_text(encoding="utf-8"))
-    except (OSError, json.JSONDecodeError) as exc:
-        raise SplitOperationError(
-            f"mvp-checklist.json at {checklist_path} cannot be read: {exc}",
-            REASON_VALIDATION_ERROR,
-        ) from exc
-
-
 def _find_checklist_item(checklist: dict[str, Any], task_id: str) -> dict[str, Any] | None:
     items = checklist.get("items") if isinstance(checklist.get("items"), list) else None
     if not items:
@@ -727,10 +540,6 @@ def _find_checklist_item(checklist: dict[str, Any], task_id: str) -> dict[str, A
         if isinstance(item, dict) and item.get("id") == task_id:
             return item
     return None
-
-
-def _write_checklist(checklist_path: Path, checklist: dict[str, Any]) -> None:
-    _atomic_write_json(checklist_path, checklist)
 
 
 @dataclass(frozen=True)
@@ -788,8 +597,7 @@ def _validate_task_create_files_inputs(
         raise SplitOperationError("resolved title is empty", REASON_VALIDATION_ERROR)
     if not phase:
         raise SplitOperationError("phase is required", REASON_VALIDATION_ERROR)
-    if not priority:
-        raise SplitOperationError("priority is required", REASON_VALIDATION_ERROR)
+    _validate_priority(priority)
     return operation_id, workspace_id, task_id, plan_doc, title, phase, priority
 
 
@@ -810,8 +618,11 @@ def apply_task_create_files(
 ) -> TaskCreateFilesOperationResult:
     """Apply the file half of a task.create split operation.
 
-    Writes the operation envelope into ``mvp-checklist.json`` atomically under
-    a per-checklist lock. Idempotent when the exact envelope is already present.
+    Resolves the single active checklist (new/legacy; none/both fail closed),
+    validates the current checklist, and appends the operation envelope
+    atomically under the per-checklist lock. Idempotent when the exact envelope
+    is already present (file bytes and mtime are preserved). Reserved
+    lifecycle/terminal phases fail closed before any file work.
     """
     operation_id, workspace_id, task_id, plan_doc, title, phase, priority = (
         _validate_task_create_files_inputs(
@@ -824,9 +635,9 @@ def apply_task_create_files(
             priority=priority,
         )
     )
+    _require_creatable_phase(phase)
     workspace_path = Path(workspace_path)
     harness_root = Path(harness_root)
-    checklist_path = harness_root / "mvp-checklist.json"
     plan_abs = workspace_path / plan_doc
     if not plan_abs.is_file():
         raise SplitOperationError(
@@ -875,14 +686,14 @@ def apply_task_create_files(
     )
     after_item["split_operation"] = envelope
 
-    lock = _lock or ChecklistLock(checklist_path, timeout=_lock_timeout)
-    with lock:
-        checklist = _read_checklist(checklist_path)
-        existing = _find_checklist_item(checklist, task_id)
-
+    def callback(candidate: dict[str, Any]) -> bool:
+        existing = _find_checklist_item(candidate, task_id)
         if existing is not None:
             existing_envelope = existing.get("split_operation")
-            if isinstance(existing_envelope, dict) and existing_envelope.get("operation_id") == operation_id:
+            if (
+                isinstance(existing_envelope, dict)
+                and existing_envelope.get("operation_id") == operation_id
+            ):
                 # Same operation id: verify the whole envelope and projected item.
                 expected_keys = {
                     "contract_version",
@@ -913,44 +724,53 @@ def apply_task_create_files(
                             f"task {task_id} has operation {operation_id} but envelope field {key} differs",
                             REASON_OPERATION_CONFLICT,
                         )
-                current_fingerprint = compute_task_item_fingerprint(item=existing, task_id=task_id)
+                current_fingerprint = compute_task_item_fingerprint(
+                    item=existing, task_id=task_id
+                )
                 if current_fingerprint != after_fingerprint:
                     raise SplitOperationError(
                         f"task {task_id} has operation {operation_id} but current projection has drifted",
                         REASON_FINGERPRINT_DRIFT,
                     )
-                # Idempotent success: do not rewrite the file.
-                return TaskCreateFilesOperationResult(
-                    workspace_id=workspace_id,
-                    workspace_path=str(workspace_path),
-                    harness_root=str(harness_root),
-                    task_id=task_id,
-                    plan_doc=plan_doc,
-                    operation_id=operation_id,
-                    operation_kind=OPERATION_KIND_TASK_CREATE,
-                    contract_version=CONTRACT_VERSION,
-                    input_fingerprint=input_fingerprint,
-                    before_fingerprint=before_fingerprint,
-                    after_fingerprint=after_fingerprint,
-                    files_applied_at=existing_envelope["files_applied_at"],
-                    checklist_changed=False,
+                # Idempotent success: no rewrite; the original envelope time wins.
+                return False
+            if not isinstance(existing_envelope, dict):
+                raise SplitOperationError(
+                    f"task {task_id} already exists in the checklist without a "
+                    "split-operation envelope; refusing to adopt a legacy "
+                    "unbound item. Reconcile it explicitly instead.",
+                    REASON_LEGACY_UNBOUND_ITEM,
                 )
-            # Existing item is either unbound or bound to another operation.
+            # Bound to another operation.
             raise SplitOperationError(
                 f"task {task_id} already exists in checklist with a different operation",
                 REASON_OPERATION_CONFLICT,
             )
 
         # Absent task: append the new item atomically.
-        items = checklist.setdefault("items", [])
+        items = candidate.setdefault("items", [])
         if not isinstance(items, list):
             raise SplitOperationError(
-                "mvp-checklist.json items must be a list",
+                "checklist items must be a list",
                 REASON_VALIDATION_ERROR,
             )
         items.append(after_item)
-        checklist["updated_at"] = files_applied_at.split("T")[0]
-        _write_checklist(checklist_path, checklist)
+        return True
+
+    try:
+        checklist, changed = mutate_checklist(
+            harness_root,
+            callback,
+            lock_timeout=_lock_timeout,
+            _lock=_lock,
+        )
+    except ChecklistError as exc:
+        raise SplitOperationError(str(exc), exc.reason) from exc
+    if changed:
+        applied_at = files_applied_at
+    else:
+        existing = _find_checklist_item(checklist, task_id)
+        applied_at = existing["split_operation"]["files_applied_at"]
 
     return TaskCreateFilesOperationResult(
         workspace_id=workspace_id,
@@ -964,8 +784,8 @@ def apply_task_create_files(
         input_fingerprint=input_fingerprint,
         before_fingerprint=before_fingerprint,
         after_fingerprint=after_fingerprint,
-        files_applied_at=files_applied_at,
-        checklist_changed=True,
+        files_applied_at=applied_at,
+        checklist_changed=changed,
     )
 
 
@@ -1010,6 +830,15 @@ class IssueMaterializeFilesOperationResult:
         }
 
 
+def _validate_priority(priority: str) -> None:
+    """Created items must carry a p0|p1|p2 priority (U1 validator contract)."""
+    if priority not in {"p0", "p1", "p2"}:
+        raise SplitOperationError(
+            f"priority must be one of p0|p1|p2, got {priority!r}",
+            REASON_VALIDATION_ERROR,
+        )
+
+
 def _validate_issue_materialize_files_inputs(
     *,
     workspace_id: str,
@@ -1033,8 +862,7 @@ def _validate_issue_materialize_files_inputs(
         raise SplitOperationError("resolved title is empty", REASON_VALIDATION_ERROR)
     if not phase:
         raise SplitOperationError("phase is required", REASON_VALIDATION_ERROR)
-    if not priority:
-        raise SplitOperationError("priority is required", REASON_VALIDATION_ERROR)
+    _validate_priority(priority)
     return (
         operation_id,
         workspace_id,
@@ -1066,8 +894,10 @@ def apply_issue_materialize_files(
     """Apply the file half of an issue.materialize split operation.
 
     Binds the accepted triage event as the operation source and writes the
-    C2 envelope into ``mvp-checklist.json`` atomically under the shared
-    per-checklist lock. Idempotent when the exact envelope is already present.
+    C2 envelope into the resolved checklist (new/legacy; none/both fail
+    closed) atomically under the shared per-checklist lock. Idempotent when
+    the exact envelope is already present. Reserved lifecycle/terminal
+    phases fail closed before any file work.
     """
     (
         operation_id,
@@ -1088,9 +918,9 @@ def apply_issue_materialize_files(
         phase=phase,
         priority=priority,
     )
+    _require_creatable_phase(phase)
     workspace_path = Path(workspace_path)
     harness_root = Path(harness_root)
-    checklist_path = harness_root / "mvp-checklist.json"
     plan_abs = workspace_path / plan_doc
     if not plan_abs.is_file():
         raise SplitOperationError(
@@ -1143,11 +973,8 @@ def apply_issue_materialize_files(
     )
     after_item["split_operation"] = envelope
 
-    lock = _lock or ChecklistLock(checklist_path, timeout=_lock_timeout)
-    with lock:
-        checklist = _read_checklist(checklist_path)
-        existing = _find_checklist_item(checklist, task_id)
-
+    def callback(candidate: dict[str, Any]) -> bool:
+        existing = _find_checklist_item(candidate, task_id)
         if existing is not None:
             existing_envelope = existing.get("split_operation")
             if (
@@ -1181,39 +1008,45 @@ def apply_issue_materialize_files(
                         f"task {task_id} has operation {operation_id} but current projection has drifted",
                         REASON_FINGERPRINT_DRIFT,
                     )
-                # Idempotent success: do not rewrite the file.
-                return IssueMaterializeFilesOperationResult(
-                    workspace_id=workspace_id,
-                    workspace_path=str(workspace_path),
-                    harness_root=str(harness_root),
-                    task_id=task_id,
-                    plan_doc=plan_doc,
-                    operation_id=operation_id,
-                    operation_kind=OPERATION_KIND_ISSUE_MATERIALIZE,
-                    contract_version=CONTRACT_VERSION,
-                    source_event_id=source_event_id,
-                    input_fingerprint=input_fingerprint,
-                    before_fingerprint=before_fingerprint,
-                    after_fingerprint=after_fingerprint,
-                    files_applied_at=existing_envelope["files_applied_at"],
-                    checklist_changed=False,
+                # Idempotent success: no rewrite; the original envelope time wins.
+                return False
+            if not isinstance(existing_envelope, dict):
+                raise SplitOperationError(
+                    f"task {task_id} already exists in the checklist without a "
+                    "split-operation envelope; refusing to adopt a legacy "
+                    "unbound item. Reconcile it explicitly instead.",
+                    REASON_LEGACY_UNBOUND_ITEM,
                 )
-            # Existing item is either unbound or bound to another operation/source.
+            # Bound to another operation/source.
             raise SplitOperationError(
                 f"task {task_id} already exists in checklist with a different operation",
                 REASON_OPERATION_CONFLICT,
             )
 
         # Absent task: append the new item atomically.
-        items = checklist.setdefault("items", [])
+        items = candidate.setdefault("items", [])
         if not isinstance(items, list):
             raise SplitOperationError(
-                "mvp-checklist.json items must be a list",
+                "checklist items must be a list",
                 REASON_VALIDATION_ERROR,
             )
         items.append(after_item)
-        checklist["updated_at"] = files_applied_at.split("T")[0]
-        _write_checklist(checklist_path, checklist)
+        return True
+
+    try:
+        checklist, changed = mutate_checklist(
+            harness_root,
+            callback,
+            lock_timeout=_lock_timeout,
+            _lock=_lock,
+        )
+    except ChecklistError as exc:
+        raise SplitOperationError(str(exc), exc.reason) from exc
+    if changed:
+        applied_at = files_applied_at
+    else:
+        existing = _find_checklist_item(checklist, task_id)
+        applied_at = existing["split_operation"]["files_applied_at"]
 
     return IssueMaterializeFilesOperationResult(
         workspace_id=workspace_id,
@@ -1228,8 +1061,8 @@ def apply_issue_materialize_files(
         input_fingerprint=input_fingerprint,
         before_fingerprint=before_fingerprint,
         after_fingerprint=after_fingerprint,
-        files_applied_at=files_applied_at,
-        checklist_changed=True,
+        files_applied_at=applied_at,
+        checklist_changed=changed,
     )
 
 
@@ -1306,19 +1139,15 @@ def _load_deployed_envelope(
     task_id: str,
     operation_id: str,
 ) -> dict[str, Any]:
-    checklist_path = Path(workspace.harness_root) / "mvp-checklist.json"
-    if not checklist_path.is_file():
-        raise SplitOperationError(
-            f"mvp-checklist.json not deployed at {workspace.harness_root}",
-            REASON_FILES_NOT_DEPLOYED,
-        )
     try:
-        checklist = json.loads(checklist_path.read_text(encoding="utf-8"))
-    except (OSError, json.JSONDecodeError) as exc:
-        raise SplitOperationError(
-            f"deployed mvp-checklist.json cannot be read: {exc}",
-            REASON_FILES_NOT_DEPLOYED,
-        ) from exc
+        checklist, resolved = load_checklist(workspace.harness_root, purpose="read")
+    except ChecklistError as exc:
+        if exc.reason == REASON_CHECKLIST_MISSING:
+            raise SplitOperationError(
+                f"checklist not deployed at {workspace.harness_root}",
+                REASON_FILES_NOT_DEPLOYED,
+            ) from exc
+        raise SplitOperationError(str(exc), exc.reason) from exc
     items = checklist.get("items") if isinstance(checklist.get("items"), list) else None
     item = None
     if items:
@@ -1677,20 +1506,21 @@ def load_deployed_item_readonly(
     operation id, so callers can distinguish missing envelopes from drifted
     identity.
     """
-    checklist_path = Path(workspace.harness_root) / "mvp-checklist.json"
-    if not checklist_path.is_file():
-        return None, [f"mvp-checklist.json not deployed at {workspace.harness_root}"]
     try:
-        checklist = json.loads(checklist_path.read_text(encoding="utf-8"))
-    except (OSError, json.JSONDecodeError) as exc:
-        return None, [f"deployed mvp-checklist.json cannot be read: {exc}"]
+        raw, resolved = read_checklist_bytes(workspace.harness_root, purpose="read")
+    except ChecklistError as exc:
+        return None, [str(exc)]
+    try:
+        checklist = json.loads(raw.decode("utf-8"))
+    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+        return None, [f"deployed checklist at {resolved.path} cannot be read: {exc}"]
     items = checklist.get("items") if isinstance(checklist.get("items"), list) else None
     if not items:
-        return None, ["deployed mvp-checklist.json has no items"]
+        return None, [f"deployed checklist at {resolved.path} has no items"]
     for candidate in items:
         if isinstance(candidate, dict) and candidate.get("id") == task_id:
             return candidate, []
-    return None, [f"task {task_id} not found in deployed checklist"]
+    return None, [f"task {task_id} not found in deployed checklist at {resolved.path}"]
 
 
 def verify_task_create_envelope_readonly(

@@ -356,7 +356,7 @@ class PlanningBehaviorTests(unittest.TestCase):
             plan.write_text("# Plan\n", encoding="utf-8")
             checklist = Path(tmp) / "mvp-checklist.json"
             checklist.write_text(
-                json.dumps({"project": "demo", "harness_root": ".", "version": 1, "items": []}),
+                json.dumps({"project": "demo", "harness_root": ".", "version": 1, "updated_at": "2026-07-13", "items": []}),
                 encoding="utf-8",
             )
             self._setup_workspace(tmp, db_path)
@@ -403,7 +403,7 @@ class PlanningBehaviorTests(unittest.TestCase):
             plan.write_text("# Plan\n", encoding="utf-8")
             checklist = Path(tmp) / "mvp-checklist.json"
             checklist.write_text(
-                json.dumps({"project": "demo", "harness_root": ".", "version": 1, "items": []}),
+                json.dumps({"project": "demo", "harness_root": ".", "version": 1, "updated_at": "2026-07-13", "items": []}),
                 encoding="utf-8",
             )
             operation_id = str(uuid.uuid4())
@@ -431,7 +431,7 @@ class PlanningBehaviorTests(unittest.TestCase):
             plan.write_text("# Plan\n", encoding="utf-8")
             checklist = Path(tmp) / "mvp-checklist.json"
             checklist.write_text(
-                json.dumps({"project": "demo", "harness_root": ".", "version": 1, "items": []}),
+                json.dumps({"project": "demo", "harness_root": ".", "version": 1, "updated_at": "2026-07-13", "items": []}),
                 encoding="utf-8",
             )
             self._setup_workspace(tmp, db_path)

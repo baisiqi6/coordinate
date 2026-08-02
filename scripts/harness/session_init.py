@@ -13,7 +13,7 @@ import sys
 from pathlib import Path
 
 from build_harness_state import build_state, write_state
-from harness_common import load_config, project_root
+from harness_common import load_config, project_root, rel, resolve_checklist
 
 
 def run_step(label: str, command: str | list[str], cwd: Path) -> int:
@@ -78,7 +78,7 @@ def command_order(config: dict, commands: dict[str, str]) -> list[str]:
 
 
 def main() -> int:
-    parser = argparse.ArgumentParser(description="Deterministic session bootstrap for discord-nexus.")
+    parser = argparse.ArgumentParser(description="Deterministic session bootstrap for Coordinate.")
     parser.add_argument("--skip-checklist", action="store_true", help="Skip checklist validation.")
     parser.add_argument("--skip-typecheck", action="store_true", help="Skip configured typecheck command.")
     parser.add_argument("--skip-tests", action="store_true", help="Skip configured test command.")
@@ -102,9 +102,10 @@ def main() -> int:
     config = load_config()
 
     if not args.skip_checklist:
+        resolved = resolve_checklist(purpose="read")
         checklist_command = (
             f"{sys.executable} scripts/harness/validate_checklist.py "
-            "docs/project-harness/mvp-checklist.json"
+            f"{rel(resolved.path)}"
         )
         if run_step("Checklist Validation", checklist_command, root) != 0:
             failures.append("checklist validation failed")

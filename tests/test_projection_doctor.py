@@ -51,6 +51,18 @@ class ProjectionDoctorTestBase(unittest.TestCase):
     def _make_workspace(self, conn, tmp, harness_root=None):
         hr = harness_root or os.path.join(tmp, "harness")
         Path(hr).mkdir(parents=True, exist_ok=True)
+        # Seed a validator-passing empty checklist (the init contract shape) so
+        # file-half mutations resolve and validate the current checklist.
+        (Path(hr) / "mvp-checklist.json").write_text(
+            json.dumps({
+                "project": "demo",
+                "harness_root": ".",
+                "version": 1,
+                "updated_at": "2026-07-13",
+                "items": [],
+            }, ensure_ascii=False, indent=2) + "\n",
+            encoding="utf-8",
+        )
         upsert_workspace(
             conn,
             workspace_id="demo",
@@ -301,7 +313,7 @@ class SplitOperationFindingsTest(ProjectionDoctorTestBase):
                 plan_doc="plans/plan.md",
                 title="Task 1",
                 phase="ready",
-                priority="high",
+                priority="p1",
                 operation_id=operation_id,
             )
             apply_task_create_record(
@@ -339,7 +351,7 @@ class SplitOperationFindingsTest(ProjectionDoctorTestBase):
                 plan_doc="plans/plan.md",
                 title="Task 1",
                 phase="ready",
-                priority="high",
+                priority="p1",
                 operation_id=operation_id,
             )
             report = diagnose_projections(conn, ws)
@@ -390,7 +402,7 @@ class SplitOperationFindingsTest(ProjectionDoctorTestBase):
                 plan_doc="plans/plan.md",
                 title="Task 1",
                 phase="ready",
-                priority="high",
+                priority="p1",
                 operation_id=operation_id,
             )
             apply_task_create_record(
@@ -434,7 +446,7 @@ class SplitOperationFindingsTest(ProjectionDoctorTestBase):
                 plan_doc="plans/plan.md",
                 title="Task 1",
                 phase="ready",
-                priority="high",
+                priority="p1",
                 operation_id=operation_id,
             )
             apply_task_create_record(
@@ -515,7 +527,7 @@ class TaskMirrorFindingsTest(ProjectionDoctorTestBase):
                 plan_doc="plans/plan.md",
                 title="Task 1",
                 phase="ready",
-                priority="high",
+                priority="p1",
                 operation_id=operation_id,
             )
             apply_task_create_record(
@@ -568,7 +580,7 @@ class TaskMirrorFindingsTest(ProjectionDoctorTestBase):
                 plan_doc="plans/plan.md",
                 title="Task 1",
                 phase="ready",
-                priority="high",
+                priority="p1",
                 operation_id=operation_id,
             )
             apply_task_create_record(
@@ -609,7 +621,7 @@ class TaskMirrorFindingsTest(ProjectionDoctorTestBase):
                 plan_doc="plans/plan.md",
                 title="Task 1",
                 phase="ready",
-                priority="high",
+                priority="p1",
                 operation_id=operation_id,
             )
             apply_task_create_record(
@@ -919,7 +931,7 @@ class NoWriteProofTest(ProjectionDoctorTestBase):
                 plan_doc="plans/plan.md",
                 title="Task 1",
                 phase="ready",
-                priority="high",
+                priority="p1",
                 operation_id=operation_id,
             )
             apply_task_create_record(
@@ -1066,7 +1078,7 @@ class AdditionalRequiredChecksTest(ProjectionDoctorTestBase):
                 plan_doc="plans/plan.md",
                 title="Task 1",
                 phase="ready",
-                priority="high",
+                priority="p1",
                 operation_id=operation_id,
             )
             apply_task_create_record(
@@ -1111,7 +1123,7 @@ class AdditionalRequiredChecksTest(ProjectionDoctorTestBase):
                 plan_doc="plans/plan.md",
                 title="Task 1",
                 phase="ready",
-                priority="high",
+                priority="p1",
                 operation_id=operation_id,
             )
             checklist_path = Path(ws.harness_root) / "mvp-checklist.json"
@@ -1290,7 +1302,7 @@ class AdditionalRequiredChecksTest(ProjectionDoctorTestBase):
                 plan_doc="plans/plan.md",
                 title="Task 1",
                 phase="ready",
-                priority="high",
+                priority="p1",
                 operation_id=operation_id,
             )
             apply_task_create_record(
@@ -1339,7 +1351,7 @@ class AdditionalRequiredChecksTest(ProjectionDoctorTestBase):
                 plan_doc="plans/plan.md",
                 title="Task 1",
                 phase="ready",
-                priority="high",
+                priority="p1",
                 operation_id=operation_id,
             )
             apply_task_create_record(
@@ -1389,7 +1401,7 @@ class AdditionalRequiredChecksTest(ProjectionDoctorTestBase):
                 plan_doc="plans/plan.md",
                 title="Task 1",
                 phase="ready",
-                priority="high",
+                priority="p1",
                 operation_id=operation_id,
             )
             apply_task_create_record(
@@ -1439,7 +1451,7 @@ class AdditionalRequiredChecksTest(ProjectionDoctorTestBase):
                 plan_doc="plans/plan.md",
                 title="Task 1",
                 phase="ready",
-                priority="high",
+                priority="p1",
                 operation_id=operation_id,
             )
             apply_task_create_record(
@@ -1490,7 +1502,7 @@ class AdditionalRequiredChecksTest(ProjectionDoctorTestBase):
                 plan_doc="plans/plan.md",
                 title="Task 1",
                 phase="ready",
-                priority="high",
+                priority="p1",
                 operation_id=operation_id,
             )
             apply_task_create_record(
@@ -1534,7 +1546,7 @@ class AdditionalRequiredChecksTest(ProjectionDoctorTestBase):
                 plan_doc="plans/plan.md",
                 title="Task 1",
                 phase="ready",
-                priority="high",
+                priority="p1",
                 operation_id=operation_id,
             )
             apply_task_create_record(
@@ -1652,7 +1664,7 @@ class AdditionalRequiredChecksTest(ProjectionDoctorTestBase):
                 plan_doc="plans/plan.md",
                 title="Issue 1",
                 phase="ready",
-                priority="high",
+                priority="p1",
                 operation_id=operation_id,
             )
             # Manually create the DB record state (ledger + mirror + record event).
@@ -1671,7 +1683,7 @@ class AdditionalRequiredChecksTest(ProjectionDoctorTestBase):
                     "plan_doc": "plans/plan.md",
                     "phase": "ready",
                     "status": "ready",
-                    "priority": "high",
+                    "priority": "p1",
                     "plan_sha256": plan_sha256,
                     "split_operation": {
                         "contract_version": 1,
@@ -1697,7 +1709,7 @@ class AdditionalRequiredChecksTest(ProjectionDoctorTestBase):
                     "plan_doc": "plans/plan.md",
                     "phase": "ready",
                     "status": "ready",
-                    "priority": "high",
+                    "priority": "p1",
                     "triage_event_id": triage.row["id"],
                     "source": "github_issue",
                     "plan_ready_event_id": plan_ready.row["id"],
@@ -1743,7 +1755,7 @@ class AdditionalRequiredChecksTest(ProjectionDoctorTestBase):
                     "plan_doc": "plans/plan.md",
                     "phase": "ready",
                     "status": "ready",
-                    "priority": "high",
+                    "priority": "p1",
                     "triage_event_id": triage.row["id"],
                     "source": "github_issue",
                     "split_operation": {
@@ -1800,7 +1812,7 @@ class AdditionalRequiredChecksTest(ProjectionDoctorTestBase):
                 plan_doc="plans/plan.md",
                 title="Issue 1",
                 phase="ready",
-                priority="high",
+                priority="p1",
                 operation_id=operation_id,
             )
             # Manually create the DB record state (ledger + mirror + record event).
@@ -1819,7 +1831,7 @@ class AdditionalRequiredChecksTest(ProjectionDoctorTestBase):
                     "plan_doc": "plans/plan.md",
                     "phase": "ready",
                     "status": "ready",
-                    "priority": "high",
+                    "priority": "p1",
                     "plan_sha256": plan_sha256,
                     "split_operation": {
                         "contract_version": 1,
@@ -1845,7 +1857,7 @@ class AdditionalRequiredChecksTest(ProjectionDoctorTestBase):
                     "plan_doc": "plans/plan.md",
                     "phase": "ready",
                     "status": "ready",
-                    "priority": "high",
+                    "priority": "p1",
                     "triage_event_id": triage.row["id"],
                     "source": "github_issue",
                     "plan_ready_event_id": plan_ready.row["id"],
@@ -1891,7 +1903,7 @@ class AdditionalRequiredChecksTest(ProjectionDoctorTestBase):
                     "plan_doc": "plans/plan.md",
                     "phase": "ready",
                     "status": "ready",
-                    "priority": "high",
+                    "priority": "p1",
                     "triage_event_id": triage.row["id"],
                     "source": "github_issue",
                     "split_operation": {
@@ -1953,7 +1965,7 @@ class AdditionalRequiredChecksTest(ProjectionDoctorTestBase):
                 plan_doc="plans/plan.md",
                 title="Task 1",
                 phase="ready",
-                priority="high",
+                priority="p1",
                 operation_id=operation_id,
             )
             apply_task_create_record(
@@ -2042,7 +2054,7 @@ class AdditionalRequiredChecksTest(ProjectionDoctorTestBase):
             plan_doc=plan_doc,
             title=title,
             phase="ready",
-            priority="high",
+            priority="p1",
             operation_id=operation_id,
         )
         apply_task_create_record(
@@ -2103,7 +2115,7 @@ class AdditionalRequiredChecksTest(ProjectionDoctorTestBase):
                     "plan_doc": "plans/plan.md",
                     "phase": "ready",
                     "status": "ready",
-                    "priority": "high",
+                    "priority": "p1",
                     "plan_sha256": new_sha,
                     "supersedes_plan_ready_event_id": base_ready_event_id,
                 },
@@ -2157,7 +2169,7 @@ class AdditionalRequiredChecksTest(ProjectionDoctorTestBase):
                     "plan_doc": "plans/plan.md",
                     "phase": "ready",
                     "status": "ready",
-                    "priority": "high",
+                    "priority": "p1",
                     "plan_sha256": new_sha,
                     "supersedes_plan_ready_event_id": base_ready_event_id,
                 },
@@ -2201,7 +2213,7 @@ class AdditionalRequiredChecksTest(ProjectionDoctorTestBase):
                     "plan_doc": "plans/plan.md",
                     "phase": "ready",
                     "status": "ready",
-                    "priority": "high",
+                    "priority": "p1",
                     "plan_sha256": new_sha,
                     "supersedes_plan_ready_event_id": base_ready_event_id,
                 },
@@ -2250,7 +2262,7 @@ class AdditionalRequiredChecksTest(ProjectionDoctorTestBase):
                     "plan_doc": "plans/plan.md",
                     "phase": "ready",
                     "status": "ready",
-                    "priority": "high",
+                    "priority": "p1",
                     "plan_sha256": new_sha,
                     "supersedes_plan_ready_event_id": base_ready_event_id,
                 },
@@ -2269,7 +2281,7 @@ class AdditionalRequiredChecksTest(ProjectionDoctorTestBase):
                     "plan_doc": "plans/plan.md",
                     "phase": "ready",
                     "status": "ready",
-                    "priority": "high",
+                    "priority": "p1",
                     "plan_sha256": new_sha,
                     "supersedes_plan_ready_event_id": base_ready_event_id,
                 },
@@ -2343,7 +2355,7 @@ class AdditionalRequiredChecksTest(ProjectionDoctorTestBase):
                     "plan_doc": "plans/plan.md",
                     "phase": "ready",
                     "status": "ready",
-                    "priority": "high",
+                    "priority": "p1",
                     "plan_sha256": new_sha,
                     "supersedes_plan_ready_event_id": base_ready_2,  # wrong task: cross-task link
                 },
@@ -2392,7 +2404,7 @@ class AdditionalRequiredChecksTest(ProjectionDoctorTestBase):
                     "plan_doc": "plans/plan.md",
                     "phase": "ready",
                     "status": "ready",
-                    "priority": "high",
+                    "priority": "p1",
                     # missing plan_sha256 and supersedes link -> fail-closed
                     "supersedes_plan_ready_event_id": base_ready_event_id,
                 },

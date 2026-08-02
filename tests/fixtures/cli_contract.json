@@ -2047,7 +2047,7 @@
         }
       ],
       "defaults": {},
-      "help": "usage: coordinate task [-h] {create,create-files,create-record,handoff} ...\n\npositional arguments:\n  {create,create-files,create-record,handoff}\n    create              Create a plan-backed task and plan.ready event\n    create-files        Coding-host half of host-aware task create: sync mvp-checklist.json only\n                        (no DB write)\n    create-record       Server half of host-aware task create: write DB task mirror + plan.ready\n                        only (no checklist write)\n    handoff             Generate a structured worker handoff\n\noptions:\n  -h, --help            show this help message and exit\n",
+      "help": "usage: coordinate task [-h] {create,create-files,create-record,handoff} ...\n\npositional arguments:\n  {create,create-files,create-record,handoff}\n    create              Combined managed create: checklist file half first, DB record half second\n                        (idempotent; --operation-id to pin)\n    create-files        Coding-host half of host-aware task create: checklist file half only (no\n                        DB write)\n    create-record       Server half of host-aware task create: write DB task mirror + plan.ready\n                        only (no checklist write)\n    handoff             Generate a structured worker handoff\n\noptions:\n  -h, --help            show this help message and exit\n",
       "path": [
         "task"
       ],
@@ -2176,6 +2176,25 @@
         },
         {
           "action_class": "_StoreAction",
+          "choices": [
+            "p0",
+            "p1",
+            "p2"
+          ],
+          "const": null,
+          "default": "p1",
+          "dest": "priority",
+          "help": null,
+          "metavar": null,
+          "nargs": null,
+          "option_strings": [
+            "--priority"
+          ],
+          "required": false,
+          "type": null
+        },
+        {
+          "action_class": "_StoreAction",
           "choices": null,
           "const": null,
           "default": "operator",
@@ -2233,12 +2252,42 @@
           ],
           "required": false,
           "type": null
+        },
+        {
+          "action_class": "_StoreAction",
+          "choices": null,
+          "const": null,
+          "default": null,
+          "dest": "operation_id",
+          "help": "Pin the split operation id (default: fresh UUIDv4 or reuse the deployed envelope)",
+          "metavar": null,
+          "nargs": null,
+          "option_strings": [
+            "--operation-id"
+          ],
+          "required": false,
+          "type": null
+        },
+        {
+          "action_class": "_StoreTrueAction",
+          "choices": null,
+          "const": true,
+          "default": false,
+          "dest": "allow_runtime_copy",
+          "help": "Override the /opt runtime-copy guard",
+          "metavar": null,
+          "nargs": 0,
+          "option_strings": [
+            "--allow-runtime-copy"
+          ],
+          "required": false,
+          "type": null
         }
       ],
       "defaults": {
         "handler": "coordinate.planning_cli.handle_task_create"
       },
-      "help": "usage: coordinate task create [-h] --task-id TASK_ID --plan-doc PLAN_DOC [--title TITLE]\n                              [--owner OWNER] [--branch BRANCH] [--phase PHASE] [--actor ACTOR]\n                              [--target TARGET] [--payload-json PAYLOAD_JSON]\n                              [--idempotency-key IDEMPOTENCY_KEY]\n                              workspace_id\n\npositional arguments:\n  workspace_id\n\noptions:\n  -h, --help            show this help message and exit\n  --task-id TASK_ID\n  --plan-doc PLAN_DOC\n  --title TITLE\n  --owner OWNER\n  --branch BRANCH\n  --phase PHASE\n  --actor ACTOR\n  --target TARGET\n  --payload-json PAYLOAD_JSON\n  --idempotency-key IDEMPOTENCY_KEY\n",
+      "help": "usage: coordinate task create [-h] --task-id TASK_ID --plan-doc PLAN_DOC [--title TITLE]\n                              [--owner OWNER] [--branch BRANCH] [--phase PHASE]\n                              [--priority {p0,p1,p2}] [--actor ACTOR] [--target TARGET]\n                              [--payload-json PAYLOAD_JSON] [--idempotency-key IDEMPOTENCY_KEY]\n                              [--operation-id OPERATION_ID] [--allow-runtime-copy]\n                              workspace_id\n\npositional arguments:\n  workspace_id\n\noptions:\n  -h, --help            show this help message and exit\n  --task-id TASK_ID\n  --plan-doc PLAN_DOC\n  --title TITLE\n  --owner OWNER\n  --branch BRANCH\n  --phase PHASE\n  --priority {p0,p1,p2}\n  --actor ACTOR\n  --target TARGET\n  --payload-json PAYLOAD_JSON\n  --idempotency-key IDEMPOTENCY_KEY\n  --operation-id OPERATION_ID\n                        Pin the split operation id (default: fresh UUIDv4 or reuse the deployed\n                        envelope)\n  --allow-runtime-copy  Override the /opt runtime-copy guard\n",
       "path": [
         "task",
         "create"
@@ -4694,7 +4743,7 @@
         }
       ],
       "defaults": {},
-      "help": "usage: coordinate issue [-h] {scan,triage,materialize,materialize-files,materialize-record} ...\n\npositional arguments:\n  {scan,triage,materialize,materialize-files,materialize-record}\n    scan                Scan GitHub issues into issue.spotted events\n    triage              Triage an issue.spotted event: accept creates a task mirror, reject/defer\n                        does not\n    materialize         Materialize an accepted issue.triaged event into a plan-backed harness\n                        task\n    materialize-files   Coding-host half of host-aware materialize: sync mvp-checklist.json only\n                        (no DB write)\n    materialize-record  Server half of host-aware materialize: write DB\n                        plan.ready/issue.materialized only (no harness write)\n\noptions:\n  -h, --help            show this help message and exit\n",
+      "help": "usage: coordinate issue [-h] {scan,triage,materialize,materialize-files,materialize-record} ...\n\npositional arguments:\n  {scan,triage,materialize,materialize-files,materialize-record}\n    scan                Scan GitHub issues into issue.spotted events\n    triage              Triage an issue.spotted event: accept creates a task mirror, reject/defer\n                        does not\n    materialize         Materialize an accepted issue.triaged event into a plan-backed harness\n                        task\n    materialize-files   Coding-host half of host-aware materialize: checklist file half only (no\n                        DB write)\n    materialize-record  Server half of host-aware materialize: write DB\n                        plan.ready/issue.materialized only (no harness write)\n\noptions:\n  -h, --help            show this help message and exit\n",
       "path": [
         "issue"
       ],
@@ -8839,7 +8888,7 @@
         }
       ],
       "defaults": {},
-      "help": "usage: coordinate assignment [-h]\n                             {request,accept,handoff,blocker,unblock,closeout,review-result,mark-done,mark-done-prepare,mark-done-preflight,mark-done-claim,mark-done-apply,mark-done-files,mark-done-record}\n                             ...\n\npositional arguments:\n  {request,accept,handoff,blocker,unblock,closeout,review-result,mark-done,mark-done-prepare,mark-done-preflight,mark-done-claim,mark-done-apply,mark-done-files,mark-done-record}\n    request             Request a task assignment\n    accept              Accept a task assignment\n    handoff             Hand off a task to another agent\n    blocker             Raise a blocker on a task\n    unblock             Resolve a blocker on a task\n    closeout            Request closeout review for a task\n    review-result       Submit a review result for a task\n    mark-done           Mark a task as done\n    mark-done-prepare   Validate the closeout/review gate on the control plane and issue a one-\n                        time completion.authorized receipt binding the host-aware mark-done files\n                        + record pair.\n    mark-done-preflight\n                        Read-only: re-query a receipt from the control-plane DB and return its\n                        authoritative workspace/task/status/expiry. The coding host calls this\n                        through coord-ssh before mutating the canonical checklist so it never\n                        trusts its own claims.\n    mark-done-claim     Atomically reserve a receipt authorized -> claimed on the control plane,\n                        recording before/expected-after fingerprints. Server-side sink invoked by\n                        the coding host through coord-ssh BEFORE the checklist mutation (two-phase\n                        reserve step).\n    mark-done-apply     Acknowledge a claimed receipt -> applied on the control plane, recording\n                        the actual after-fingerprint. Server-side sink invoked by the coding host\n                        through coord-ssh AFTER the canonical checklist write lands (two-phase\n                        apply step).\n    mark-done-files     Coding-host half of host-aware mark-done. Writes local mvp-checklist.json\n                        only. Normal path requires --receipt and a remote coord CLI (--event-cli-\n                        path) to verify/claim the receipt online before any file mutation.\n                        --repair-reason selects the explicit repair-only path.\n    mark-done-record    Server half of host-aware mark-done. Writes the control-plane task.done\n                        event after re-verifying the receipt and the deployed harness. Normal path\n                        requires --receipt; --repair-reason selects the explicit repair-only path.\n\noptions:\n  -h, --help            show this help message and exit\n",
+      "help": "usage: coordinate assignment [-h]\n                             {request,accept,handoff,blocker,unblock,closeout,review-result,mark-done,mark-done-prepare,mark-done-preflight,mark-done-claim,mark-done-apply,mark-done-files,mark-done-record}\n                             ...\n\npositional arguments:\n  {request,accept,handoff,blocker,unblock,closeout,review-result,mark-done,mark-done-prepare,mark-done-preflight,mark-done-claim,mark-done-apply,mark-done-files,mark-done-record}\n    request             Request a task assignment\n    accept              Accept a task assignment\n    handoff             Hand off a task to another agent\n    blocker             Raise a blocker on a task\n    unblock             Resolve a blocker on a task\n    closeout            Request closeout review for a task\n    review-result       Submit a review result for a task\n    mark-done           Mark a task as done\n    mark-done-prepare   Validate the closeout/review gate on the control plane and issue a one-\n                        time completion.authorized receipt binding the host-aware mark-done files\n                        + record pair.\n    mark-done-preflight\n                        Read-only: re-query a receipt from the control-plane DB and return its\n                        authoritative workspace/task/status/expiry. The coding host calls this\n                        through coord-ssh before mutating the canonical checklist so it never\n                        trusts its own claims.\n    mark-done-claim     Atomically reserve a receipt authorized -> claimed on the control plane,\n                        recording before/expected-after fingerprints. Server-side sink invoked by\n                        the coding host through coord-ssh BEFORE the checklist mutation (two-phase\n                        reserve step).\n    mark-done-apply     Acknowledge a claimed receipt -> applied on the control plane, recording\n                        the actual after-fingerprint. Server-side sink invoked by the coding host\n                        through coord-ssh AFTER the canonical checklist write lands (two-phase\n                        apply step).\n    mark-done-files     Coding-host half of host-aware mark-done. Writes local checklist file half\n                        only. Normal path requires --receipt and a remote coord CLI (--event-cli-\n                        path) to verify/claim the receipt online before any file mutation.\n                        --repair-reason selects the explicit repair-only path.\n    mark-done-record    Server half of host-aware mark-done. Writes the control-plane task.done\n                        event after re-verifying the receipt and the deployed harness. Normal path\n                        requires --receipt; --repair-reason selects the explicit repair-only path.\n\noptions:\n  -h, --help            show this help message and exit\n",
       "path": [
         "assignment"
       ],
@@ -9805,6 +9854,21 @@
           "choices": null,
           "const": null,
           "default": null,
+          "dest": "verification",
+          "help": "Non-empty completion verification committed with the terminal status",
+          "metavar": null,
+          "nargs": null,
+          "option_strings": [
+            "--verification"
+          ],
+          "required": false,
+          "type": null
+        },
+        {
+          "action_class": "_StoreAction",
+          "choices": null,
+          "const": null,
+          "default": null,
           "dest": "idempotency_hint",
           "help": null,
           "metavar": null,
@@ -9819,7 +9883,7 @@
       "defaults": {
         "handler": "coordinate.workflow_cli.handle_assignment_mark_done"
       },
-      "help": "usage: coordinate assignment mark-done [-h] --task-id TASK_ID [--actor ACTOR]\n                                       [--idempotency-hint IDEMPOTENCY_HINT]\n                                       workspace_id\n\npositional arguments:\n  workspace_id\n\noptions:\n  -h, --help            show this help message and exit\n  --task-id TASK_ID\n  --actor ACTOR\n  --idempotency-hint IDEMPOTENCY_HINT\n",
+      "help": "usage: coordinate assignment mark-done [-h] --task-id TASK_ID [--actor ACTOR]\n                                       [--verification VERIFICATION]\n                                       [--idempotency-hint IDEMPOTENCY_HINT]\n                                       workspace_id\n\npositional arguments:\n  workspace_id\n\noptions:\n  -h, --help            show this help message and exit\n  --task-id TASK_ID\n  --actor ACTOR\n  --verification VERIFICATION\n                        Non-empty completion verification committed with the terminal status\n  --idempotency-hint IDEMPOTENCY_HINT\n",
       "path": [
         "assignment",
         "mark-done"

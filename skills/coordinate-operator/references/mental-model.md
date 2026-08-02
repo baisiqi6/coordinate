@@ -1,4 +1,4 @@
-# Coordinator 心智模型
+# Coordinate 心智模型
 
 Coordinate 是顶层 harness 系统中的确定性运行时控制面，不是顶层本身、固定的
 Coordinator 或唯一权威。当前 Operator 负责判断；Coordinate 通过事件记录 runtime
@@ -29,7 +29,7 @@ Workspace：
 - 具有 `path`、`harness_root`、可选 `harnessctl_path`、默认 bus/destination、`base_branch` 和 `branch_namespace`。
 
 Task mirror：
-- Coordinator 对 harness 任务的本地视图。
+- Coordinate 对 harness 任务的本地视图。
 - 跟踪任务 id、phase/status 类元数据、owner、branch、PR、payload、最新事件。
 
 Event：
@@ -61,7 +61,7 @@ ExecutionContext / executor / capacity：
 runtime request -> pending job -> claim -> agentd -> report -> event -> policy -> delivery
 ```
 
-在 coordinator 已有服务的地方避免直接副作用。使用 CLI 或服务层，使状态保持可恢复。
+在 Coordinate 已有服务的地方避免直接副作用。使用 CLI 或服务层，使状态保持可恢复。
 
 ## 授权边界
 

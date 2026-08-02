@@ -551,7 +551,13 @@ class IssueMaterializeTests(unittest.TestCase):
         self.harness_root.mkdir(parents=True)
         if with_checklist:
             (self.harness_root / "mvp-checklist.json").write_text(
-                json.dumps({"project": "demo", "items": []}), encoding="utf-8"
+                json.dumps({
+                    "project": "demo",
+                    "harness_root": ".",
+                    "updated_at": "2026-07-13",
+                    "items": [],
+                }),
+                encoding="utf-8",
             )
         plan_abs = self.workspace_path / "docs" / "plan.md"
         plan_abs.parent.mkdir(parents=True, exist_ok=True)
@@ -804,7 +810,13 @@ class IssueMaterializeTests(unittest.TestCase):
         harness_root = workspace_path / "docs" / "project-harness"
         harness_root.mkdir(parents=True)
         (harness_root / "mvp-checklist.json").write_text(
-            json.dumps({"project": "demo", "items": []}), encoding="utf-8"
+            json.dumps({
+                "project": "demo",
+                "harness_root": ".",
+                "updated_at": "2026-07-13",
+                "items": [],
+            }),
+            encoding="utf-8",
         )
         plan_abs = workspace_path / "docs" / "plan.md"
         plan_abs.parent.mkdir(parents=True, exist_ok=True)
@@ -852,7 +864,13 @@ class IssueMaterializeHostAwareTests(unittest.TestCase):
         harness_root = ws_path / "docs" / "project-harness"
         harness_root.mkdir(parents=True)
         (harness_root / "mvp-checklist.json").write_text(
-            json.dumps({"project": "demo", "items": []}), encoding="utf-8"
+            json.dumps({
+                "project": "demo",
+                "harness_root": ".",
+                "updated_at": "2026-07-13",
+                "items": [],
+            }),
+            encoding="utf-8",
         )
         plan_abs = ws_path / "docs" / "plan.md"
         plan_abs.parent.mkdir(parents=True, exist_ok=True)
@@ -872,7 +890,13 @@ class IssueMaterializeHostAwareTests(unittest.TestCase):
         harness_root = Path(sidecar_tmp.name) / "harness"  # sidecar, outside checkout
         harness_root.mkdir(parents=True)
         (harness_root / "mvp-checklist.json").write_text(
-            json.dumps({"project": "opencode-sidecar", "items": []}), encoding="utf-8"
+            json.dumps({
+                "project": "opencode-sidecar",
+                "harness_root": ".",
+                "updated_at": "2026-07-13",
+                "items": [],
+            }),
+            encoding="utf-8",
         )
         # Plan lives in the code checkout (workspace-relative), not the sidecar
         # harness, so the operator plan remains under version control.

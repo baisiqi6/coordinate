@@ -784,6 +784,40 @@ class RuntimeServiceTests(unittest.TestCase):
             "DiscordBus workspace must keep platform=discord, not forced to discord_webhook",
         )
 
+    def test_reply_platform_none_keeps_completion_evidence_without_delivery(self):
+        self.register_codex()
+        request = submit_request(
+            self.conn,
+            workspace_id="demo",
+            target_agent="mac-codex",
+            prompt="audit-only reply",
+            origin={
+                "platform": "discord",
+                "destination": "channel-1",
+                "message_id": "m-none",
+                "session_scope_id": "discord:test",
+            },
+            reply={"platform": "none", "destination": "audit"},
+        )
+        claim_job(self.conn, agent_id="mac-codex")
+
+        result = report_job_result(
+            self.conn,
+            job_id=request.job["id"],
+            agent_id="mac-codex",
+            status="done",
+            result={"response_text": "already delivered by bridge"},
+        )
+
+        event_types = [
+            row_to_dict(row)["event_type"] for row in list_events(self.conn, "demo")
+        ]
+        self.assertEqual(result.job["status"], "done")
+        self.assertIn("job.completed", event_types)
+        self.assertIsNone(result.delivery)
+        self.assertFalse(result.delivery_created)
+        self.assertEqual(list_deliveries(self.conn), [])
+
 
 class PreWriteRejectionTests(unittest.TestCase):
     """R1-1: authority inputs must resolve before any event/job write."""

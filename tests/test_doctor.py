@@ -1,13 +1,31 @@
+import hashlib
 import json
 import os
+import shutil
 import subprocess
 import tempfile
 import unittest
 from pathlib import Path
 
-from coordinate.db import Workspace, initialize, upsert_workspace
+from coordinate.db import (
+    Workspace,
+    initialize,
+    list_events,
+    list_split_operations,
+    list_task_mirrors,
+    upsert_workspace,
+)
 from coordinate.doctor import diagnose_workspace
-from coordinate.onboarding import init_full_harness
+from coordinate.onboarding import (
+    REASON_RUNTIME_ROOT_INCOMPATIBLE,
+    REASON_RUNTIME_SOURCE_INCOMPLETE,
+    RuntimeSourceError,
+    init_full_harness,
+)
+from tests.fixtures.runtime_template import (
+    coordinate_runtime_dir,
+    make_template_source,
+)
 
 
 class _FakeRunner:
@@ -272,13 +290,25 @@ class _InitTestBase(unittest.TestCase):
         )
 
     def _make_source(self, tmp):
-        """Create a fake source directory with harness scripts."""
-        source = Path(tmp) / "source-harness"
-        source.mkdir()
-        (source / "harnessctl").write_text("#!/bin/bash\necho harnessctl $@\n", encoding="utf-8")
-        (source / "harness_common.py").write_text("# common lib\n", encoding="utf-8")
-        (source / "build_harness_state.py").write_text("# builder\n", encoding="utf-8")
-        return str(source)
+        """Build a U1-style template source from Coordinate's vendored runtime."""
+        return str(make_template_source(Path(tmp)))
+
+    def _snapshot(self, tmp, conn):
+        """Full file-tree digests plus DB task/event/operation counts."""
+        ws = Path(tmp)
+        files = {}
+        for p in sorted(ws.rglob("*")):
+            rel = str(p.relative_to(ws))
+            if p.is_dir():
+                files[rel + "/"] = None
+            else:
+                files[rel] = hashlib.sha256(p.read_bytes()).hexdigest()
+        return {
+            "files": files,
+            "events": len(list(list_events(conn, "test-ws"))),
+            "mirrors": len(list(list_task_mirrors(conn, "test-ws"))),
+            "ops": len(list_split_operations(conn, workspace_id="test-ws")),
+        }
 
 
 class FullInitDryRunTest(_InitTestBase):
@@ -326,28 +356,23 @@ class FullInitCreatesFilesTest(_InitTestBase):
                 self.assertTrue((hr / fname).exists(), f"{fname} should exist")
 
             # Check minimal files created
-            for fname in ["harness-config.json", "mvp-checklist.json",
+            for fname in ["harness-config.json", "harness-checklist.json",
                           "events.jsonl", "progress.md", "harness-state.json"]:
                 self.assertTrue((hr / fname).exists(), f"{fname} should exist")
 
 
 class FullInitNoOverwriteTest(_InitTestBase):
-    def test_does_not_overwrite_existing_files(self):
+    def test_provably_compatible_existing_runtime_is_kept(self):
         with tempfile.TemporaryDirectory() as tmp:
             conn = self._make_conn()
             self._make_workspace(conn, tmp)
             source = self._make_source(tmp)
 
-            # Pre-create some files with known content
+            # Pre-create protocol files with known content
             hr = Path(tmp) / "docs" / "project-harness"
             hr.mkdir(parents=True)
             (hr / "scope.md").write_text("ORIGINAL SCOPE", encoding="utf-8")
             (hr / "harness-config.json").write_text('{"existing": true}', encoding="utf-8")
-
-            # Pre-create scripts
-            scripts_dir = Path(tmp) / "scripts" / "harness"
-            scripts_dir.mkdir(parents=True)
-            (scripts_dir / "harnessctl").write_text("ORIGINAL", encoding="utf-8")
 
             result = init_full_harness(
                 conn,
@@ -358,13 +383,45 @@ class FullInitNoOverwriteTest(_InitTestBase):
             # Existing files should be preserved
             self.assertEqual((hr / "scope.md").read_text(), "ORIGINAL SCOPE")
             self.assertEqual((hr / "harness-config.json").read_text(), '{"existing": true}')
-            self.assertEqual((scripts_dir / "harnessctl").read_text(), "ORIGINAL")
 
             # They should appear in existing lists, not created (compare resolved paths)
             scope_resolved = str((hr / "scope.md").resolve())
             existing_resolved = [str(Path(p).resolve()) for p in result.files_existing]
             self.assertIn(scope_resolved, existing_resolved)
-            self.assertIn("scripts/harness/harnessctl", result.scripts_existing)
+
+            # A second full init over the compatible rendered runtime keeps it
+            # (existing, not re-copied, not overwritten).
+            second = init_full_harness(conn, workspace_id="test-ws", source=source)
+            self.assertEqual(second.scripts_copied, [])
+            self.assertIn("scripts/harness/harnessctl", second.scripts_existing)
+
+    def test_incompatible_existing_runtime_fails_closed_zero_mutation(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            conn = self._make_conn()
+            self._make_workspace(conn, tmp)  # harness_root=docs/project-harness
+            source = self._make_source(tmp)
+
+            # Pre-existing runtime rendered for the repo's own root (docs):
+            # the P1-3 root-mismatch destination case.
+            scripts_dir = Path(tmp) / "scripts" / "harness"
+            scripts_dir.mkdir(parents=True)
+            runtime = coordinate_runtime_dir()
+            shutil.copy2(runtime / "harnessctl", scripts_dir / "harnessctl")
+            shutil.copy2(runtime / "harness_common.py", scripts_dir / "harness_common.py")
+            hr = Path(tmp) / "docs" / "project-harness"
+
+            before = self._snapshot(tmp, conn)
+            with self.assertRaises(RuntimeSourceError) as ctx:
+                init_full_harness(conn, workspace_id="test-ws", source=source)
+            self.assertEqual(ctx.exception.reason, REASON_RUNTIME_ROOT_INCOMPATIBLE)
+            self.assertEqual(self._snapshot(tmp, conn), before)
+            self.assertFalse((hr / "scope.md").exists())
+            self.assertFalse((hr / "harness-config.json").exists())
+            self.assertFalse((hr / "harness-checklist.json").exists())
+            self.assertEqual(
+                (scripts_dir / "harnessctl").read_bytes(),
+                (runtime / "harnessctl").read_bytes(),
+            )
 
 
 class FullInitUpdatesHarnessctlPathTest(_InitTestBase):
@@ -431,18 +488,21 @@ class FullInitUnknownWorkspaceTest(_InitTestBase):
 
 
 class FullInitEmptySourceTest(_InitTestBase):
-    def test_warns_on_empty_source(self):
+    def test_empty_source_fails_closed(self):
         with tempfile.TemporaryDirectory() as tmp:
             conn = self._make_conn()
             self._make_workspace(conn, tmp)
             empty_source = Path(tmp) / "empty-source"
             empty_source.mkdir()
-            result = init_full_harness(
-                conn,
-                workspace_id="test-ws",
-                source=str(empty_source),
-            )
-            self.assertTrue(any("no files" in w for w in result.warnings))
+            before = self._snapshot(tmp, conn)
+            with self.assertRaises(RuntimeSourceError) as ctx:
+                init_full_harness(
+                    conn,
+                    workspace_id="test-ws",
+                    source=str(empty_source),
+                )
+            self.assertEqual(ctx.exception.reason, REASON_RUNTIME_SOURCE_INCOMPLETE)
+            self.assertEqual(self._snapshot(tmp, conn), before)
 
 
 class FullInitToDictTest(_InitTestBase):

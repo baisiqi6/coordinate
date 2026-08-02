@@ -1,6 +1,6 @@
 ---
 name: coordinate-operator
-description: Use when operating the Coordinate project across local development, coding-host files, and production control-plane via coord-ssh. Covers workspace setup, runner jobs, assignment transitions, visible-message delivery, GitHub branch/PR/CI/review state, merge gate checks, and operational troubleshooting. This skill is for AI operator onboarding, not for implementing new coordinator features.
+description: Use when operating the Coordinate project across local development, coding-host files, and production control-plane via coord-ssh. Covers workspace setup, runner jobs, assignment transitions, visible-message delivery, GitHub branch/PR/CI/review state, merge gate checks, and operational troubleshooting. This skill is for AI operator onboarding, not for implementing new Coordinate features.
 ---
 
 # Coordinate Operator
@@ -23,6 +23,20 @@ description: Use when operating the Coordinate project across local development,
 
 Coordinate DB 保存 runtime events、jobs、leases、receipts、deliveries、executor/capacity projection；repo harness 文件保存稳定项目规范。Discord/KOOK 只是可见总线。
 
+## 组合选择
+
+Operator 应按需求使用最小部署组合：
+
+- 只需要当前 agent 遵循 SDD/TDD、review 与测试纪律：使用 EXharness，不启动 Coordinate runtime。
+- 需要 durable job、event、lease、receipt 与恢复：增加 Coordinate；当前 agent、Operator 或已有
+  runner 可以主动执行和报告 job。
+- 需要自动调用 vendor agent CLI、恢复 provider session 或跨主机执行：增加 MultiNexus
+  `agentd/adapters`。
+- 需要 Discord/KOOK、多 Bot 和可见协作：再启用 MultiNexus bridge。
+
+不要把 MultiNexus 等同于 Discord，也不要把 Coordinate 等同于 vendor agent executor。没有消息平台
+需求时可以使用 executor-only；已有可靠执行者时也可以只使用 Coordinate，不为完整性增加运行层。
+
 Coordinate 对 path 的约束**分层**，不要笼统说"harness_root 必须 workspace-local"。当前代码有四条
 不同路径（`workspace_cli.py` + `onboarding.py`）：
 
@@ -38,7 +52,8 @@ Coordinate 对 path 的约束**分层**，不要笼统说"harness_root 必须 wo
   的归档"。这是 Coordinate 的 capability，不是本项目采用的 policy。
 - **`workspace init-harness --mode full`（full harness 层，Boundary B）**：**忽略 CLI `--root`**，使用
   已注册的 `workspace.harness_root`，并用 `hr_path.relative_to(ws_root)` 强制其在 `workspace.path` 内
-  （`onboarding.py:966-982`），否则拒绝写 mvp-checklist/harness-state/events。
+  （`onboarding.py:966-982`），否则拒绝写 checklist（`harness-checklist.json` 或 legacy
+  `mvp-checklist.json`）、`harness-state` 与 events。
 - **split-operation `plan_doc`（mutation fingerprint 层，Boundary A）**：强制 POSIX workspace-relative
   （拒绝绝对/`..`/空段/反斜杠）。这是 lexical guard，**不**提供 symlink/TOCTOU 抵抗。
 
@@ -86,11 +101,11 @@ skills/coordinate-operator/scripts/mac.sh ...
   （event-first、幂等，`--actor`/`--reason`/`--idempotency-key` 必填；改绑必须先显式 release）。
   详见 `references/command-reference.md` 的 “Channel Binding” 与 `references/workflows.md` 的
   “绑定 Channel 到 Workspace”。
-- 所有任务生命周期操作默认使用 coordinator 命令。不要要求普通 worker agent
+- 所有任务生命周期操作默认使用 Coordinate 命令。不要要求普通 worker agent
   直接使用 harness CLI。
-- Harness CLI 和 harness skill 是底层修复和维护接口。仅在 coordinator 缺少
-  所需操作、调试 coordinator-harness 同步或维护 harness 本身时使用。
-- 不要直接编辑 harness JSON。Harness mutation 必须通过 coordinator 服务
+- Harness CLI 和 harness skill 是底层修复和维护接口。仅在 Coordinate 缺少
+  所需操作、调试 Coordinate 与 harness 的同步或维护 harness 本身时使用。
+- 不要直接编辑 harness JSON。Harness mutation 必须通过 Coordinate 服务
   经由 `harnessctl` 进行。
 - 除非用户明确提供平台、目标和 token 上下文，否则不要发送真实 Discord/KOOK
   消息。
@@ -108,6 +123,28 @@ skills/coordinate-operator/scripts/mac.sh ...
   授权明确覆盖。
 - 只有当前明确授权或有界持久授权覆盖 merge/deploy 时才执行；不得把技术 gate
   或历史授权推断成新的权限。
+
+## Checklist 与任务权威矩阵
+
+按部署 profile 与任务重要性选择入口；ordinary 小任务不强制 checklist node：
+
+| 场景 | 正确入口 |
+|---|---|
+| ordinary 小任务 | task spec → worker → independent review → tests |
+| managed same-host 重要/跨 session 任务 | `coordinate task create`（checklist file + DB 的 combined contract） |
+| managed split-host 重要任务 | `task create-files` → code/deploy boundary → `task create-record` |
+| Standalone 重要任务 | `harnessctl add-item` |
+| managed metadata/lifecycle | canonical plan + Coordinate wrapper/receipt 路径；不直接裸 `harnessctl add-item/update-item/mark-done` |
+
+稳定规则：
+
+- **old/new resolver**：只有 `harness-checklist.json` 时用新名，只有 `mvp-checklist.json` 时用旧名；两者皆无或并存 fail closed。既有实例继续使用其现有 filename，不自动迁移。
+- **combined create 部分失败恢复**：`coordinate task create` 是 file-first、record-second 的 combined contract；`--operation-id` 固定 split operation。file 半边已提交而 DB 半边失败时，用同一 `--operation-id` 重跑（或按 recovery 参数重跑 `task create-record`）幂等补齐，不重复 mutation。
+- **freshness**：`harness-state.json` 与 `docs/current/*` 是可重建 cache/pointer，不是 authority；与 checklist bytes 不一致时以 checklist 为准，重新运行 `harnessctl state`。
+- **filename migration** 必须独立 authority；`--ack-managed-profile` 等 acknowledgement flag 不等于 authority。
+- 存在有界持久授权时不机械重复提问，但 acknowledgement flag 不授予 mutation；preflight/review/receipt/fail-closed gate 不省略。
+
+完整 flags 与恢复命令留在 `references/command-reference.md`；本 skill 只保留稳定规则。
 
 ## Dogfood 委派规则
 
@@ -136,7 +173,7 @@ operator -> review-result -> mark-done
 
 ## 心智模型
 
-Coordinator 围绕事件驱动的 runtime 控制面：
+Coordinate 围绕事件驱动的 runtime 控制面：
 
 ```text
 命令 -> 服务 -> event/job/delivery -> worker -> 外部副作用
@@ -172,7 +209,7 @@ PYTHONPATH=src python3 -m coordinate --help
 export DB="${COORDINATE_DB:-$HOME/projects/coordinate/data/coordinator.sqlite3}"
 ```
 
-3. 检查当前 coordinator 状态：
+3. 检查当前 Coordinate 状态：
 
 ```bash
 skills/coordinate-operator/scripts/inspect.sh --db "$DB"
@@ -219,4 +256,4 @@ Python 解析顺序：`COORDINATOR_PYTHON_BIN` -> `$REPO/.venv/bin/python` -> `p
 - 影响
 - 如果明显，建议的下一个切片
 
-保持说明基于事实。操作 coordinator 时不要静默改变架构或运行时行为。
+保持说明基于事实。操作 Coordinate 时不要静默改变架构或运行时行为。

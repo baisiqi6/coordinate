@@ -1,0 +1,93 @@
+{
+ "empty_valid": {
+  "errors": [],
+  "warnings": []
+ },
+ "item_with_split_shape": {
+  "errors": [],
+  "warnings": []
+ },
+ "invalid_priority": {
+  "errors": [
+   "item 'task-1' field 'priority' must be one of ['p0', 'p1', 'p2'], got 'high'"
+  ],
+  "warnings": []
+ },
+ "invalid_status": {
+  "errors": [
+   "item 'task-1' field 'status' must be one of ['blocked', 'doing', 'done', 'todo'], got 'pending'"
+  ],
+  "warnings": []
+ },
+ "done_without_verification": {
+  "errors": [
+   "item 'task-1' with status 'done' must have non-empty verification"
+  ],
+  "warnings": []
+ },
+ "done_with_verification": {
+  "errors": [],
+  "warnings": []
+ },
+ "missing_dependency": {
+  "errors": [
+   "item 'task-1' dependency 'missing-1' does not exist"
+  ],
+  "warnings": []
+ },
+ "unknown_fields": {
+  "errors": [],
+  "warnings": []
+ },
+ "blocked_warnings": {
+  "errors": [],
+  "warnings": [
+   "item 'task-1' with status 'blocked' should list blocked_by item ids when another checklist item is the blocker",
+   "item 'task-1' with status 'blocked' should include blocked_reason",
+   "item 'task-1' with status 'blocked' should include handoff"
+  ]
+ },
+ "done_workflow_todo": {
+  "errors": [],
+  "warnings": [
+   "item 'task-1' is done but workflow.status is not 'closed'"
+  ]
+ },
+ "doing_without_owner": {
+  "errors": [
+   "item 'task-1' with status 'doing' must have non-empty owner",
+   "item 'task-1' with status 'doing' must have non-empty selected_in_session"
+  ],
+  "warnings": []
+ },
+ "missing_item_field": {
+  "errors": [
+   "item 'task-1' missing required field: acceptance"
+  ],
+  "warnings": []
+ },
+ "non_object_root": {
+  "errors": [
+   "root must be a JSON object"
+  ],
+  "warnings": []
+ },
+ "items_not_list": {
+  "errors": [
+   "root field 'items' must be an array"
+  ],
+  "warnings": []
+ },
+ "duplicate_ids": {
+  "errors": [
+   "item 'task-1' has duplicate id"
+  ],
+  "warnings": []
+ },
+ "empty_acceptance": {
+  "errors": [
+   "item 'task-1' field 'acceptance' must be a non-empty string"
+  ],
+  "warnings": []
+ }
+}

@@ -20,7 +20,7 @@ from typing import Any
 from types import SimpleNamespace
 from unittest.mock import Mock, patch
 
-from coordinate.db import get_job, initialize, list_events, row_to_dict, set_workspace_agent, upsert_workspace, upsert_workspace_host_profile
+from coordinate.db import get_job, initialize, list_deliveries, list_events, row_to_dict, set_workspace_agent, upsert_workspace, upsert_workspace_host_profile
 from coordinate.execution_leases import LEASE_DEFAULT_TTL_SECONDS, get_attempt_lease
 from coordinate.executor_capacity import (
     CapacityCatalog,
@@ -289,6 +289,35 @@ class RuntimeLeaseTerminalTests(unittest.TestCase):
         lease = get_attempt_lease(self.conn, self.lease_id)
         self.assertEqual(lease["status"], "released")
         self.assertEqual(lease["release_reason"], "job_done")
+
+    def test_managed_reply_platform_none_creates_no_delivery(self):
+        job = row_to_dict(get_job(self.conn, self.job_id))
+        payload = dict(job["payload"])
+        payload["reply"] = {"platform": "none", "destination": "audit"}
+        self.conn.execute(
+            "UPDATE jobs SET payload_json = ? WHERE id = ?",
+            (json.dumps(payload, sort_keys=True), self.job_id),
+        )
+        self.conn.commit()
+
+        result = report_job_result(
+            self.conn,
+            job_id=self.job_id,
+            agent_id="mac-omp",
+            status="done",
+            result={"response_text": "already delivered by bridge"},
+            attempt_token=self.attempt_token,
+            lease_id=self.lease_id,
+        )
+
+        event_types = [
+            row_to_dict(row)["event_type"] for row in list_events(self.conn, "demo")
+        ]
+        self.assertEqual(result.job["status"], "done")
+        self.assertIn("job.completed", event_types)
+        self.assertIsNone(result.delivery)
+        self.assertFalse(result.delivery_created)
+        self.assertEqual(list_deliveries(self.conn), [])
 
     def test_report_without_lease_id_rejects_managed_attempt(self):
         with self.assertRaisesRegex(RuntimeLeaseError, "requires lease_id"):

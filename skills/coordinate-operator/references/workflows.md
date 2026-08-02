@@ -85,6 +85,19 @@ $MAC worker delivery --platform stdout --once
 
 `workspace audit --no-refresh` 将 file-backed 状态能力与 `harnessctl` 能力分开报告。如果 `assignment_lifecycle_available=false`，还不要使用 assignment mutation 命令；在 harness 运行时存在之前，使用 `task create`、events、jobs 和 deliveries。
 
+## 登记重要任务（managed）
+
+重要/跨 session 任务必须经 Coordinate 入口登记，不裸跑 harnessctl mutation：
+
+- managed same-host：`$MAC task create WORKSPACE --task-id TASK --plan-doc docs/path/to/phase-plan.md
+  [--operation-id UUID]` — combined create：checklist file 半边 + DB record 半边，幂等。
+- managed split-host：`task create-files` → commit/deploy → `task create-record`。
+- Standalone：`harnessctl add-item`。
+- ordinary 小任务：task spec → worker → independent review → tests，不强制 checklist node。
+
+入口矩阵与 old/new resolver、部分失败恢复、freshness、migration acknowledgement 规则见
+`SKILL.md` 的“Checklist 与任务权威矩阵”；完整 flags 见 `command-reference.md`。
+
 ## 将 Event 转为可见消息
 
 1. 确认事件存在。
@@ -146,7 +159,7 @@ assignment request -> accept -> 按需 blocker/handoff/unblock -> closeout -> re
 host-aware mark-done 拆分为 `mark-done-prepare` / `mark-done-files` /
 `mark-done-record`，保证 coding-host 文件边与 control-plane 事件边的 authority 分离。
 
-每个命令写入持久化 coordinator 事件。支持的事件可以通过 policy 转换为可见 deliveries。
+每个命令写入持久化 Coordinate 事件。支持的事件可以通过 policy 转换为可见 deliveries。
 
 ## 操作 GitHub 状态
 

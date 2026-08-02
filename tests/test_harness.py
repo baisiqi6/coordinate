@@ -18,6 +18,17 @@ class HarnessAdapterTests(unittest.TestCase):
             harnessctl.write_text("#!/usr/bin/env bash\nexit 0\n", encoding="utf-8")
             harnessctl.chmod(0o755)
             state = {"project": "demo", "current_item": None}
+            checklist_bytes = json.dumps({
+                "project": "demo",
+                "harness_root": ".",
+                "updated_at": "2026-01-01",
+                "items": [],
+            }).encode("utf-8")
+            (harness_root / "mvp-checklist.json").write_bytes(checklist_bytes)
+            state["source"] = {
+                "checklist_path": "harness/mvp-checklist.json",
+                "checklist_sha256": __import__("hashlib").sha256(checklist_bytes).hexdigest(),
+            }
             (harness_root / "harness-state.json").write_text(
                 json.dumps(state), encoding="utf-8"
             )
@@ -39,6 +50,33 @@ class HarnessAdapterTests(unittest.TestCase):
             self.assertEqual(adapter.refresh_state(), state)
             self.assertEqual(calls[0][0][0], [str(harnessctl), "state"])
             self.assertEqual(calls[0][1]["cwd"], str(root))
+
+    def test_read_checklist_rejects_contract_invalid_checklist(self):
+        """P1-4 direct contract: HarnessAdapter.read_checklist enforces full
+        checklist validation — a parseable checklist missing a required field
+        raises HarnessError instead of returning the invalid authority."""
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / "mvp-checklist.json").write_text(
+                json.dumps({
+                    "project": "demo",
+                    "harness_root": ".",
+                    "updated_at": "2026-07-13",
+                    # "items" deliberately missing
+                }),
+                encoding="utf-8",
+            )
+            workspace = Workspace(
+                id="demo",
+                name="Demo",
+                path=str(root),
+                harness_root=str(root),
+            )
+            adapter = HarnessAdapter(workspace)
+
+            with self.assertRaises(HarnessError) as ctx:
+                adapter.read_checklist()
+            self.assertIn("items", str(ctx.exception))
 
     def test_refresh_state_reports_harnessctl_failure(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -69,8 +107,21 @@ class HarnessAdapterTests(unittest.TestCase):
             harness_root.mkdir()
             harnessctl = root / "harnessctl"
             harnessctl.write_text("#!/usr/bin/env bash\nexit 0\n", encoding="utf-8")
+            checklist_bytes = json.dumps({
+                "project": "demo",
+                "harness_root": ".",
+                "updated_at": "2026-01-01",
+                "items": [],
+            }).encode("utf-8")
+            (harness_root / "mvp-checklist.json").write_bytes(checklist_bytes)
             (harness_root / "harness-state.json").write_text(
-                json.dumps({"project": "demo"}), encoding="utf-8"
+                json.dumps({
+                    "project": "demo",
+                    "source": {
+                        "checklist_path": "harness/mvp-checklist.json",
+                        "checklist_sha256": __import__("hashlib").sha256(checklist_bytes).hexdigest(),
+                    },
+                }), encoding="utf-8"
             )
             workspace = Workspace(
                 id="demo",

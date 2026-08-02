@@ -1387,6 +1387,8 @@ def _create_response_delivery(
     default_bus = workspace.default_bus if workspace else None
     if platform == "discord" and default_bus != "discord":
         platform = "discord_webhook"
+    if platform == "none":
+        return None, False
     message_key = f"runtime:job:{job['id']}:response:{event_id}:{platform}:{destination}"
     delivery, created = create_delivery(
         conn,

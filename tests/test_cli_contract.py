@@ -49,7 +49,7 @@ P9_3B_LEASE_LEAVES = {
 }
 
 _P9_3C1_P1_BASE_FIXTURE_SHA256 = (
-    "cc52981905bd2a7d479146e45057c48b9d3e4c5404185d43acc688ff113a0df3"
+    "869084cdc985a0efb9921266af98f5813d0d6efca03b90aeebf5c7916f2b5746"
 )
 _P9_3C1_P1_AGENT_HELP = (
     "usage: coordinate runtime agent [-h] {register,heartbeat} ...\n\n"
@@ -260,11 +260,11 @@ def _generate_contract_bytes() -> bytes:
     return json.dumps(contract, ensure_ascii=False, sort_keys=True, indent=2).encode("utf-8") + b"\n"
 
 
-def _run_generation_subprocess() -> bytes:
-    """Run a clean subprocess that generates the contract and return stdout bytes."""
+def _run_generation_subprocess(flag: str = "--dump") -> bytes:
+    """Run a clean subprocess that generates the requested dump and return stdout bytes."""
     with tempfile.TemporaryDirectory() as tmpdir:
         result = subprocess.run(
-            [sys.executable, str(CONTRACT_GENERATION_SCRIPT), "--dump"],
+            [sys.executable, str(CONTRACT_GENERATION_SCRIPT), flag],
             cwd=tmpdir,
             env=_allowed_env(),
             stdout=subprocess.PIPE,
@@ -272,6 +272,43 @@ def _run_generation_subprocess() -> bytes:
             check=True,
         )
     return result.stdout
+
+
+# Marker recorded in the semantic dump metadata so receipts can prove which
+# projection produced the bytes being byte-compared.
+_SEMANTIC_PROJECTION_MARKER = "semantic-help-whitespace-v1"
+
+
+def _project_semantic_help(contract: dict[str, object]) -> dict[str, object]:
+    """Return a copy with only the node formatted help whitespace layout normalized.
+
+    Each node's ``format_help()`` text is folded to its equivalent token
+    sequence (single-space separated), so argparse layout differences across
+    Python versions -- usage wrapping, description column alignment, blank
+    lines -- no longer affect comparison. Every other contract field is
+    preserved byte-for-byte: path, prog, actions (option strings, dest, action
+    class, nargs, required, choices, default, const, metavar, type), help text
+    tokens in order, defaults, leaf order and counts.
+    """
+    projected = copy.deepcopy(contract)
+    for node in projected["nodes"]:
+        help_text = node["help"]
+        if not isinstance(help_text, str):
+            raise TypeError(
+                f"node {' '.join(node['path']) or '<root>'!r} help must be str, got {type(help_text).__name__}"
+            )
+        node["help"] = " ".join(help_text.split())
+    projected["metadata"]["projection"] = _SEMANTIC_PROJECTION_MARKER
+    return projected
+
+
+def _generate_semantic_contract_bytes() -> bytes:
+    """Generate the semantic projection bytes for cross-version byte comparison.
+
+    Machine-callable via ``tests/test_cli_contract.py --dump-semantic``; the
+    operator byte-compares the stdout of the Python 3.12 and 3.14 runs.
+    """
+    return _serialize_contract(_project_semantic_help(_build_contract()))
 
 
 # Historical help strings captured from the post-C1 / pre-C2 fixture.
@@ -329,7 +366,7 @@ _S4C2_ISSUE_MATERIALIZE_RECORD_NODE_SHA256 = (
 
 # S4-D projection-doctor CLI deltas.
 _S4D_BASELINE_FIXTURE_SHA256 = (
-    "f8fea0a22e46516e0177f910d652d09c85563ca23b5bda2236a741655110a6f4"
+    "779c146bf1b861d51455dc3ba5d21a436f1327b5b39e6cfad828a309c251146f"
 )
 _S4D_WORKSPACE_DOCTOR_NODE_SHA256 = (
     "d51fc123073a032bec4bd82fc0c34dd190503c89a9f6656c9fe80d8e6279e0ec"
@@ -426,14 +463,14 @@ def _rewrite_contract_to_p9_3c1_p1_baseline(
 
 # SHA-256 of the P9-2B pre-routing fixture (before runtime request submit gained routed flags).
 _P9_2B_BASELINE_FIXTURE_SHA256 = (
-    "cfe4d22de36beee6553ae7d375f20930d2dbdbefd1befbd7d4909f0b0e9c4af8"
+    "4b11a5c25f1ac30d395cc5777f6a766ae0f5b16369676420181515f612dddc62"
 )
 
 # SHA-256 of the reviewed pre-P9-3C0 fixture after masking the request-submit
 # help text.  Masking isolates the new action structure without coupling the
 # proof to argparse line wrapping.
 _P9_3C0_WORKTREE_PATH_BASELINE_FIXTURE_SHA256 = (
-    "90f1843553eb84a584bfd09fdeb808e38e83dd1584b146627401fd0f1b8597dc"
+    "1f6a8784fcea3baf9749c856ad40eff2ad183bc6b092db30646c05d1542577fc"
 )
 
 # P9-2A added exactly these 3 executor leaves under ``runtime executor``.
@@ -1137,6 +1174,37 @@ class CLIContractTests(unittest.TestCase):
                 f"Rewound {' '.join(path)} must not expose C2-only dests",
             )
 
+    def test_semantic_projection_is_deterministic(self) -> None:
+        first = _run_generation_subprocess("--dump-semantic")
+        second = _run_generation_subprocess("--dump-semantic")
+        self.assertEqual(first, second)
+        self.assertEqual(
+            hashlib.sha256(first).hexdigest(),
+            hashlib.sha256(second).hexdigest(),
+        )
+
+    def test_semantic_projection_preserves_non_layout_fields(self) -> None:
+        """The projection must keep every non-layout field and every help token."""
+        contract = _build_contract()
+        projected = _project_semantic_help(contract)
+
+        self.assertEqual(
+            projected["metadata"]["projection"], _SEMANTIC_PROJECTION_MARKER
+        )
+        raw_metadata = dict(contract["metadata"])
+        projected["metadata"].pop("projection")
+        self.assertEqual(projected["metadata"], raw_metadata)
+        self.assertEqual(projected["leaf_paths"], contract["leaf_paths"])
+
+        for raw, sem in zip(contract["nodes"], projected["nodes"]):
+            with self.subTest(path=" ".join(raw["path"]) or "<root>"):
+                self.assertEqual(sem["path"], raw["path"])
+                self.assertEqual(sem["prog"], raw["prog"])
+                self.assertEqual(sem["actions"], raw["actions"])
+                self.assertEqual(sem["defaults"], raw["defaults"])
+                self.assertEqual(sem["help"], " ".join(raw["help"].split()))
+                self.assertEqual(sem["help"].split(), raw["help"].split())
+
 
 class CLISupportSeamTests(unittest.TestCase):
     """Tests for the extracted cli_support seam and facade compatibility."""
@@ -1259,5 +1327,8 @@ print('ok')
 if __name__ == "__main__":
     if len(sys.argv) > 1 and sys.argv[1] == "--dump":
         sys.stdout.buffer.write(_generate_contract_bytes())
+        sys.exit(0)
+    if len(sys.argv) > 1 and sys.argv[1] == "--dump-semantic":
+        sys.stdout.buffer.write(_generate_semantic_contract_bytes())
         sys.exit(0)
     unittest.main()

@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import json
 import logging
 import sqlite3
 from dataclasses import dataclass
@@ -9,13 +8,12 @@ from pathlib import Path
 from typing import Any
 
 from .completion import (
-    CompletionReceiptError,
     MarkDoneGateResult,
     ReceiptEvidence,
     check_mark_done_gate,
     compute_item_fingerprint,
-    compute_mark_done_fingerprints,
 )
+from .checklist_io import ChecklistError, mutate_checklist
 from .db import append_event, get_workspace, row_to_dict
 from .harness import HarnessAdapter, HarnessError, HarnessMutationResult
 from .reconcile import reconcile_workspace
@@ -886,7 +884,7 @@ def _handle_review_result_failure(
 
 
 _LEGACY_MARK_DONE_HOST_AWARE_WARNING = (
-    "`assignment mark-done` writes both mvp-checklist.json and DB event. "
+    "`assignment mark-done` writes both the resolved checklist and the DB event. "
     "For host-aware workflows, use `assignment mark-done-files` on the coding "
     "host, commit/deploy, then `assignment mark-done-record` against the runtime DB."
 )
@@ -969,6 +967,7 @@ def mark_done_task(
     actor: str = "operator",
     adapter: HarnessAdapter | None = None,
     idempotency_hint: str | None = None,
+    verification: str | None = None,
 ) -> MarkDoneTaskResult:
     hint = idempotency_hint or f"{workspace_id}:mark-done:{task_id}:{actor}"
     success_key = f"{hint}:task.done"
@@ -1012,7 +1011,28 @@ def mark_done_task(
             host_aware_warning=_LEGACY_MARK_DONE_HOST_AWARE_WARNING,
         )
 
-    args = [actor]
+    # Non-empty verification contract (U1): before calling the mutation, strict
+    # pre-check the current checklist item. Prefer the explicit non-empty value;
+    # otherwise carry the item's existing non-empty verification. With neither,
+    # fail closed before harnessctl runs (no checklist write, no task.done).
+    effective_verification = _resolve_mark_done_verification(adapter, task_id, verification)
+    if not effective_verification:
+        return MarkDoneTaskResult(
+            mutation=None,
+            event={},
+            event_created=False,
+            gate=MarkDoneGateResult(
+                passed=False,
+                reason=(
+                    f"task {task_id} has no verification; pass --verification "
+                    "with non-empty text or set the item's verification first"
+                ),
+                task_status=None,
+            ),
+            host_aware_warning=_LEGACY_MARK_DONE_HOST_AWARE_WARNING,
+        )
+
+    args = [actor, "--verification", effective_verification]
 
     try:
         mutation = adapter.run_mutation(
@@ -1035,6 +1055,7 @@ def mark_done_task(
         result = _handle_mark_done_success(
             conn, workspace_id, task_id,
             actor, mutation, success_key,
+            verification=effective_verification,
         )
         if result.event_created:
             _post_mutation_reconcile(conn, workspace_id)
@@ -1046,14 +1067,39 @@ def mark_done_task(
     )
 
 
+def _resolve_mark_done_verification(
+    adapter: HarnessAdapter,
+    task_id: str,
+    verification: str | None,
+) -> str:
+    """Strict pre-check: explicit non-empty value wins, else the item's
+    existing non-empty verification. Returns "" when neither exists."""
+    explicit = (verification or "").strip()
+    if explicit:
+        return explicit
+    try:
+        checklist = adapter.read_checklist()
+    except (HarnessError, OSError, ValueError):
+        return ""
+    items = checklist.get("items") if isinstance(checklist, dict) else None
+    if isinstance(items, list):
+        for item in items:
+            if isinstance(item, dict) and item.get("id") == task_id:
+                return str(item.get("verification") or "").strip()
+    return ""
+
+
 def _handle_mark_done_success(
     conn, workspace_id, task_id,
     actor, mutation, success_key,
+    verification: str | None = None,
 ):
     payload = {
         "task_id": task_id,
         "mutation": mutation.to_dict(),
     }
+    if verification:
+        payload["verification"] = verification
     event_result = append_event(
         conn,
         event_type="task.done",
@@ -1136,7 +1182,7 @@ def mark_done_files(
     receipt: ReceiptEvidence | None = None,
     repair_reason: str | None = None,
 ) -> MarkDoneFilesResult:
-    """Coding-host canonical write: local ``mvp-checklist.json`` only.
+    """Coding-host canonical write: resolved checklist file half only.
 
     Service-layer authorization (P1-7): exactly one path is accepted —
 
@@ -1146,6 +1192,13 @@ def mark_done_files(
 
     Any call missing both is rejected before touching the file, so the
     split command cannot be silently bypassed at the service layer.
+
+    The mutation runs through the shared checklist I/O boundary (resolve ->
+    lock -> validate current -> verify receipt/repair authority and before
+    fingerprint -> mutate candidate -> validate candidate -> atomic commit)
+    and requires a non-empty verification: the explicit value wins, otherwise
+    the item's existing non-empty verification is carried. With neither, the
+    write is refused before any file mutation.
 
     Normal path (P1-6) writes structured ``completion_receipt`` metadata
     into the task item (receipt_id, before/after fingerprints, applied_at).
@@ -1177,127 +1230,123 @@ def mark_done_files(
                         f"({label}={path_val}); use --allow-runtime-copy to override"
                     )
 
-    checklist_path = Path(harness_root) / "mvp-checklist.json"
-    if not checklist_path.is_file():
-        raise ValueError(f"mvp-checklist.json not found at {checklist_path}")
-    try:
-        checklist = json.loads(checklist_path.read_text(encoding="utf-8"))
-    except (OSError, json.JSONDecodeError) as exc:
+    state: dict[str, Any] = {}
+
+    def callback(candidate: dict[str, Any]) -> bool:
+        items = candidate.get("items")
+        if not isinstance(items, list):
+            raise ValueError(f"checklist at {harness_root} has no 'items' list")
+        for item in items:
+            if not isinstance(item, dict) or item.get("id") != task_id:
+                continue
+            workflow = item["workflow"] if isinstance(item.get("workflow"), dict) else {}
+            before_fingerprint = compute_item_fingerprint(item)
+            state["before_fingerprint"] = before_fingerprint
+            already_done = item.get("status") == "done" and workflow.get("status") == "closed"
+            state["already_done"] = already_done
+
+            # Non-empty verification contract: explicit value wins, otherwise
+            # the item's existing non-empty verification is carried; with
+            # neither the mutation is refused before any write.
+            explicit = (verification or "").strip()
+            existing = str(item.get("verification") or "").strip()
+            effective_verification = explicit or existing
+            if not effective_verification:
+                raise ValueError(
+                    f"task {task_id} has no verification; pass an explicit "
+                    "non-empty --verification or set the item's verification "
+                    "before marking it done"
+                )
+            state["verification"] = effective_verification
+
+            if receipt is not None:
+                expected_after = receipt.after_fingerprint
+                if already_done:
+                    # Idempotent retry: recompute the actual on-disk lifecycle
+                    # fingerprint and require it to match the receipt's
+                    # after-fingerprint. Do NOT trust the stored metadata — the
+                    # item could have drifted (e.g. branch changed) while leaving
+                    # completion_receipt metadata intact. Compared BEFORE any write.
+                    actual = compute_item_fingerprint(item)
+                    if actual != expected_after:
+                        raise ValueError(
+                            f"on-disk lifecycle fingerprint {actual!r} does not match "
+                            f"receipt after-fingerprint {expected_after!r}; the done "
+                            f"item appears to have drifted"
+                        )
+                    metadata = item.get("completion_receipt") if isinstance(
+                        item.get("completion_receipt"), dict) else {}
+                    if metadata.get("receipt_id") != receipt.receipt_id:
+                        raise ValueError(
+                            f"task {task_id} already done under receipt "
+                            f"{metadata.get('receipt_id')!r}, cannot reuse {receipt.receipt_id!r}"
+                        )
+                    if metadata.get("after_fingerprint") != expected_after:
+                        raise ValueError(
+                            f"task {task_id} on-disk after_fingerprint "
+                            f"{metadata.get('after_fingerprint')!r} does not match receipt "
+                            f"after-fingerprint {expected_after!r}"
+                        )
+                    state["after_fingerprint"] = actual
+                    state["receipt_id"] = receipt.receipt_id
+                    return False
+                # Fresh mutation: the current on-disk lifecycle MUST match the
+                # before-fingerprint the receipt was reserved against. Compare BEFORE
+                # any write so a drift between reserve and apply cannot mutate the
+                # canonical file under the wrong authorization.
+                if before_fingerprint != receipt.before_fingerprint:
+                    raise ValueError(
+                        f"on-disk lifecycle fingerprint {before_fingerprint!r} does "
+                        f"not match receipt before-fingerprint "
+                        f"{receipt.before_fingerprint!r}; the item appears to have "
+                        f"drifted since the receipt was reserved"
+                    )
+                _mutate_item_done(item, effective_verification)
+                metadata = {
+                    "receipt_id": receipt.receipt_id,
+                    "before_fingerprint": receipt.before_fingerprint,
+                    "after_fingerprint": expected_after,
+                    "applied_at": item["updated_at"],
+                }
+                item["completion_receipt"] = metadata
+                actual_after = compute_item_fingerprint(item)
+                if actual_after != expected_after:
+                    raise ValueError(
+                        f"post-write fingerprint {actual_after!r} does not match receipt "
+                        f"after-fingerprint {expected_after!r}"
+                    )
+                state["after_fingerprint"] = actual_after
+                state["receipt_id"] = receipt.receipt_id
+                return True
+
+            # Repair path.
+            if already_done:
+                state["after_fingerprint"] = compute_item_fingerprint(item)
+                return False
+            _mutate_item_done(item, effective_verification)
+            after_fingerprint = compute_item_fingerprint(item)
+            state["after_fingerprint"] = after_fingerprint
+            return True
+
         raise ValueError(
-            f"mvp-checklist.json at {checklist_path} cannot be read: {exc}"
-        ) from exc
-
-    items = checklist.get("items")
-    if not isinstance(items, list):
-        raise ValueError(f"mvp-checklist.json at {checklist_path} has no 'items' list")
-
-    for item in items:
-        if not isinstance(item, dict) or item.get("id") != task_id:
-            continue
-        return _apply_mark_done_item(
-            item, checklist, checklist_path, task_id, verification,
-            receipt=receipt, repair_reason=repair_reason,
+            f"task {task_id} not found in checklist at {harness_root}"
         )
 
-    raise ValueError(
-        f"task {task_id} not found in mvp-checklist.json at {checklist_path}"
-    )
+    try:
+        _, changed = mutate_checklist(harness_root, callback)
+    except ChecklistError as exc:
+        raise ValueError(str(exc)) from exc
 
-
-def _apply_mark_done_item(
-    item, checklist, checklist_path, task_id, verification,
-    *, receipt, repair_reason,
-) -> MarkDoneFilesResult:
-    workflow = item["workflow"] if isinstance(item.get("workflow"), dict) else {}
-    before_fingerprint = compute_item_fingerprint(item)
-    already_done = item.get("status") == "done" and workflow.get("status") == "closed"
-
-    if receipt is not None:
-        expected_after = receipt.after_fingerprint
-        if already_done:
-            # Idempotent retry: recompute the actual on-disk lifecycle
-            # fingerprint and require it to match the receipt's
-            # after-fingerprint. Do NOT trust the stored metadata — the item
-            # could have drifted (e.g. branch changed) while leaving
-            # completion_receipt metadata intact. Compared BEFORE any write.
-            actual = compute_item_fingerprint(item)
-            if actual != expected_after:
-                raise ValueError(
-                    f"on-disk lifecycle fingerprint {actual!r} does not match "
-                    f"receipt after-fingerprint {expected_after!r}; the done "
-                    f"item appears to have drifted"
-                )
-            metadata = item.get("completion_receipt") if isinstance(
-                item.get("completion_receipt"), dict) else {}
-            if metadata.get("receipt_id") != receipt.receipt_id:
-                raise ValueError(
-                    f"task {task_id} already done under receipt "
-                    f"{metadata.get('receipt_id')!r}, cannot reuse {receipt.receipt_id!r}"
-                )
-            if metadata.get("after_fingerprint") != expected_after:
-                raise ValueError(
-                    f"task {task_id} on-disk after_fingerprint "
-                    f"{metadata.get('after_fingerprint')!r} does not match receipt "
-                    f"after-fingerprint {expected_after!r}"
-                )
-            return MarkDoneFilesResult(
-                workspace_id="local", task_id=task_id, checklist_changed=False,
-                verification=item.get("verification"),
-                receipt_id=receipt.receipt_id,
-                before_fingerprint=before_fingerprint,
-                after_fingerprint=expected_after,
-                repair_only=False, repair_reason=None,
-            )
-        # Fresh mutation: the current on-disk lifecycle MUST match the
-        # before-fingerprint the receipt was reserved against. Compare BEFORE
-        # any write so a drift between reserve and apply cannot mutate the
-        # canonical file under the wrong authorization.
-        if before_fingerprint != receipt.before_fingerprint:
-            raise ValueError(
-                f"on-disk lifecycle fingerprint {before_fingerprint!r} does "
-                f"not match receipt before-fingerprint "
-                f"{receipt.before_fingerprint!r}; the item appears to have "
-                f"drifted since the receipt was reserved"
-            )
-        _mutate_item_done(item, verification)
-        metadata = {
-            "receipt_id": receipt.receipt_id,
-            "before_fingerprint": receipt.before_fingerprint,
-            "after_fingerprint": expected_after,
-            "applied_at": item["updated_at"],
-        }
-        item["completion_receipt"] = metadata
-        _write_checklist(checklist_path, checklist)
-        actual_after = compute_item_fingerprint(item)
-        if actual_after != expected_after:
-            raise ValueError(
-                f"post-write fingerprint {actual_after!r} does not match receipt "
-                f"after-fingerprint {expected_after!r}"
-            )
-        return MarkDoneFilesResult(
-            workspace_id="local", task_id=task_id, checklist_changed=True,
-            verification=verification, receipt_id=receipt.receipt_id,
-            before_fingerprint=before_fingerprint, after_fingerprint=actual_after,
-            repair_only=False, repair_reason=None,
-        )
-
-    # Repair path.
-    if already_done:
-        return MarkDoneFilesResult(
-            workspace_id="local", task_id=task_id, checklist_changed=False,
-            verification=item.get("verification"), receipt_id=None,
-            before_fingerprint=before_fingerprint,
-            after_fingerprint=compute_item_fingerprint(item),
-            repair_only=True, repair_reason=repair_reason,
-        )
-    _mutate_item_done(item, verification)
-    _write_checklist(checklist_path, checklist)
-    after_fingerprint = compute_item_fingerprint(item)
     return MarkDoneFilesResult(
-        workspace_id="local", task_id=task_id, checklist_changed=True,
-        verification=verification, receipt_id=None,
-        before_fingerprint=before_fingerprint, after_fingerprint=after_fingerprint,
-        repair_only=True, repair_reason=repair_reason,
+        workspace_id="local",
+        task_id=task_id,
+        checklist_changed=changed,
+        verification=state.get("verification"),
+        receipt_id=state.get("receipt_id"),
+        before_fingerprint=state.get("before_fingerprint"),
+        after_fingerprint=state.get("after_fingerprint"),
+        repair_only=receipt is None,
+        repair_reason=repair_reason,
     )
 
 
@@ -1311,16 +1360,6 @@ def _mutate_item_done(item, verification) -> None:
         item["workflow"]["updated_at"] = now
     else:
         item["workflow"] = {"status": "closed", "branch": None, "updated_at": now}
-
-
-def _write_checklist(checklist_path, checklist) -> None:
-    if isinstance(checklist, dict) and "updated_at" in checklist:
-        now_date = datetime.now(timezone.utc).strftime("%Y-%m-%d")
-        checklist["updated_at"] = now_date
-    checklist_path.write_text(
-        json.dumps(checklist, ensure_ascii=False, indent=2) + "\n",
-        encoding="utf-8",
-    )
 
 
 def mark_done_record(

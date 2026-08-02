@@ -82,7 +82,7 @@ def register_issue_commands(subcommands) -> None:
 
     issue_materialize_files = issue_subcommands.add_parser(
         "materialize-files",
-        help="Coding-host half of host-aware materialize: sync mvp-checklist.json only (no DB write)",
+        help="Coding-host half of host-aware materialize: checklist file half only (no DB write)",
     )
     issue_materialize_files.add_argument("--workspace-path", required=True)
     issue_materialize_files.add_argument("--harness-root", required=True)

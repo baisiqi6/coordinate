@@ -1,9 +1,12 @@
 import contextlib
+import hashlib
 import io
 import json
 import os
+import sqlite3
 import tempfile
 import unittest
+from unittest.mock import patch
 import uuid
 from pathlib import Path
 
@@ -15,6 +18,73 @@ from coordinate.db import (
     upsert_task_mirror,
     upsert_workspace,
 )
+
+
+def _write_harness_state_with_source(
+    root,
+    *,
+    checklist_name="mvp-checklist.json",
+    project="demo",
+    current_item=None,
+):
+    """Write harness-state.json whose source matches the actual checklist bytes."""
+    checklist_path = Path(root) / checklist_name
+    checklist_bytes = checklist_path.read_bytes()
+    (Path(root) / "harness-state.json").write_text(
+        json.dumps({
+            "project": project,
+            "current_item": current_item,
+            "source": {
+                "checklist_path": checklist_name,
+                "checklist_sha256": hashlib.sha256(checklist_bytes).hexdigest(),
+            },
+        }),
+        encoding="utf-8",
+    )
+
+
+def _audit_item(task_id="mvp-001", status="doing", workflow_status="running",
+                owner="codex"):
+    """A validator-passing checklist item for reconcile/audit fixtures."""
+    return {
+        "id": task_id,
+        "title": "Build core",
+        "status": status,
+        "priority": "p1",
+        "owner": owner,
+        "selected_in_session": "session-1" if status == "doing" else None,
+        "verification": "verified" if status == "done" else "",
+        "updated_at": "2026-01-01T00:00:00Z",
+        "dependencies": [],
+        "blocked_by": [],
+        "blocked_reason": "",
+        "acceptance": "Acceptance",
+        "handoff": {"from": None, "to": None, "reason": None},
+        "workflow": {"status": workflow_status, "branch": None,
+                     "updated_at": "2026-01-01T00:00:00Z"},
+    }
+
+
+def _mark_done_item(task_id="mvp-001", status="doing", workflow_status="review_approved",
+                    branch=None, verification="evidence"):
+    """A validator-passing checklist item for mark-done/receipt fixtures."""
+    return {
+        "id": task_id,
+        "title": f"Task {task_id}",
+        "status": status,
+        "priority": "p1",
+        "owner": "codex",
+        "selected_in_session": "session-1",
+        "verification": verification,
+        "updated_at": "2026-01-01T00:00:00Z",
+        "dependencies": [],
+        "blocked_by": [],
+        "blocked_reason": "",
+        "acceptance": f"Acceptance for {task_id}",
+        "handoff": {"from": None, "to": None, "reason": None},
+        "workflow": {"status": workflow_status, "branch": branch,
+                     "updated_at": "2026-01-01T00:00:00Z"},
+    }
 
 
 class CliTests(unittest.TestCase):
@@ -381,9 +451,24 @@ class CliTests(unittest.TestCase):
     def test_state_no_refresh_reads_registered_harness_state(self):
         with tempfile.TemporaryDirectory() as tmp:
             db_path = str(Path(tmp) / "coordinator.sqlite3")
+            # A fresh cache carries the real checklist source path + digest.
+            checklist_bytes = json.dumps({
+                "project": "demo",
+                "harness_root": ".",
+                "updated_at": "2026-07-13",
+                "items": [],
+            }).encode("utf-8")
+            (Path(tmp) / "mvp-checklist.json").write_bytes(checklist_bytes)
             state_path = Path(tmp) / "harness-state.json"
             state_path.write_text(
-                json.dumps({"project": "demo", "current_item": None}),
+                json.dumps({
+                    "project": "demo",
+                    "current_item": None,
+                    "source": {
+                        "checklist_path": "mvp-checklist.json",
+                        "checklist_sha256": hashlib.sha256(checklist_bytes).hexdigest(),
+                    },
+                }),
                 encoding="utf-8",
             )
             self.run_cli(
@@ -408,6 +493,76 @@ class CliTests(unittest.TestCase):
 
             self.assertEqual(code, 0)
             self.assertEqual(payload["state"]["project"], "demo")
+            self.assertTrue(payload["authoritative"])
+
+    def test_state_no_refresh_stale_reports_non_authoritative_nonzero(self):
+        """--no-refresh on a stale cache is a diagnostic: JSON marks
+        authoritative=false and the exit code is nonzero."""
+        with tempfile.TemporaryDirectory() as tmp:
+            db_path = str(Path(tmp) / "coordinator.sqlite3")
+            # No checklist source at all → stale.
+            (Path(tmp) / "harness-state.json").write_text(
+                json.dumps({"project": "demo", "current_item": None}),
+                encoding="utf-8",
+            )
+            self.run_cli(
+                "--db",
+                db_path,
+                "workspace",
+                "add",
+                "demo",
+                "--path",
+                tmp,
+                "--harness-root",
+                tmp,
+            )
+
+            code, payload = self.run_cli(
+                "--db",
+                db_path,
+                "state",
+                "demo",
+                "--no-refresh",
+            )
+
+            self.assertEqual(code, 1)
+            self.assertFalse(payload["authoritative"])
+            self.assertTrue(payload["stale_reasons"])
+
+    def test_state_refresh_adapter_error_reports_diagnostic_json(self):
+        """A HarnessAdapter failure during refresh must surface as the
+        documented error JSON with exit code 1, never as a NameError from
+        the CLI handler."""
+        with tempfile.TemporaryDirectory() as tmp:
+            db_path = str(Path(tmp) / "coordinator.sqlite3")
+            harnessctl_path = Path(tmp) / "fake-harnessctl"
+            harnessctl_path.write_text(
+                "#!/bin/bash\necho 'harnessctl exploded' >&2\nexit 1\n"
+            )
+            harnessctl_path.chmod(0o755)
+            self.run_cli(
+                "--db",
+                db_path,
+                "workspace",
+                "add",
+                "demo",
+                "--path",
+                tmp,
+                "--harness-root",
+                tmp,
+                "--harnessctl-path",
+                str(harnessctl_path),
+            )
+
+            code, payload = self.run_cli(
+                "--db",
+                db_path,
+                "state",
+                "demo",
+            )
+
+            self.assertEqual(code, 1)
+            self.assertIn("harnessctl state failed", payload["error"]["message"])
 
     def test_workspace_init_harness_creates_minimal_file_backed_state(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -458,26 +613,49 @@ class CliTests(unittest.TestCase):
             harness_root = (repo / "docs" / "project-harness").resolve()
             self.assertEqual(code, 0)
             self.assertEqual(payload["result"]["workspace"]["harness_root"], str(harness_root))
-            self.assertTrue((harness_root / "mvp-checklist.json").exists())
+            self.assertTrue((harness_root / "harness-checklist.json").exists())
             self.assertTrue((harness_root / "harness-state.json").exists())
             self.assertTrue((harness_root / "tasks" / "phase-001" / "plan.md").exists())
             self.assertEqual(payload["result"]["event"]["event_type"], "harness.initialized")
             self.assertEqual(payload["result"]["task"]["task_id"], "phase-001")
             self.assertEqual(state_code, 0)
             self.assertEqual(state_payload["state"]["current_item"]["id"], "phase-001")
+            # The config must name the real workspace-relative events path, not
+            # a bare filename that silently resolves elsewhere.
+            config = json.loads((harness_root / "harness-config.json").read_text(encoding="utf-8"))
+            self.assertEqual(
+                config["message_bus"]["event_log"],
+                "docs/project-harness/events.jsonl",
+            )
+            # The state must carry a real checklist source path + digest.
+            state = state_payload["state"]
+            self.assertEqual(
+                state["source"]["checklist_path"],
+                "docs/project-harness/harness-checklist.json",
+            )
+            checklist_digest = hashlib.sha256(
+                (harness_root / "harness-checklist.json").read_bytes()
+            ).hexdigest()
+            self.assertEqual(state["source"]["checklist_sha256"], checklist_digest)
+            # The checklist item carries a single canonical plan locator.
+            checklist_data = json.loads(
+                (harness_root / "harness-checklist.json").read_text(encoding="utf-8")
+            )
+            item = checklist_data["items"][0]
+            self.assertEqual(item["plan_path"], "docs/plan.md")
+            self.assertEqual(item["artifacts"]["plan"], "docs/plan.md")
+            self.assertEqual(item["status"], "todo")
+            self.assertEqual(item["workflow"]["status"], "todo")
 
     def test_workspace_audit_no_refresh_reports_file_state_without_harnessctl(self):
         with tempfile.TemporaryDirectory() as tmp:
             db_path = str(Path(tmp) / "coordinator.sqlite3")
             root = Path(tmp)
-            (root / "harness-state.json").write_text(
-                json.dumps({"project": "demo", "current_item": None}),
-                encoding="utf-8",
-            )
             (root / "mvp-checklist.json").write_text(
-                json.dumps({"project": "demo", "items": []}),
+                json.dumps({"project": "demo", "harness_root": ".", "updated_at": "2026-07-13", "items": []}),
                 encoding="utf-8",
             )
+            _write_harness_state_with_source(root)
             self.run_cli(
                 "--db",
                 db_path,
@@ -513,7 +691,7 @@ class CliTests(unittest.TestCase):
             plan.write_text("# Plan\n", encoding="utf-8")
             checklist = Path(tmp) / "mvp-checklist.json"
             checklist.write_text(
-                json.dumps({"project": "demo", "harness_root": ".", "version": 1, "items": []}),
+                json.dumps({"project": "demo", "harness_root": ".", "version": 1, "updated_at": "2026-07-13", "items": []}),
                 encoding="utf-8",
             )
             self.run_cli(
@@ -567,13 +745,15 @@ class CliTests(unittest.TestCase):
             self.assertIn("plan.md", items[0]["acceptance"])
 
     def test_task_create_repairs_missing_checklist_item_for_existing_plan_event(self):
+        """A lost checklist item under an existing DB operation is NOT re-created:
+        combined create fails closed and writes neither file nor DB."""
         with tempfile.TemporaryDirectory() as tmp:
             db_path = str(Path(tmp) / "coordinator.sqlite3")
             plan = Path(tmp) / "plan.md"
             plan.write_text("# Plan\n", encoding="utf-8")
             checklist = Path(tmp) / "mvp-checklist.json"
             checklist.write_text(
-                json.dumps({"project": "demo", "harness_root": ".", "version": 1, "items": []}),
+                json.dumps({"project": "demo", "harness_root": ".", "version": 1, "updated_at": "2026-07-13", "items": []}),
                 encoding="utf-8",
             )
             base_args = (
@@ -594,23 +774,35 @@ class CliTests(unittest.TestCase):
                 "--harness-root",
                 tmp,
             )
-            self.run_cli(*base_args)
+            first_code, first_payload = self.run_cli(*base_args)
+            self.assertEqual(first_code, 0)
+            first_event_id = first_payload["result"]["event"]["id"]
+            # Simulate the lost checklist item: wipe items but keep the DB.
             checklist.write_text(
-                json.dumps({"project": "demo", "harness_root": ".", "version": 1, "items": []}),
+                json.dumps({"project": "demo", "harness_root": ".", "version": 1, "updated_at": "2026-07-13", "items": []}),
                 encoding="utf-8",
             )
 
             code, payload = self.run_cli(*base_args)
 
-            self.assertEqual(code, 0)
-            self.assertFalse(payload["result"]["event_created"])
-            self.assertEqual(payload["result"]["task"]["last_event_id"], payload["result"]["event"]["id"])
+            self.assertEqual(code, 1)
+            self.assertEqual(payload["error"]["reason"], "operation_conflict")
+            # Zero file write: the checklist stays empty.
             checklist_payload = json.loads(checklist.read_text(encoding="utf-8"))
-            items = checklist_payload["items"]
-            self.assertEqual(len(items), 1)
-            self.assertEqual(items[0]["id"], "phase-001")
+            self.assertEqual(checklist_payload["items"], [])
+            # Zero new events: the original plan.ready remains the only one.
+            _, events_payload = self.run_cli(
+                "--db", db_path, "event", "list", "--workspace-id", "demo"
+            )
+            plan_ready = [
+                e for e in events_payload["events"] if e["event_type"] == "plan.ready"
+            ]
+            self.assertEqual(len(plan_ready), 1)
+            self.assertEqual(plan_ready[0]["id"], first_event_id)
 
     def test_task_create_repairs_invalid_existing_checklist_item(self):
+        """A legacy unbound checklist item is NOT silently adopted: combined
+        create fails closed with legacy_unbound_item and zero DB writes."""
         with tempfile.TemporaryDirectory() as tmp:
             db_path = str(Path(tmp) / "coordinator.sqlite3")
             plan = Path(tmp) / "plan.md"
@@ -621,6 +813,7 @@ class CliTests(unittest.TestCase):
                     "project": "demo",
                     "harness_root": ".",
                     "version": 1,
+                    "updated_at": "2026-07-13",
                     "items": [
                         {
                             "id": "phase-001",
@@ -630,7 +823,7 @@ class CliTests(unittest.TestCase):
                             "owner": None,
                             "human_gate_required": True,
                             "plan_path": "plan.md",
-                            "acceptance": "",
+                            "acceptance": "acceptance text",
                             "blocked_by": [],
                             "blocked_reason": "",
                             "dependencies": [],
@@ -666,20 +859,31 @@ class CliTests(unittest.TestCase):
                 "--title", "Phase 001",
             )
 
-            self.assertEqual(code, 0)
-            self.assertTrue(payload["result"]["event_created"])
+            self.assertEqual(code, 1)
+            self.assertEqual(payload["error"]["reason"], "legacy_unbound_item")
+            # Zero DB writes: no plan.ready event.
+            _, events_payload = self.run_cli(
+                "--db", db_path, "event", "list", "--workspace-id", "demo"
+            )
+            plan_ready = [
+                e for e in events_payload["events"] if e["event_type"] == "plan.ready"
+            ]
+            self.assertEqual(plan_ready, [])
+            # File unchanged.
             checklist_payload = json.loads(checklist.read_text(encoding="utf-8"))
-            item = checklist_payload["items"][0]
-            self.assertIn("plan.md", item["acceptance"])
+            self.assertEqual(len(checklist_payload["items"]), 1)
+            self.assertNotIn("split_operation", checklist_payload["items"][0])
 
     def test_task_create_legacy_returns_host_aware_warning(self):
+        """Combined create returns a combined receipt (file half + record half),
+        with no legacy host-aware warning: the combined path IS the managed path."""
         with tempfile.TemporaryDirectory() as tmp:
             db_path = str(Path(tmp) / "coordinator.sqlite3")
             plan = Path(tmp) / "plan.md"
             plan.write_text("# Plan\n", encoding="utf-8")
             checklist = Path(tmp) / "mvp-checklist.json"
             checklist.write_text(
-                json.dumps({"project": "demo", "harness_root": ".", "version": 1, "items": []}),
+                json.dumps({"project": "demo", "harness_root": ".", "version": 1, "updated_at": "2026-07-13", "items": []}),
                 encoding="utf-8",
             )
             self.run_cli(
@@ -701,9 +905,13 @@ class CliTests(unittest.TestCase):
             result = payload["result"]
             self.assertEqual(result["task"]["task_id"], "phase-legacy")
             self.assertEqual(result["event"]["event_type"], "plan.ready")
-            self.assertIn("host_aware_warning", result)
-            self.assertIn("create-files", result["host_aware_warning"])
-            self.assertIn("create-record", result["host_aware_warning"])
+            self.assertNotIn("host_aware_warning", result)
+            # Combined receipt: the file half result and the shared operation.
+            self.assertEqual(
+                result["files"]["operation_id"],
+                result["operation"]["operation_id"],
+            )
+            self.assertTrue(result["files"]["checklist_changed"])
 
     def test_task_create_files_writes_checklist_without_db(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -712,7 +920,7 @@ class CliTests(unittest.TestCase):
             plan.write_text("# Plan\n", encoding="utf-8")
             checklist = Path(tmp) / "mvp-checklist.json"
             checklist.write_text(
-                json.dumps({"project": "demo", "harness_root": ".", "version": 1, "items": []}),
+                json.dumps({"project": "demo", "harness_root": ".", "version": 1, "updated_at": "2026-07-13", "items": []}),
                 encoding="utf-8",
             )
             operation_id = str(uuid.uuid4())
@@ -753,7 +961,7 @@ class CliTests(unittest.TestCase):
             plan.write_text("# Plan\n", encoding="utf-8")
             checklist = Path(tmp) / "mvp-checklist.json"
             checklist.write_text(
-                json.dumps({"project": "demo", "harness_root": ".", "version": 1, "items": []}),
+                json.dumps({"project": "demo", "harness_root": ".", "version": 1, "updated_at": "2026-07-13", "items": []}),
                 encoding="utf-8",
             )
             self.run_cli(
@@ -910,27 +1118,18 @@ class CliTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             db_path = str(Path(tmp) / "coordinator.sqlite3")
             root = Path(tmp)
-            (root / "harness-state.json").write_text(
-                json.dumps({"project": "demo", "generated_at": "2026-05-17T00:00:00Z"}),
-                encoding="utf-8",
-            )
             (root / "mvp-checklist.json").write_text(
                 json.dumps(
                     {
                         "project": "demo",
-                        "items": [
-                            {
-                                "id": "mvp-001",
-                                "title": "Build core",
-                                "status": "doing",
-                                "owner": "codex",
-                                "workflow": {"status": "running"},
-                            }
-                        ],
+                        "harness_root": ".",
+                        "updated_at": "2026-07-13",
+                        "items": [_audit_item()],
                     }
                 ),
                 encoding="utf-8",
             )
+            _write_harness_state_with_source(root)
             self.run_cli(
                 "--db",
                 db_path,
@@ -3269,16 +3468,16 @@ class CliTests(unittest.TestCase):
         harnessctl_path.chmod(0o755)
         # Provide harness-state.json and mvp-checklist.json so gate precheck passes
         import json as _json
-        (Path(tmp) / "harness-state.json").write_text(_json.dumps({
-            "project": "demo",
-            "current_item": None,
-        }))
         (Path(tmp) / "mvp-checklist.json").write_text(_json.dumps({
+            "project": "demo",
+            "harness_root": ".",
+            "updated_at": "2026-01-01",
             "items": [
-                {"id": "mvp-001", "workflow": {"status": "review_approved"}, "status": "doing"},
-                {"id": "mvp-002", "workflow": {"status": "review_approved"}, "status": "doing"},
+                _mark_done_item("mvp-001"),
+                _mark_done_item("mvp-002"),
             ]
         }))
+        _write_harness_state_with_source(Path(tmp))
         self.run_cli(
             "--db", db_path,
             "workspace", "add", "demo",
@@ -3386,14 +3585,15 @@ class CliTests(unittest.TestCase):
             )
             harnessctl_path.chmod(0o755)
             import json as _json
-            (Path(tmp) / "harness-state.json").write_text(_json.dumps({
-                "project": "demo", "current_item": None,
-            }))
             (Path(tmp) / "mvp-checklist.json").write_text(_json.dumps({
+                "project": "demo",
+                "harness_root": ".",
+                "updated_at": "2026-01-01",
                 "items": [
-                    {"id": "mvp-001", "workflow": {"status": "review_approved"}, "status": "doing"},
+                    _mark_done_item("mvp-001"),
                 ]
             }))
+            _write_harness_state_with_source(Path(tmp))
             self.run_cli(
                 "--db", db_path,
                 "workspace", "add", "demo",
@@ -3496,9 +3696,11 @@ class CliTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             checklist = Path(tmp) / "mvp-checklist.json"
             checklist.write_text(json.dumps({
+                "project": "demo",
+                "harness_root": ".",
+                "updated_at": "2026-01-01",
                 "items": [
-                    {"id": "mvp-001", "status": "doing",
-                     "workflow": {"status": "review_approved"}},
+                    _mark_done_item("mvp-001"),
                 ]
             }), encoding="utf-8")
 
@@ -3602,11 +3804,14 @@ class CliTests(unittest.TestCase):
             "project": "demo", "current_item": None,
         }))
         (Path(tmp) / "mvp-checklist.json").write_text(json.dumps({
+            "project": "demo",
+            "harness_root": ".",
+            "updated_at": "2026-01-01",
             "items": [
-                {"id": "mvp-001", "status": "doing",
-                 "workflow": {"status": "review_approved", "branch": "feat-x"}},
+                _mark_done_item("mvp-001", branch="feat-x"),
             ]
         }))
+        _write_harness_state_with_source(Path(tmp))
         self.run_cli(
             "--db", db_path,
             "workspace", "add", "demo",
@@ -3675,11 +3880,14 @@ class CliTests(unittest.TestCase):
                 "project": "demo", "current_item": None,
             }))
             (Path(tmp) / "mvp-checklist.json").write_text(json.dumps({
+                "project": "demo",
+                "harness_root": ".",
+                "updated_at": "2026-01-01",
                 "items": [
-                    {"id": "mvp-001", "status": "doing",
-                     "workflow": {"status": "todo", "branch": "feat-x"}},
+                    _mark_done_item("mvp-001", workflow_status="todo", branch="feat-x"),
                 ]
             }))
+            _write_harness_state_with_source(Path(tmp))
             self.run_cli(
                 "--db", db_path, "workspace", "add", "demo",
                 "--path", tmp, "--harness-root", tmp,
@@ -3851,8 +4059,10 @@ class CliTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             checklist = Path(tmp) / "mvp-checklist.json"
             checklist.write_text(json.dumps({
-                "items": [{"id": "mvp-001", "status": "doing",
-                           "workflow": {"status": "review_approved"}}],
+                "project": "demo",
+                "harness_root": ".",
+                "updated_at": "2026-01-01",
+                "items": [_mark_done_item("mvp-001")],
             }))
             code, payload = self.run_cli(
                 "assignment", "mark-done-files",
@@ -3879,8 +4089,10 @@ class CliTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             checklist = Path(tmp) / "mvp-checklist.json"
             checklist.write_text(json.dumps({
-                "items": [{"id": "mvp-001", "status": "doing",
-                           "workflow": {"status": "review_approved"}}],
+                "project": "demo",
+                "harness_root": ".",
+                "updated_at": "2026-01-01",
+                "items": [_mark_done_item("mvp-001")],
             }))
             code, payload = self.run_cli(
                 "assignment", "mark-done-files",
@@ -3897,9 +4109,10 @@ class CliTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             checklist = Path(tmp) / "mvp-checklist.json"
             checklist.write_text(json.dumps({
-                "items": [{"id": "mvp-001", "status": "doing",
-                           "workflow": {"status": "review_approved",
-                                        "branch": "feat-x"}}],
+                "project": "demo",
+                "harness_root": ".",
+                "updated_at": "2026-01-01",
+                "items": [_mark_done_item("mvp-001", branch="feat-x")],
             }))
             code, payload = self.run_cli(
                 "assignment", "mark-done-files",
@@ -3925,9 +4138,10 @@ class CliTests(unittest.TestCase):
             receipt_id, fps = self._prepare_claim_apply_receipt(db_path, tmp)
             # Reset checklist to pre-done so the canonical write is observable.
             (Path(tmp) / "mvp-checklist.json").write_text(json.dumps({
-                "items": [{"id": "mvp-001", "status": "doing",
-                           "workflow": {"status": "review_approved",
-                                        "branch": "feat-x"}}],
+                "project": "demo",
+                "harness_root": ".",
+                "updated_at": "2026-01-01",
+                "items": [_mark_done_item("mvp-001", branch="feat-x")],
             }))
 
             captured = []
@@ -4144,8 +4358,10 @@ class CliTests(unittest.TestCase):
             db_path = self._setup_receipt_workspace(tmp)
             receipt_id, fps = self._prepare_claim_apply_receipt(db_path, tmp)
             (Path(tmp) / "mvp-checklist.json").write_text(json.dumps({
-                "items": [{"id": "mvp-001", "status": "done",
-                           "workflow": {"status": "closed", "branch": "feat-x"}}],
+                "project": "demo",
+                "harness_root": ".",
+                "updated_at": "2026-01-01",
+                "items": [_mark_done_item("mvp-001", status="done", workflow_status="closed", branch="feat-x")],
             }))
 
             code, payload = self.run_cli(
@@ -4199,14 +4415,11 @@ class CliTests(unittest.TestCase):
         harnessctl_path = Path(tmp) / "fake-harnessctl"
         harnessctl_path.write_text("#!/bin/bash\necho 'ok'\nexit 0\n")
         harnessctl_path.chmod(0o755)
-        (Path(tmp) / "harness-state.json").write_text(
-            json.dumps({"project": "demo", "generated_at": "2026-05-17T00:00:00Z"}),
-            encoding="utf-8",
-        )
         (Path(tmp) / "mvp-checklist.json").write_text(
-            json.dumps({"project": "demo", "items": []}),
+            json.dumps({"project": "demo", "harness_root": ".", "updated_at": "2026-07-13", "items": []}),
             encoding="utf-8",
         )
+        _write_harness_state_with_source(Path(tmp))
         self.run_cli(
             "--db", db_path,
             "workspace", "add", "demo",
@@ -4224,18 +4437,15 @@ class CliTests(unittest.TestCase):
             (Path(tmp) / "mvp-checklist.json").write_text(
                 json.dumps({
                     "project": "demo",
+                    "harness_root": ".",
+                    "updated_at": "2026-07-13",
                     "items": [
-                        {
-                            "id": "mvp-001",
-                            "title": "Build core",
-                            "status": "doing",
-                            "owner": "codex",
-                            "workflow": {"status": "running"},
-                        },
+                        _audit_item(),
                     ],
                 }),
                 encoding="utf-8",
             )
+            _write_harness_state_with_source(Path(tmp))
             self.run_cli("--db", db_path, "reconcile", "demo", "--no-refresh")
 
             code, payload = self.run_cli("--db", db_path, "workspace", "audit", "demo")
@@ -4254,40 +4464,30 @@ class CliTests(unittest.TestCase):
             (Path(tmp) / "mvp-checklist.json").write_text(
                 json.dumps({
                     "project": "demo",
+                    "harness_root": ".",
+                    "updated_at": "2026-07-13",
                     "items": [
-                        {
-                            "id": "mvp-001",
-                            "title": "Build core",
-                            "status": "doing",
-                            "owner": "codex",
-                            "workflow": {"status": "running"},
-                        },
+                        _audit_item(),
                     ],
                 }),
                 encoding="utf-8",
             )
+            _write_harness_state_with_source(Path(tmp))
             self.run_cli("--db", db_path, "reconcile", "demo", "--no-refresh")
             # Now change harness state to create a mismatch
             (Path(tmp) / "mvp-checklist.json").write_text(
                 json.dumps({
                     "project": "demo",
+                    "harness_root": ".",
+                    "updated_at": "2026-07-13",
                     "items": [
-                        {
-                            "id": "mvp-001",
-                            "title": "Build core",
-                            "status": "done",
-                            "owner": "codex",
-                            "workflow": {"status": "closed"},
-                        },
+                        _audit_item(status="done", workflow_status="closed"),
                     ],
                 }),
                 encoding="utf-8",
             )
             # Refresh harness-state.json to reflect new checklist
-            (Path(tmp) / "harness-state.json").write_text(
-                json.dumps({"project": "demo", "generated_at": "2026-05-17T00:00:01Z"}),
-                encoding="utf-8",
-            )
+            _write_harness_state_with_source(Path(tmp))
 
             code, payload = self.run_cli("--db", db_path, "workspace", "audit", "demo")
 
@@ -4848,29 +5048,54 @@ class CliTests(unittest.TestCase):
 
     def _write_harness_task(self, tmp, task_id):
         root = Path(tmp)
-        (root / "harness-state.json").write_text(
-            json.dumps(
-                {
-                    "project": "demo",
-                    "current_item": {"id": task_id, "status": "ready"},
-                    "items": [{"id": task_id, "status": "ready"}],
-                }
-            ),
-            encoding="utf-8",
-        )
         (root / "mvp-checklist.json").write_text(
             json.dumps(
                 {
                     "project": "demo",
-                    "items": [{"id": task_id, "status": "pending"}],
+                    "harness_root": ".",
+                    "updated_at": "2026-07-13",
+                    "items": [
+                        {
+                            "id": task_id,
+                            "title": f"Task {task_id}",
+                            "status": "todo",
+                            "priority": "p1",
+                            "owner": None,
+                            "selected_in_session": None,
+                            "verification": "",
+                            "updated_at": "2026-07-13T12:00:00Z",
+                            "dependencies": [],
+                            "blocked_by": [],
+                            "blocked_reason": "",
+                            "acceptance": "Acceptance",
+                            "handoff": {"from": None, "to": None, "reason": None},
+                            "workflow": {"status": "todo", "branch": None,
+                                         "updated_at": "2026-07-13T12:00:00Z"},
+                        }
+                    ],
                 }
             ),
             encoding="utf-8",
         )
+        _write_harness_state_with_source(root, current_item={"id": task_id, "status": "todo"})
 
     def _create_task(self, db_path, tmp):
         plan = Path(tmp) / "plan.md"
         plan.write_text("# Plan\n", encoding="utf-8")
+        checklist = Path(tmp) / "mvp-checklist.json"
+        if not checklist.exists():
+            checklist.write_text(
+                json.dumps(
+                    {
+                        "project": "demo",
+                        "harness_root": ".",
+                        "version": 1,
+                        "updated_at": "2026-07-13",
+                        "items": [],
+                    }
+                ),
+                encoding="utf-8",
+            )
         self.run_cli(
             "--db", db_path,
             "task", "create", "demo",
@@ -5139,6 +5364,16 @@ class CliTests(unittest.TestCase):
             db_path = str(Path(tmp) / "coordinator.sqlite3")
             plan = Path(tmp) / "plan.md"
             plan.write_text("# Plan\n", encoding="utf-8")
+            (Path(tmp) / "mvp-checklist.json").write_text(
+                json.dumps({
+                    "project": "demo",
+                    "harness_root": ".",
+                    "version": 1,
+                    "updated_at": "2026-07-13",
+                    "items": [],
+                }),
+                encoding="utf-8",
+            )
             self.run_cli(
                 "--db", db_path,
                 "workspace", "add", "demo",
@@ -5445,4 +5680,342 @@ class LoadDotenvTests(unittest.TestCase):
                 os.chdir(cwd)
             self.assertEqual(
                 os.environ.get("COORDINATOR_BOT_TOKEN"), "process-env-token"
+            )
+
+
+class CombinedCreateFaultMatrixTests(unittest.TestCase):
+    """U2 §11.1 fault matrix for the combined task create: file-first/
+    record-second ordering, idempotency, recovery, and the initial phase table."""
+
+    def run_cli(self, *args):
+        stdout = io.StringIO()
+        stderr = io.StringIO()
+        with contextlib.redirect_stdout(stdout), contextlib.redirect_stderr(stderr):
+            code = main(list(args))
+        return code, json.loads(stdout.getvalue()) if stdout.getvalue().strip() else {}
+
+    def _setup(self, tmp):
+        db_path = str(Path(tmp) / "coordinator.sqlite3")
+        plan = Path(tmp) / "plan.md"
+        plan.write_text("# Plan\n", encoding="utf-8")
+        (Path(tmp) / "mvp-checklist.json").write_text(
+            json.dumps({"project": "demo", "harness_root": ".", "version": 1,
+                        "updated_at": "2026-07-13", "items": []}),
+            encoding="utf-8",
+        )
+        self.run_cli("--db", db_path, "workspace", "add", "demo",
+                     "--path", tmp, "--harness-root", tmp)
+        return db_path
+
+    def _create(self, db_path, task_id="t1", **extra):
+        argv = ["--db", db_path, "task", "create", "demo",
+                "--task-id", task_id, "--plan-doc", "plan.md", "--title", "T"]
+        for key, value in extra.items():
+            flag = "--operation-id" if key == "operation_id" else f"--{key}"
+            argv += [flag, str(value)]
+        return self.run_cli(*argv)
+
+    def _plan_ready_count(self, db_path):
+        _, payload = self.run_cli("--db", db_path, "event", "list", "--workspace-id", "demo")
+        return sum(1 for e in payload.get("events", []) if e["event_type"] == "plan.ready")
+
+    def test_file_half_phase_rejection_leaves_db_and_file_untouched(self):
+        """Reserved lifecycle/terminal phases fail closed at the file half:
+        zero DB writes and zero checklist mutation."""
+        with tempfile.TemporaryDirectory() as tmp:
+            db_path = self._setup(tmp)
+            checklist_path = Path(tmp) / "mvp-checklist.json"
+            before = checklist_path.read_bytes()
+            for phase in ("awaiting_operator", "running", "blocked", "done", "released"):
+                with self.subTest(phase=phase):
+                    code, payload = self._create(db_path, task_id=f"t-{phase}", phase=phase)
+                    self.assertEqual(code, 1)
+                    self.assertEqual(payload["error"]["reason"], "phase_not_creatable")
+                    self.assertEqual(self._plan_ready_count(db_path), 0)
+                    self.assertEqual(checklist_path.read_bytes(), before)
+
+    def test_arbitrary_planning_label_creates_todo(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            db_path = self._setup(tmp)
+            code, payload = self._create(db_path, task_id="t1", phase="phase-8")
+            self.assertEqual(code, 0)
+            self.assertEqual(payload["result"]["task"]["task_id"], "t1")
+            checklist = json.loads(
+                (Path(tmp) / "mvp-checklist.json").read_text(encoding="utf-8")
+            )
+            item = checklist["items"][0]
+            self.assertEqual(item["status"], "todo")
+            self.assertEqual(item["workflow"]["status"], "todo")
+            self.assertEqual(item["phase"], "phase-8")
+
+    def test_full_success_retry_reuses_operation_no_new_event(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            db_path = self._setup(tmp)
+            first_code, first = self._create(db_path)
+            self.assertEqual(first_code, 0)
+            first_op = first["result"]["operation"]["operation_id"]
+            first_event = first["result"]["event"]["id"]
+
+            second_code, second = self._create(db_path)
+            self.assertEqual(second_code, 0)
+            self.assertEqual(second["result"]["operation"]["operation_id"], first_op)
+            self.assertEqual(second["result"]["event"]["id"], first_event)
+            self.assertFalse(second["result"]["event_created"])
+            self.assertEqual(self._plan_ready_count(db_path), 1)
+
+    def test_input_change_fails_closed_before_any_write(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            db_path = self._setup(tmp)
+            first_code, _ = self._create(db_path, title="Original")
+            self.assertEqual(first_code, 0)
+            checklist_path = Path(tmp) / "mvp-checklist.json"
+            before = checklist_path.read_bytes()
+
+            code, payload = self._create(db_path, title="Changed Title")
+            self.assertEqual(code, 1)
+            self.assertEqual(payload["error"]["reason"], "operation_conflict")
+            # Zero writes: file bytes unchanged and still one plan.ready.
+            self.assertEqual(checklist_path.read_bytes(), before)
+            self.assertEqual(self._plan_ready_count(db_path), 1)
+
+    def _db_counts(self, db_path):
+        """(task mirror, event, split-operation) rows for the demo workspace."""
+        conn = sqlite3.connect(db_path)
+        try:
+            return (
+                conn.execute(
+                    "SELECT COUNT(*) FROM tasks WHERE workspace_id = 'demo'"
+                ).fetchone()[0],
+                conn.execute(
+                    "SELECT COUNT(*) FROM events WHERE workspace_id = 'demo'"
+                ).fetchone()[0],
+                conn.execute(
+                    "SELECT COUNT(*) FROM split_operations WHERE workspace_id = 'demo'"
+                ).fetchone()[0],
+            )
+        finally:
+            conn.close()
+
+    def test_lost_item_with_new_explicit_operation_id_conflicts(self):
+        """P1-1: after a successful create, deleting the checklist item and
+        retrying with a NEW explicit --operation-id must fail closed: the DB
+        ledger still binds the target, so re-authoring under a second
+        authority is refused with operation_conflict and zero mutation
+        (checklist bytes, task mirror, events, split-operation ledger)."""
+        with tempfile.TemporaryDirectory() as tmp:
+            db_path = self._setup(tmp)
+            first_code, first = self._create(db_path)
+            self.assertEqual(first_code, 0)
+            self.assertEqual(first["result"]["event_created"], True)
+            checklist_path = Path(tmp) / "mvp-checklist.json"
+            # The DB ledger row survives the file-side deletion.
+            checklist = json.loads(checklist_path.read_text(encoding="utf-8"))
+            checklist["items"] = []
+            checklist_path.write_text(json.dumps(checklist), encoding="utf-8")
+            before_bytes = checklist_path.read_bytes()
+            before_counts = self._db_counts(db_path)
+
+            code, payload = self._create(db_path, operation_id=str(uuid.uuid4()))
+            self.assertEqual(code, 1)
+            self.assertEqual(payload["error"]["reason"], "operation_conflict")
+            self.assertEqual(checklist_path.read_bytes(), before_bytes)
+            self.assertEqual(self._db_counts(db_path), before_counts)
+
+    def test_explicit_operation_id_mismatch_conflicts_with_zero_mutation(self):
+        """P1-1: an item already deployed under an envelope with identical
+        inputs, retried with a DIFFERENT explicit --operation-id, must fail
+        closed with operation_conflict and zero mutation; the deployed
+        envelope stays bound to the original operation."""
+        with tempfile.TemporaryDirectory() as tmp:
+            db_path = self._setup(tmp)
+            first_code, first = self._create(db_path)
+            self.assertEqual(first_code, 0)
+            deployed_op = first["result"]["operation"]["operation_id"]
+            checklist_path = Path(tmp) / "mvp-checklist.json"
+            before_bytes = checklist_path.read_bytes()
+            before_counts = self._db_counts(db_path)
+
+            other = str(uuid.uuid4())
+            self.assertNotEqual(other, deployed_op)
+            code, payload = self._create(db_path, operation_id=other)
+            self.assertEqual(code, 1)
+            self.assertEqual(payload["error"]["reason"], "operation_conflict")
+            self.assertEqual(checklist_path.read_bytes(), before_bytes)
+            self.assertEqual(self._db_counts(db_path), before_counts)
+            checklist = json.loads(checklist_path.read_text(encoding="utf-8"))
+            self.assertEqual(
+                checklist["items"][0]["split_operation"]["operation_id"],
+                deployed_op,
+            )
+
+    def test_phase_whitespace_rejected_with_zero_mutation(self):
+        """P2-1: surrounding whitespace must not smuggle lifecycle/terminal
+        phases past the combined create ("done ", " running") — same
+        phase_not_creatable contract as the plain phase table, with zero
+        checklist and DB mutation."""
+        with tempfile.TemporaryDirectory() as tmp:
+            db_path = self._setup(tmp)
+            checklist_path = Path(tmp) / "mvp-checklist.json"
+            before = checklist_path.read_bytes()
+            before_counts = self._db_counts(db_path)
+            for phase in ("done ", " running"):
+                with self.subTest(phase=phase):
+                    code, payload = self._create(
+                        db_path, task_id=f"t-{phase.strip()}", phase=phase
+                    )
+                    self.assertEqual(code, 1)
+                    self.assertEqual(payload["error"]["reason"], "phase_not_creatable")
+                    self.assertEqual(checklist_path.read_bytes(), before)
+                    self.assertEqual(self._db_counts(db_path), before_counts)
+
+    def test_record_half_failure_emits_structured_recovery(self):
+        """A record-half failure keeps the file authority and returns the
+        same-operation recovery argv (recovery_required JSON + copyable command)."""
+        import coordinate.onboarding as onboarding_module
+
+        def boom(*_args, **_kwargs):
+            raise RuntimeError("injected record failure")
+
+        with tempfile.TemporaryDirectory() as tmp:
+            db_path = self._setup(tmp)
+            checklist_path = Path(tmp) / "mvp-checklist.json"
+            with patch.object(onboarding_module, "apply_task_create_record", side_effect=boom):
+                code, payload = self.run_cli(
+                    "--db", db_path,
+                    "task", "create", "demo",
+                    "--task-id", "t1",
+                    "--plan-doc", "plan.md",
+                    "--title", "T",
+                )
+            self.assertEqual(code, 1)
+            error = payload["error"]
+            self.assertTrue(error["recovery_required"])
+            self.assertIn("operation_id", error)
+            self.assertIn("input_fingerprint", error)
+            self.assertIn("before_fingerprint", error)
+            self.assertIn("after_fingerprint", error)
+            self.assertIn("recovery_argv", error)
+            self.assertEqual(error["recovery_argv"][:3], ["coordinate", "task", "create-record"])
+            self.assertIn("recovery_command", error)
+            # File authority is preserved: the checklist item + envelope remain.
+            checklist = json.loads(checklist_path.read_text(encoding="utf-8"))
+            self.assertEqual(len(checklist["items"]), 1)
+            self.assertEqual(
+                checklist["items"][0]["split_operation"]["operation_id"],
+                error["operation_id"],
+            )
+            # The recovery argv completes the same operation idempotently.
+            with patch.object(onboarding_module, "apply_task_create_record") as mock_record:
+                mock_record.return_value = None
+                argv = error["recovery_argv"]
+                self.assertIn("--operation-id", argv)
+                self.assertEqual(
+                    argv[argv.index("--operation-id") + 1],
+                    error["operation_id"],
+                )
+
+    def test_assignment_mark_done_empty_verification_rejected(self):
+        """Monolithic mark-done E2E: a new item with verification='' is rejected
+        before harnessctl runs (no task.done event)."""
+        with tempfile.TemporaryDirectory() as tmp:
+            db_path = str(Path(tmp) / "coordinator.sqlite3")
+            harnessctl_path = Path(tmp) / "fake-harnessctl"
+            harnessctl_path.write_text("#!/bin/bash\necho 'ok'\nexit 0\n")
+            harnessctl_path.chmod(0o755)
+            (Path(tmp) / "mvp-checklist.json").write_text(json.dumps({
+                "project": "demo",
+                "harness_root": ".",
+                "updated_at": "2026-01-01",
+                "items": [_mark_done_item(verification="")],
+            }), encoding="utf-8")
+            _write_harness_state_with_source(Path(tmp))
+            self.run_cli(
+                "--db", db_path,
+                "workspace", "add", "demo",
+                "--path", tmp, "--harness-root", tmp,
+                "--harnessctl-path", str(harnessctl_path),
+            )
+
+            code, payload = self.run_cli(
+                "--db", db_path,
+                "assignment", "mark-done", "demo",
+                "--task-id", "mvp-001",
+            )
+
+            self.assertEqual(code, 1)
+            self.assertFalse(payload["result"]["gate"]["passed"])
+            self.assertIn("verification", payload["result"]["gate"]["reason"])
+            self.assertIsNone(payload["result"]["mutation"])
+
+            _, events_payload = self.run_cli("--db", db_path, "event", "list", "--workspace-id", "demo")
+            task_done = [e for e in events_payload["events"] if e["event_type"] == "task.done"]
+            self.assertEqual(task_done, [])
+
+    def test_assignment_mark_done_existing_item_verification_success(self):
+        """Monolithic mark-done E2E: an item with an existing non-empty
+        verification succeeds and passes --verification to harnessctl."""
+        with tempfile.TemporaryDirectory() as tmp:
+            db_path = str(Path(tmp) / "coordinator.sqlite3")
+            harnessctl_path = Path(tmp) / "fake-harnessctl"
+            harnessctl_path.write_text("#!/bin/bash\necho 'ok'\nexit 0\n")
+            harnessctl_path.chmod(0o755)
+            (Path(tmp) / "mvp-checklist.json").write_text(json.dumps({
+                "project": "demo",
+                "harness_root": ".",
+                "updated_at": "2026-01-01",
+                "items": [_mark_done_item(verification="already in item")],
+            }), encoding="utf-8")
+            _write_harness_state_with_source(Path(tmp))
+            self.run_cli(
+                "--db", db_path,
+                "workspace", "add", "demo",
+                "--path", tmp, "--harness-root", tmp,
+                "--harnessctl-path", str(harnessctl_path),
+            )
+
+            code, payload = self.run_cli(
+                "--db", db_path,
+                "assignment", "mark-done", "demo",
+                "--task-id", "mvp-001",
+            )
+
+            self.assertEqual(code, 0)
+            self.assertTrue(payload["result"]["event_created"])
+            self.assertEqual(
+                payload["result"]["event"]["payload"].get("verification"),
+                "already in item",
+            )
+
+    def test_assignment_mark_done_explicit_verification_wins(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            db_path = str(Path(tmp) / "coordinator.sqlite3")
+            harnessctl_path = Path(tmp) / "fake-harnessctl"
+            harnessctl_path.write_text("#!/bin/bash\necho 'ok'\nexit 0\n")
+            harnessctl_path.chmod(0o755)
+            (Path(tmp) / "mvp-checklist.json").write_text(json.dumps({
+                "project": "demo",
+                "harness_root": ".",
+                "updated_at": "2026-01-01",
+                "items": [_mark_done_item(verification="")],
+            }), encoding="utf-8")
+            _write_harness_state_with_source(Path(tmp))
+            self.run_cli(
+                "--db", db_path,
+                "workspace", "add", "demo",
+                "--path", tmp, "--harness-root", tmp,
+                "--harnessctl-path", str(harnessctl_path),
+            )
+
+            code, payload = self.run_cli(
+                "--db", db_path,
+                "assignment", "mark-done", "demo",
+                "--task-id", "mvp-001",
+                "--verification", "explicit evidence",
+            )
+
+            self.assertEqual(code, 0)
+            self.assertTrue(payload["result"]["event_created"])
+            self.assertEqual(
+                payload["result"]["event"]["payload"].get("verification"),
+                "explicit evidence",
             )

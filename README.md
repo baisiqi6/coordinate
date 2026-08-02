@@ -43,6 +43,20 @@ Coordinate ── 持久化协调、authority、恢复、可见性
 
 当前跨仓产品状态与计划在 MultiNexus 的活跃 harness 中维护；Coordinate 仓库不复制第二份。
 
+## 什么时候需要 Coordinate / MultiNexus
+
+| 需求 | 最小组合 |
+|---|---|
+| 当前 agent 直接开发，只需要持久计划、SDD/TDD、审查和测试纪律 | EXharness |
+| 需要 durable job、任务状态、事件、审查记录和可恢复流程 | EXharness + Coordinate |
+| 需要系统自动调用 agent CLI、恢复 provider session 或跨宿主机执行 | EXharness + Coordinate + MultiNexus `agentd/adapters` |
+| 需要 Discord/KOOK、多 Bot 和多 agent 可见协作 | 三者完整部署 |
+
+Coordinate 可以独立作为控制面使用：当前 agent、Operator 或已有 runner 主动领取和报告 job 即可。
+但 Coordinate 不会因为安装完成就自动获得 Claude Code、Qoder、Grok 等 vendor runtime 的原生
+session 控制；需要这种托管执行时，使用 MultiNexus `agentd/adapters` 或实现等价的自定义 executor。
+Discord/KOOK 只是可选 transport，不是使用 Coordinate 或 MultiNexus executor 层的前提。
+
 ## 部署拓扑
 
 Coordinate 区分四个操作环境：

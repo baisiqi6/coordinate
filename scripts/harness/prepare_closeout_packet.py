@@ -12,10 +12,11 @@ from harness_common import (
     append_event,
     harness_root,
     load_checklist,
+    mutate_checklist,
     read_text,
     rel,
     require_item,
-    save_checklist,
+    resolve_item_plan,
     today,
     ensure_artifacts,
     ensure_review,
@@ -42,7 +43,6 @@ def main() -> int:
     parser = argparse.ArgumentParser(description="Prepare a closeout packet for a checklist item.")
     parser.add_argument("--item", required=True, help="Checklist item id, e.g. mvp-003")
     parser.add_argument("--reviewer", default="TBD", help="Reviewer label")
-    parser.add_argument("--self-test-evidence", default="", help="Worker self-test evidence (deploy SHA, e2e result, bugs found)")
     parser.add_argument("--date", default=today(), help="ISO date override")
     args = parser.parse_args()
 
@@ -50,21 +50,14 @@ def main() -> int:
     checklist = load_checklist()
     item = require_item(checklist, args.item)
     workflow = ensure_workflow(item)
-    artifacts = ensure_artifacts(item)
-    review = ensure_review(item)
 
-    plan_path = root / "tasks" / args.item / "plan.md"
+    plan_path = resolve_item_plan(item, require_exists=True)
     progress_path = root / "progress.md"
     review_path = root / "current" / "review.md"
     packet_path = root / "current" / "closeout-packet.md"
 
     progress_text = read_text(progress_path)
     recent_progress = tail_session_log(progress_text)
-
-    if args.self_test_evidence.strip():
-        self_test_evidence_display = args.self_test_evidence.strip()
-    else:
-        self_test_evidence_display = "_No self-test evidence provided. Reviewer should reject or request evidence before approving._"
 
     body = f"""# Closeout Packet
 
@@ -74,10 +67,6 @@ def main() -> int:
 - Reviewer: `{args.reviewer}`
 - Updated at: `{args.date}`
 - Canonical plan path: `{rel(plan_path)}`
-
-## Self-Test Evidence
-
-{self_test_evidence_display}
 
 ## Item Snapshot
 
@@ -103,11 +92,11 @@ def main() -> int:
 
 ## Review Inputs
 
-- Scope: `docs/project-harness/scope.md`
-- Architecture: `docs/project-harness/architecture.md`
-- Domain model: `docs/project-harness/domain-model.md`
-- Progress: `docs/project-harness/progress.md`
-- Review output target: `docs/project-harness/current/review.md`
+- Scope: `docs/scope.md`
+- Architecture: `docs/architecture.md`
+- Domain model: `docs/domain-model.md`
+- Progress: `docs/progress.md`
+- Review output target: `docs/current/review.md`
 
 ## Canonical Plan Content
 
@@ -136,13 +125,20 @@ def main() -> int:
 """
 
     write_text(packet_path, body + "\n")
-    artifacts["closeout_packet"] = rel(packet_path)
-    workflow["status"] = "closeout_requested"
-    workflow["updated_at"] = today()
-    review["decision"] = None
-    review["reviewer"] = args.reviewer
-    item["updated_at"] = today()
-    save_checklist(checklist)
+
+    def callback(candidate: dict) -> None:
+        item = require_item(candidate, args.item)
+        workflow = ensure_workflow(item)
+        artifacts = ensure_artifacts(item)
+        review = ensure_review(item)
+        artifacts["closeout_packet"] = rel(packet_path)
+        workflow["status"] = "closeout_requested"
+        workflow["updated_at"] = today()
+        review["decision"] = None
+        review["reviewer"] = args.reviewer
+        item["updated_at"] = today()
+
+    mutate_checklist(callback)
 
     append_event(
         "RESULT",

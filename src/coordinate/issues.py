@@ -593,7 +593,7 @@ def materialize_issue(
     """Materialize an accepted issue.triaged event into a plan-backed harness task.
 
     Reuses onboarding.create_plan_task to write plan.ready + sync the harness
-    mvp-checklist + upsert the task mirror, so `task handoff` can pass the
+    checklist + upsert the task mirror, so `task handoff` can pass the
     `_require_harness_task` preflight (checklist still needs a separate
     `plan approve` for the plan-gate). The issue body is never used as a plan
     or system prompt — the operator must supply a real --plan-doc file.
@@ -702,7 +702,7 @@ def materialize_issue(
             f"plan_doc={plan_doc}"
         )
 
-    # Reuse create_plan_task: writes plan.ready + syncs mvp-checklist +
+    # Reuse create_plan_task: writes plan.ready + syncs the checklist +
     # upserts the task mirror. GitHub issue metadata rides in the payload,
     # always flagged content_trust=untrusted.
     plan_result = create_plan_task(
@@ -899,7 +899,7 @@ def materialize_issue_files(
     priority: str = "p1",
     allow_runtime_copy: bool = False,
 ) -> IssueMaterializeFilesResult:
-    """Coding-host half of host-aware materialize: write mvp-checklist.json only.
+    """Coding-host half of host-aware materialize: write the resolved checklist only.
 
     Runs on the Mac/Windows git checkout (operator passes the local paths).
     Does NOT touch the coordinate DB — that is the job of `materialize-record`

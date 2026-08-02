@@ -2122,6 +2122,8 @@ def _create_response_delivery(
         str(reply["platform"]),
         default_bus=workspace.default_bus if workspace else None,
     )
+    if platform == "none":
+        return None, False
     message_key = f"runtime:job:{job['id']}:response:{event_id}:{platform}:{reply['destination']}"
     delivery, created = create_delivery(
         conn,

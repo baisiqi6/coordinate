@@ -2,17 +2,32 @@ from __future__ import annotations
 
 import json
 import logging
-import shutil
+import os
+import re
+import shlex
 import sqlite3
 import stat
+import uuid
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
+from .checklist_io import (
+    CHECKLIST_LEGACY_NAME,
+    REASON_CHECKLIST_MISSING,
+    ChecklistError,
+    ResolvedChecklist,
+    create_empty_checklist,
+    load_checklist,
+    resolve_checklist,
+    resolve_checklist_for_init,
+    sha256_bytes,
+)
 from .db import (
     Workspace,
     append_event,
     get_workspace,
+    list_split_operations,
     row_to_dict,
     upsert_task_mirror,
     upsert_workspace,
@@ -22,11 +37,19 @@ from .split_operations import (
     CONTRACT_VERSION,
     OPERATION_KIND_ISSUE_MATERIALIZE,
     OPERATION_KIND_TASK_CREATE,
+    REASON_FILES_NOT_DEPLOYED,
+    REASON_LEGACY_UNBOUND_ITEM,
+    REASON_OPERATION_CONFLICT,
+    TARGET_KIND_CHECKLIST_TASK,
+    SplitOperationError,
     apply_task_create_files,
     apply_task_create_record,
+    build_task_create_input_fingerprint,
     compute_plan_sha256,
     validate_sha256,
+    validate_task_create_contract,
     validate_uuid,
+    validate_workspace_relative_path,
 )
 
 log = logging.getLogger(__name__)
@@ -38,8 +61,8 @@ class TaskCreateResult:
     task: dict[str, Any]
     event: dict[str, Any]
     event_created: bool
-    host_aware_warning: str | None = None
     operation: dict[str, Any] | None = None
+    files: dict[str, Any] | None = None
 
     def to_dict(self) -> dict[str, Any]:
         payload = {
@@ -48,10 +71,10 @@ class TaskCreateResult:
             "event": self.event,
             "event_created": self.event_created,
         }
-        if self.host_aware_warning:
-            payload["host_aware_warning"] = self.host_aware_warning
         if self.operation is not None:
             payload["operation"] = self.operation
+        if self.files is not None:
+            payload["files"] = self.files
         return payload
 
 
@@ -107,88 +130,6 @@ class InitHarnessResult:
             "event_created": self.event_created,
             "task": self.task,
         }
-
-
-def sync_to_checklist(
-    workspace: Workspace,
-    *,
-    task_id: str,
-    title: str,
-    plan_path: str,
-    priority: str = "p1",
-    phase: str = "ready",
-) -> bool:
-    """Add a task item to the workspace's mvp-checklist.json if not already present."""
-    checklist_path = Path(workspace.harness_root) / "mvp-checklist.json"
-    if not checklist_path.is_file():
-        log.debug("No mvp-checklist.json at %s, skipping sync", checklist_path)
-        return False
-
-    raw = checklist_path.read_text(encoding="utf-8")
-    checklist = json.loads(raw)
-    items = checklist.get("items", [])
-
-    from datetime import datetime, timezone
-
-    now = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
-    coarse_status = _checklist_status_for_phase(phase)
-    workflow_status = _workflow_status_for_phase(phase)
-    acceptance = f"Use the plan acceptance criteria as source of truth: {plan_path}"
-    defaults = {
-        "id": task_id,
-        "title": title,
-        "status": coarse_status,
-        "phase": phase,
-        "priority": priority,
-        "owner": None,
-        "human_gate_required": True,
-        "plan_path": plan_path,
-        "acceptance": acceptance,
-        "blocked_by": [],
-        "blocked_reason": "",
-        "dependencies": [],
-        "handoff": {"from": None, "to": None, "reason": None},
-        "selected_in_session": None,
-        "updated_at": now,
-        "workflow": {"status": workflow_status, "branch": None, "updated_at": now},
-        "artifacts": {"plan": plan_path},
-        "verification": "",
-        "review": {},
-    }
-    for item in items:
-        if item.get("id") != task_id:
-            continue
-        changed = False
-        for key, value in defaults.items():
-            if key in {"status", "workflow"}:
-                continue
-            if key not in item or item[key] in ("", None):
-                item[key] = value
-                changed = True
-        if not isinstance(item.get("workflow"), dict):
-            item["workflow"] = defaults["workflow"]
-            changed = True
-        if changed:
-            item["updated_at"] = now
-            checklist["updated_at"] = now.split("T")[0]
-            checklist_path.write_text(
-                json.dumps(checklist, ensure_ascii=False, indent=2) + "\n",
-                encoding="utf-8",
-            )
-            log.info("Repaired task %s in %s", task_id, checklist_path)
-        else:
-            log.debug("Task %s already in checklist", task_id)
-        return changed
-
-    items.append(defaults)
-    checklist["items"] = items
-    checklist["updated_at"] = now.split("T")[0]
-    checklist_path.write_text(
-        json.dumps(checklist, ensure_ascii=False, indent=2) + "\n",
-        encoding="utf-8",
-    )
-    log.info("Synced task %s to %s", task_id, checklist_path)
-    return True
 
 
 def _plan_content_hash(path) -> str | None:
@@ -318,6 +259,229 @@ def _carry_split_operation_metadata(
     return stored
 
 
+@dataclass(frozen=True)
+class TaskCreateRecovery:
+    """Structured recovery material for a record-half failure.
+
+    The file half already committed; the checklist item and its envelope stay
+    authoritative. ``recovery_argv`` re-runs ``task create-record`` with the
+    same operation id and fingerprints to complete the DB half idempotently.
+    """
+
+    workspace_id: str
+    task_id: str
+    plan_doc: str
+    phase: str
+    actor: str
+    target: str | None
+    operation_id: str
+    input_fingerprint: str
+    before_fingerprint: str
+    after_fingerprint: str
+    title: str | None = None
+    owner: str | None = None
+    branch: str | None = None
+    payload: dict[str, Any] | None = None
+    idempotency_key: str | None = None
+    error_message: str = ""
+
+    def recovery_argv(self) -> list[str]:
+        argv = [
+            "coordinate",
+            "task",
+            "create-record",
+            self.workspace_id,
+            "--operation-id",
+            self.operation_id,
+            "--input-fingerprint",
+            self.input_fingerprint,
+            "--before-fingerprint",
+            self.before_fingerprint,
+            "--after-fingerprint",
+            self.after_fingerprint,
+            "--task-id",
+            self.task_id,
+            "--plan-doc",
+            self.plan_doc,
+            "--phase",
+            self.phase,
+            "--actor",
+            self.actor,
+            "--target",
+            self.target or "worker",
+            "--payload-json",
+            json.dumps(self.payload or {}, ensure_ascii=False, sort_keys=True),
+        ]
+        if self.title:
+            argv += ["--title", self.title]
+        if self.owner:
+            argv += ["--owner", self.owner]
+        if self.branch:
+            argv += ["--branch", self.branch]
+        if self.idempotency_key:
+            argv += ["--idempotency-key", self.idempotency_key]
+        return argv
+
+    def to_dict(self) -> dict[str, Any]:
+        argv = self.recovery_argv()
+        return {
+            "recovery_required": True,
+            "operation_id": self.operation_id,
+            "input_fingerprint": self.input_fingerprint,
+            "before_fingerprint": self.before_fingerprint,
+            "after_fingerprint": self.after_fingerprint,
+            "recovery_argv": argv,
+            "recovery_command": shlex.join(argv),
+            "error": self.error_message,
+        }
+
+
+class TaskCreateRecoveryError(ValueError):
+    """The record half failed after the file half committed.
+
+    ``recovery`` carries the same-operation idempotent completion material.
+    """
+
+    def __init__(self, message: str, recovery: TaskCreateRecovery):
+        super().__init__(message)
+        self.recovery = recovery
+
+
+def _resolve_task_create_operation(
+    conn: sqlite3.Connection,
+    workspace: Workspace,
+    *,
+    task_id: str,
+    plan_doc: str,
+    title: str | None,
+    phase: str,
+    priority: str,
+    explicit_operation_id: str | None,
+) -> tuple[str, str]:
+    """Choose or reuse the operation id for a combined task create.
+
+    Rules (plan §5.2), applied identically for auto and explicit operation ids:
+
+    - the input fingerprint is always computed first;
+    - item already carrying a task.create envelope with identical inputs:
+      reused when no explicit id is given; an explicit id must equal the
+      deployed envelope's operation id exactly, else ``operation_conflict``;
+    - item without an envelope -> ``legacy_unbound_item``; envelope kind or
+      inputs differ -> ``operation_conflict``;
+    - item absent but the DB ledger already binds the target ->
+      ``operation_conflict`` BEFORE any file write (a lost checklist item is
+      never re-authored under a second authority);
+    - only an absent item with no DB binding may take a fresh (or explicit)
+      operation id.
+
+    The file half re-checks everything under the lock, so this pre-read is
+    advisory only — but it runs before ANY file/DB mutation.
+    """
+    plan_abs = _resolve_workspace_path(workspace, plan_doc)
+    try:
+        plan_sha256 = compute_plan_sha256(plan_abs)
+    except OSError as exc:
+        raise ValueError(
+            f"plan_doc is not a readable file: {plan_doc} ({plan_abs})"
+        ) from exc
+    input_fingerprint = build_task_create_input_fingerprint(
+        workspace_id=workspace.id,
+        task_id=task_id,
+        plan_doc=plan_doc,
+        plan_sha256=plan_sha256,
+        title=title or task_id,
+        phase=phase,
+        priority=priority,
+    )
+    explicit = validate_uuid(explicit_operation_id) if explicit_operation_id is not None else None
+    try:
+        checklist, _ = load_checklist(workspace.harness_root, purpose="read")
+    except ChecklistError as exc:
+        if exc.reason == REASON_CHECKLIST_MISSING:
+            # Defer to the file half, which raises checklist_missing before any
+            # DB write with the init hint.
+            return explicit or str(uuid.uuid4()), input_fingerprint
+        raise
+    items = checklist.get("items")
+    item = None
+    if isinstance(items, list):
+        for candidate in items:
+            if isinstance(candidate, dict) and candidate.get("id") == task_id:
+                item = candidate
+                break
+    if item is None:
+        # Reconciliation pre-flight: the DB already binds this target to a
+        # split operation but the checklist item is absent. Create must not
+        # guess authority by writing a second item/operation.
+        for existing_op in list_split_operations(
+            conn,
+            workspace_id=workspace.id,
+            target_kind=TARGET_KIND_CHECKLIST_TASK,
+            target_id=task_id,
+        ):
+            raise SplitOperationError(
+                f"DB ledger already binds task {task_id} to operation "
+                f"{existing_op.operation_id} but the checklist has no item for "
+                "it; run doctor/audit to reconcile, do not re-create",
+                REASON_OPERATION_CONFLICT,
+            )
+        return explicit or str(uuid.uuid4()), input_fingerprint
+    envelope = item.get("split_operation")
+    if not isinstance(envelope, dict):
+        raise SplitOperationError(
+            f"task {task_id} already exists in the checklist without a "
+            "split-operation envelope; refusing to adopt a legacy unbound item. "
+            "Reconcile it explicitly instead.",
+            REASON_LEGACY_UNBOUND_ITEM,
+        )
+    if envelope.get("operation_kind") != OPERATION_KIND_TASK_CREATE:
+        raise SplitOperationError(
+            f"task {task_id} already exists in the checklist under a different "
+            f"operation kind ({envelope.get('operation_kind')!r}); refusing to "
+            "overwrite it",
+            REASON_OPERATION_CONFLICT,
+        )
+    if envelope.get("input_fingerprint") != input_fingerprint:
+        raise SplitOperationError(
+            f"task {task_id} already exists under operation "
+            f"{envelope.get('operation_id')!r} with different inputs (plan digest, "
+            "title, phase, or priority changed); revise the plan explicitly and "
+            "do not re-create",
+            REASON_OPERATION_CONFLICT,
+        )
+    if explicit is not None:
+        if explicit != envelope.get("operation_id"):
+            raise SplitOperationError(
+                f"task {task_id} already exists under operation "
+                f"{envelope.get('operation_id')!r}; explicit --operation-id "
+                f"{explicit} does not match the deployed envelope",
+                REASON_OPERATION_CONFLICT,
+            )
+        return explicit, input_fingerprint
+    return envelope["operation_id"], input_fingerprint
+
+
+def _normalize_plan_doc(workspace: Workspace, plan_doc: str) -> str:
+    """Return *plan_doc* as a workspace-relative path for Coordinate-managed.
+
+    Absolute paths that resolve inside the workspace are rewritten to their
+    workspace-relative form; paths outside the workspace fail closed (the U1
+    locator contract keeps Coordinate-managed plans workspace-relative).
+    """
+    candidate = Path(plan_doc).expanduser()
+    if not candidate.is_absolute():
+        return plan_doc
+    try:
+        rel = candidate.resolve().relative_to(Path(workspace.path).resolve())
+    except ValueError:
+        raise ValueError(
+            f"plan_doc is outside the workspace ({workspace.path}); "
+            "Coordinate-managed plans must be workspace-relative: "
+            f"{plan_doc}"
+        ) from None
+    return str(rel)
+
+
 def create_plan_task(
     conn: sqlite3.Connection,
     *,
@@ -328,42 +492,117 @@ def create_plan_task(
     owner: str | None = None,
     branch: str | None = None,
     phase: str = "ready",
+    priority: str = "p1",
     actor: str = "operator",
     target: str | None = "worker",
     payload: dict[str, Any] | None = None,
     idempotency_key: str | None = None,
+    operation_id: str | None = None,
+    allow_runtime_copy: bool = False,
 ) -> TaskCreateResult:
-    result = create_plan_task_record(
+    """Combined managed task create: file-first, record-second.
+
+    Orders the existing split halves inside one command: resolve/validate the
+    checklist, choose or reuse the operation id, apply the checklist file half,
+    then apply the DB record half with the same envelope and fingerprints.
+    Any file-half failure leaves the DB untouched; a record-half failure keeps
+    the committed file authority and raises ``TaskCreateRecoveryError`` with
+    same-operation idempotent recovery argv.
+    """
+    workspace = get_workspace(conn, workspace_id)
+    if workspace is None:
+        raise ValueError(f"unknown workspace: {workspace_id}")
+    _refuse_runtime_copy(workspace, allow_runtime_copy=allow_runtime_copy)
+    if not task_id:
+        raise ValueError("task_id is required")
+    if not plan_doc:
+        raise ValueError("plan_doc is required")
+    plan_doc = _normalize_plan_doc(workspace, plan_doc)
+    plan_abs = _resolve_workspace_path(workspace, plan_doc)
+    if not plan_abs.is_file():
+        raise ValueError(
+            f"plan_doc is not a regular readable file: {plan_doc} ({plan_abs})"
+        )
+
+    op_id, _ = _resolve_task_create_operation(
         conn,
-        workspace_id=workspace_id,
+        workspace,
         task_id=task_id,
         plan_doc=plan_doc,
         title=title,
-        owner=owner,
-        branch=branch,
         phase=phase,
-        actor=actor,
-        target=target,
-        payload=payload,
-        idempotency_key=idempotency_key,
+        priority=priority,
+        explicit_operation_id=operation_id,
     )
-    sync_to_checklist(
-        result.workspace,
-        task_id=task_id,
-        title=title or task_id,
-        plan_path=plan_doc,
-        phase=phase,
-    )
+
+    try:
+        files = apply_task_create_files(
+            workspace_path=workspace.path,
+            harness_root=workspace.harness_root,
+            task_id=task_id,
+            plan_doc=plan_doc,
+            title=title,
+            phase=phase,
+            priority=priority,
+            operation_id=op_id,
+            workspace_id=workspace_id,
+        )
+    except SplitOperationError:
+        # File half refused: zero DB writes by construction.
+        raise
+
+    try:
+        record = apply_task_create_record(
+            conn,
+            workspace_id=workspace_id,
+            task_id=task_id,
+            plan_doc=plan_doc,
+            title=title,
+            phase=phase,
+            owner=owner,
+            branch=branch,
+            actor=actor,
+            target=target,
+            payload=payload,
+            idempotency_key=idempotency_key,
+            operation_id=op_id,
+            input_fingerprint=files.input_fingerprint,
+            before_fingerprint=files.before_fingerprint,
+            after_fingerprint=files.after_fingerprint,
+        )
+    except Exception as exc:
+        recovery = TaskCreateRecovery(
+            workspace_id=workspace_id,
+            task_id=task_id,
+            plan_doc=plan_doc,
+            phase=phase,
+            actor=actor,
+            target=target,
+            title=title,
+            owner=owner,
+            branch=branch,
+            payload=payload,
+            idempotency_key=idempotency_key,
+            operation_id=op_id,
+            input_fingerprint=files.input_fingerprint,
+            before_fingerprint=files.before_fingerprint,
+            after_fingerprint=files.after_fingerprint,
+            error_message=str(exc),
+        )
+        raise TaskCreateRecoveryError(
+            f"checklist item committed but the DB record half failed; complete "
+            f"the operation with `task create-record` using the same operation id "
+            f"({op_id})",
+            recovery=recovery,
+        ) from exc
+
     return TaskCreateResult(
-        workspace=result.workspace,
-        task=result.task,
-        event=result.event,
-        event_created=result.event_created,
-        host_aware_warning=(
-            "`task create` writes both DB and mvp-checklist.json. "
-            "For host-aware workflows, use `task create-files` on the coding "
-            "host, commit/deploy, then `task create-record` against the runtime DB."
-        ),
+        workspace=record.workspace,
+        task=record.task,
+        event=record.event,
+        event_created=record.event_created,
+        operation=record.operation,
+        files=files.to_dict(),
     )
 
 
@@ -386,7 +625,15 @@ def create_plan_task_record(
     before_fingerprint: str | None = None,
     after_fingerprint: str | None = None,
 ) -> TaskCreateResult:
-    """Server half of host-aware task create: DB mirror + plan.ready only."""
+    """Server half of host-aware task create: DB mirror + plan.ready only.
+
+    ``operation_id`` + fingerprints select the split-path record half. The
+    no-operation branch is the explicit plan-revision authoring entry (backlog
+    #9c: a revised plan produces a new plan.ready event with a supersede link
+    while preserving split-operation metadata). The combined ``create_plan_task``
+    NEVER calls this branch: combined create is file-first and uses the split
+    half exclusively.
+    """
     if operation_id is not None:
         split_result = apply_task_create_record(
             conn,
@@ -530,98 +777,57 @@ def create_plan_task_files(
     phase: str = "ready",
     priority: str = "p1",
     allow_runtime_copy: bool = False,
-    operation_id: str | None = None,
-    workspace_id: str | None = None,
+    operation_id: str,
+    workspace_id: str,
 ) -> TaskCreateFilesResult:
-    """Coding-host half of host-aware task create: mvp-checklist.json only."""
+    """Coding-host half of host-aware task create: checklist file half only.
+
+    ``operation_id`` and ``workspace_id`` are required by the Python signature
+    (not just argparse): the legacy non-split sync path was removed in U2, so
+    every create-files call binds a split operation.
+    """
     if not task_id:
         raise ValueError("task_id is required for task create-files")
     if not plan_doc:
         raise ValueError("plan_doc is required for task create-files")
+    if not operation_id:
+        raise ValueError("operation_id is required for task create-files")
+    if not workspace_id:
+        raise ValueError("workspace_id is required for task create-files")
 
-    if operation_id is not None:
-        if not workspace_id:
-            raise ValueError("workspace_id is required for split task create-files")
-        workspace = Workspace(
-            id=workspace_id,
-            name=workspace_id,
-            path=str(workspace_path),
-            harness_root=str(harness_root),
-        )
-        _refuse_runtime_copy(workspace, allow_runtime_copy=allow_runtime_copy)
-        split_result = apply_task_create_files(
-            workspace_path=workspace_path,
-            harness_root=harness_root,
-            task_id=task_id,
-            plan_doc=plan_doc,
-            title=title,
-            phase=phase,
-            priority=priority,
-            operation_id=operation_id,
-            workspace_id=workspace_id,
-        )
-        return TaskCreateFilesResult(
-            workspace_id=split_result.workspace_id,
-            workspace_path=split_result.workspace_path,
-            harness_root=split_result.harness_root,
-            task_id=split_result.task_id,
-            plan_doc=split_result.plan_doc,
-            checklist_changed=split_result.checklist_changed,
-            operation_id=split_result.operation_id,
-            operation_kind=split_result.operation_kind,
-            contract_version=split_result.contract_version,
-            input_fingerprint=split_result.input_fingerprint,
-            before_fingerprint=split_result.before_fingerprint,
-            after_fingerprint=split_result.after_fingerprint,
-            files_applied_at=split_result.files_applied_at,
-        )
-
-    # Legacy non-split path: no operation envelope, no workspace binding.
     workspace = Workspace(
-        id="local",
-        name="local",
+        id=workspace_id,
+        name=workspace_id,
         path=str(workspace_path),
         harness_root=str(harness_root),
     )
     _refuse_runtime_copy(workspace, allow_runtime_copy=allow_runtime_copy)
-    plan_abs = _resolve_workspace_path(workspace, plan_doc)
-    if not plan_abs.is_file():
-        raise ValueError(f"plan_doc does not exist: {plan_abs}")
-    changed = sync_to_checklist(
-        workspace,
-        task_id=task_id,
-        title=title or task_id,
-        plan_path=plan_doc,
-        priority=priority,
-        phase=phase,
-    )
-    if not changed and not _checklist_contains_task(Path(harness_root), task_id):
-        raise ValueError(
-            f"mvp-checklist.json not found or task {task_id} could not be synced at "
-            f"{harness_root}; ensure the harness root has a mvp-checklist.json"
-        )
-    return TaskCreateFilesResult(
-        workspace_id="local",
-        workspace_path=str(workspace_path),
-        harness_root=str(harness_root),
+    split_result = apply_task_create_files(
+        workspace_path=workspace_path,
+        harness_root=harness_root,
         task_id=task_id,
         plan_doc=plan_doc,
-        checklist_changed=changed,
+        title=title,
+        phase=phase,
+        priority=priority,
+        operation_id=operation_id,
+        workspace_id=workspace_id,
     )
-
-
-def _checklist_contains_task(harness_root: Path, task_id: str) -> bool:
-    checklist_path = harness_root / "mvp-checklist.json"
-    if not checklist_path.is_file():
-        return False
-    try:
-        checklist = json.loads(checklist_path.read_text(encoding="utf-8"))
-    except (OSError, json.JSONDecodeError):
-        return False
-    items = checklist.get("items")
-    if not isinstance(items, list):
-        return False
-    return any(isinstance(item, dict) and item.get("id") == task_id for item in items)
+    return TaskCreateFilesResult(
+        workspace_id=split_result.workspace_id,
+        workspace_path=split_result.workspace_path,
+        harness_root=split_result.harness_root,
+        task_id=split_result.task_id,
+        plan_doc=split_result.plan_doc,
+        checklist_changed=split_result.checklist_changed,
+        operation_id=split_result.operation_id,
+        operation_kind=split_result.operation_kind,
+        contract_version=split_result.contract_version,
+        input_fingerprint=split_result.input_fingerprint,
+        before_fingerprint=split_result.before_fingerprint,
+        after_fingerprint=split_result.after_fingerprint,
+        files_applied_at=split_result.files_applied_at,
+    )
 
 
 def _refuse_runtime_copy(workspace: Workspace, *, allow_runtime_copy: bool = False) -> None:
@@ -630,57 +836,39 @@ def _refuse_runtime_copy(workspace: Workspace, *, allow_runtime_copy: bool = Fal
     paths = [Path(workspace.path), Path(workspace.harness_root)]
     if any(str(path).startswith("/opt/") or str(path) == "/opt" for path in paths):
         raise ValueError(
-            "task create-files must run against the coding-host git checkout, not "
+            "task create must run against the coding-host git checkout, not "
             "an /opt runtime copy. Use --allow-runtime-copy only for explicit repair."
         )
 
 
-def _checklist_status_for_phase(phase: str) -> str:
-    if phase in {"done", "closed", "released"}:
-        return "done"
-    if phase == "blocked":
-        return "blocked"
-    if phase in {
-        "accepted",
-        "awaiting_operator",
-        "running",
-        "handoff_requested",
-        "review_requested",
-        "ready_for_review",
-        "closeout_requested",
-        "review_approved",
-        "changes_requested",
-        "unblocked",
-    }:
-        return "doing"
-    return "todo"
+def _require_workspace_contained(workspace: Workspace, path: Path, *, label: str) -> None:
+    """Fail closed when *path* resolves outside the workspace path."""
+    ws_root = Path(workspace.path).resolve()
+    try:
+        path.relative_to(ws_root)
+    except ValueError:
+        raise ValueError(
+            f"{label} ({path}) is outside workspace path ({ws_root}); "
+            "refusing to write files outside workspace"
+        ) from None
 
 
-def _workflow_status_for_phase(phase: str) -> str:
-    if phase in {"ready", "planned"}:
-        return "todo"
-    if phase == "done":
-        return "closed"
-    allowed = {
-        "todo",
-        "assigned",
-        "accepted",
-        "awaiting_operator",
-        "running",
-        "handoff_requested",
-        "review_requested",
-        "ready_for_review",
-        "closeout_requested",
-        "review_approved",
-        "changes_requested",
-        "blocked",
-        "unblocked",
-        "released",
-        "closed",
-    }
-    if phase in allowed:
-        return phase
-    return "todo"
+def _require_readable_plan(plan_path: Path) -> None:
+    """Fail closed when the plan doc is missing, not a regular file, or
+    unreadable, using the same classification as the create-time contract."""
+    if not plan_path.is_file():
+        raise SplitOperationError(
+            f"plan_doc does not exist or is not a regular file: {plan_path}",
+            REASON_FILES_NOT_DEPLOYED,
+        )
+    try:
+        with open(plan_path, "rb") as handle:
+            handle.read(1)
+    except OSError as exc:
+        raise SplitOperationError(
+            f"plan_doc cannot be read: {plan_path}: {exc}",
+            REASON_FILES_NOT_DEPLOYED,
+        ) from exc
 
 
 def init_file_harness(
@@ -693,90 +881,102 @@ def init_file_harness(
     title: str | None = None,
     owner: str = "worker",
     status: str = "ready",
+    priority: str = "p1",
     actor: str = "operator",
 ) -> InitHarnessResult:
+    """Minimal file-backed harness init (coordinate-managed profile).
+
+    Creates a validator-passing checklist (new filename by default; a
+    legacy-only existing checklist is treated as compatible and reused), the
+    coordinate-managed config with a workspace-relative event log, the progress/
+    events/pointer files, then creates the initial node through the same
+    ``apply_task_create_files`` -> ``apply_task_create_record`` split path and
+    rebuilds ``harness-state.json`` from the actual checklist with a real
+    source path + digest. The pointer file under ``tasks/<id>/plan.md`` is a
+    pointer only and is never a second canonical plan. Any DB half failure
+    raises the same-operation recovery error; init never fakes success.
+    """
     workspace = get_workspace(conn, workspace_id)
     if workspace is None:
         raise ValueError(f"unknown workspace: {workspace_id}")
+
+    # --- 0. Preflight: every predictable failure before ANY mkdir/copy/
+    # protocol write/workspace upsert/event/DB mutation. The checklist
+    # authority matrix (none/new-only/legacy-only/both; existing candidates
+    # regular + readable + schema-valid) and the create-time phase/priority
+    # contract are all decided here, so a refusal leaves zero mutation.
+    # The minimal harness root may be an external absolute path (formal
+    # contract; operator policy avoids it but the implementation must not
+    # forbid it), so no workspace containment is enforced on it — only the
+    # plan stays workspace-relative/absolute-inside-workspace.
     root_path = _resolve_workspace_path(workspace, root)
-    root_path.mkdir(parents=True, exist_ok=True)
-    (root_path / "tasks" / task_id).mkdir(parents=True, exist_ok=True)
+    plan_path = _resolve_workspace_path(workspace, plan_doc)
+    _require_readable_plan(plan_path)
+    rel_plan = _normalize_plan_doc(workspace, plan_doc)
+    validate_workspace_relative_path(rel_plan)
+    validate_task_create_contract(phase=status, priority=priority)
+    checklist_resolved, checklist_create_new = resolve_checklist_for_init(root_path)
 
     now = utc_now()
     rel_root = _relative_to_workspace(workspace, root_path)
-    rel_plan = _relative_to_workspace(workspace, _resolve_workspace_path(workspace, plan_doc))
-    task_plan_path = root_path / "tasks" / task_id / "plan.md"
-    rel_task_plan = _relative_to_workspace(workspace, task_plan_path)
+    rel_events = f"{rel_root}/events.jsonl"
     display_title = title or task_id
 
-    checklist = {
-        "project": workspace.id,
+    # --- 1. Directories, then the empty checklist through the unified
+    # validator + atomic writer (init is the only entry that may create an
+    # empty checklist, and only in the none case).
+    root_path.mkdir(parents=True, exist_ok=True)
+    (root_path / "tasks" / task_id).mkdir(parents=True, exist_ok=True)
+    if checklist_create_new:
+        create_empty_checklist(
+            root_path, project=workspace.id, harness_root_rel=rel_root
+        )
+
+    # --- 2. progress / events / pointer files (the task plan is a pointer
+    # only; the item's plan_path and artifacts.plan are the real plan doc).
+    progress = (
+        f"# {workspace.id} Harness Progress\n\n"
+        f"## {now}\n\n"
+        f"- Initialized minimal file-backed harness at `{rel_root}`.\n"
+        f"- Current item: `{task_id}`.\n"
+        f"- Source plan: `{rel_plan}`.\n"
+    )
+    task_plan_pointer = (
+        f"# {display_title}\n\n"
+        f"This file is a pointer, not the canonical plan.\n"
+        f"Canonical plan: `{rel_plan}`\n\n"
+        "Do not copy the full plan body into this file. Keep the source plan "
+        "as the single authority.\n"
+    )
+    event_line = {
+        "id": f"evt-{now.replace(':', '').replace('-', '')}-harness-initialized",
+        "type": "harness.initialized",
+        "task_id": task_id,
+        "actor": actor,
+        "created_at": now,
         "harness_root": rel_root,
-        "version": 1,
-        "items": [
-            {
-                "id": task_id,
-                "title": display_title,
-                "status": status,
-                "priority": "high",
-                "owner": owner,
-                "human_gate_required": True,
-                "plan_path": rel_plan,
-                "acceptance": {
-                    "source": f"{rel_plan}#验收标准",
-                    "summary": "Use the phase plan acceptance criteria as the source of truth.",
-                },
-                "workflow": {
-                    "status": status,
-                    "branch": _branch_for(workspace, owner, task_id),
-                    "updated_at": now,
-                },
-                "artifacts": {
-                    "plan": rel_task_plan,
-                    "source_plan": rel_plan,
-                },
-                "review": {
-                    "decision": None,
-                    "human_gate_required": True,
-                },
-            }
-        ],
+        "source_plan": rel_plan,
     }
-    harness_state = {
-        "project": workspace.id,
-        "harness_root": rel_root,
-        "generated_at": now,
-        "current_status": f"{display_title} is ready for worker implementation.",
-        "current_item": checklist["items"][0],
-        "checklist_summary": {status: 1},
-        "workflow_summary": {status: 1},
-        "paths": {
-            "checklist": f"{rel_root}/mvp-checklist.json",
-            "progress": f"{rel_root}/progress.md",
-            "config": f"{rel_root}/harness-config.json",
-            "events": f"{rel_root}/events.jsonl",
-            "current_task_plan": rel_task_plan,
-        },
-        "commands": {},
-        "message_bus": {
-            "event_log": f"{rel_root}/events.jsonl",
-            "visible_bus": "coordinator",
-        },
-        "open_risks": [
-            "No harnessctl runtime is present yet; coordinator can read file state but cannot perform harness mutation lifecycle operations."
-        ],
-        "recent_events": [
-            {
-                "id": f"evt-{now.replace(':', '').replace('-', '')}-harness-initialized",
-                "type": "harness.initialized",
-                "task": task_id,
-                "actor": actor,
-                "status": "initialized",
-            }
-        ],
+    written = {
+        "progress.md": progress,
+        f"tasks/{task_id}/plan.md": task_plan_pointer,
     }
+    for rel_path, content in written.items():
+        path = root_path / rel_path
+        path.parent.mkdir(parents=True, exist_ok=True)
+        if not path.exists():
+            path.write_text(content, encoding="utf-8")
+    events_path = root_path / "events.jsonl"
+    if not events_path.exists():
+        events_path.write_text(
+            json.dumps(event_line, ensure_ascii=False) + "\n", encoding="utf-8"
+        )
+
+    # --- 3. coordinate-managed config with the real workspace-relative events
+    # path (never a bare filename that silently resolves elsewhere).
     harness_config = {
         "project": workspace.id,
+        "deployment_profile": "coordinate-managed",
         "runtime": {
             "session_init_commands": [],
             "lease_ttl_minutes": 120,
@@ -786,47 +986,18 @@ def init_file_harness(
             "branch_namespace": workspace.branch_namespace,
         },
         "message_bus": {
-            "event_log": "events.jsonl",
+            "event_log": rel_events,
+            "visible_bus": "coordinator",
         },
     }
-    progress = (
-        f"# {workspace.id} Harness Progress\n\n"
-        f"## {now}\n\n"
-        f"- Initialized minimal file-backed harness at `{rel_root}`.\n"
-        f"- Current item: `{task_id}`.\n"
-        f"- Source plan: `{rel_plan}`.\n"
-    )
-    task_plan = (
-        f"# {display_title}\n\n"
-        f"Canonical plan: `{rel_plan}`\n\n"
-        "Do not copy the full plan body into this task file. Keep the phase plan as the source of truth.\n"
-    )
-    event_line = {
-        "id": harness_state["recent_events"][0]["id"],
-        "type": "harness.initialized",
-        "task_id": task_id,
-        "actor": actor,
-        "created_at": now,
-        "harness_root": rel_root,
-        "source_plan": rel_plan,
-    }
+    config_path = root_path / "harness-config.json"
+    if not config_path.exists():
+        config_path.write_text(
+            json.dumps(harness_config, ensure_ascii=False, indent=2) + "\n",
+            encoding="utf-8",
+        )
 
-    written = {
-        "mvp-checklist.json": json.dumps(checklist, ensure_ascii=False, indent=2) + "\n",
-        "harness-state.json": json.dumps(harness_state, ensure_ascii=False, indent=2) + "\n",
-        "harness-config.json": json.dumps(harness_config, ensure_ascii=False, indent=2) + "\n",
-        "progress.md": progress,
-        f"tasks/{task_id}/plan.md": task_plan,
-    }
-    for rel_path, content in written.items():
-        path = root_path / rel_path
-        path.parent.mkdir(parents=True, exist_ok=True)
-        if not path.exists():
-            path.write_text(content, encoding="utf-8")
-    events_path = root_path / "events.jsonl"
-    if not events_path.exists():
-        events_path.write_text(json.dumps(event_line, ensure_ascii=False) + "\n", encoding="utf-8")
-
+    # --- 4. register the workspace against the target harness root.
     updated_workspace = upsert_workspace(
         conn,
         workspace_id=workspace.id,
@@ -839,19 +1010,113 @@ def init_file_harness(
         base_branch=workspace.base_branch,
         branch_namespace=workspace.branch_namespace,
     )
-    task_result = create_plan_task(
-        conn,
-        workspace_id=workspace.id,
-        task_id=task_id,
-        plan_doc=rel_plan,
-        title=display_title,
-        owner=owner,
-        branch=_branch_for(updated_workspace, owner, task_id),
-        phase=status,
-        actor=actor,
-        payload={"harness_root": rel_root, "human_gate_required": True},
-        idempotency_key=f"{workspace.id}:{task_id}:plan.ready",
+
+    # --- 5. initial node through the split path (file first, record second).
+    operation_id = str(uuid.uuid4())
+    try:
+        files_result = apply_task_create_files(
+            workspace_path=workspace.path,
+            harness_root=str(root_path),
+            task_id=task_id,
+            plan_doc=rel_plan,
+            title=display_title,
+            phase=status,
+            priority=priority,
+            operation_id=operation_id,
+            workspace_id=workspace.id,
+        )
+        record_result = apply_task_create_record(
+            conn,
+            workspace_id=workspace.id,
+            task_id=task_id,
+            plan_doc=rel_plan,
+            title=display_title,
+            phase=status,
+            owner=owner,
+            branch=_branch_for(updated_workspace, owner, task_id),
+            actor=actor,
+            target="worker",
+            payload={"harness_root": rel_root, "human_gate_required": True},
+            operation_id=operation_id,
+            input_fingerprint=files_result.input_fingerprint,
+            before_fingerprint=files_result.before_fingerprint,
+            after_fingerprint=files_result.after_fingerprint,
+            idempotency_key=f"{workspace.id}:{task_id}:plan.ready",
+        )
+    except SplitOperationError:
+        raise  # file half refused: zero DB writes; init aborts cleanly.
+    except Exception as exc:
+        recovery = TaskCreateRecovery(
+            workspace_id=workspace.id,
+            task_id=task_id,
+            plan_doc=rel_plan,
+            phase=status,
+            actor=actor,
+            target="worker",
+            title=display_title,
+            owner=owner,
+            branch=_branch_for(updated_workspace, owner, task_id),
+            payload={"harness_root": rel_root, "human_gate_required": True},
+            idempotency_key=f"{workspace.id}:{task_id}:plan.ready",
+            operation_id=operation_id,
+            input_fingerprint=files_result.input_fingerprint,
+            before_fingerprint=files_result.before_fingerprint,
+            after_fingerprint=files_result.after_fingerprint,
+            error_message=str(exc),
+        )
+        raise TaskCreateRecoveryError(
+            f"init wrote the checklist node but the DB record half failed; "
+            f"complete the operation with `task create-record` using operation "
+            f"id {operation_id}",
+            recovery=recovery,
+        ) from exc
+
+    # --- 6. rebuild state from the ACTUAL checklist with source path + digest.
+    resolved = resolve_checklist(root_path, purpose="read")
+    checklist_raw = resolved.path.read_bytes()
+    checklist_data = json.loads(checklist_raw.decode("utf-8"))
+    checklist_items = checklist_data.get("items")
+    current_item = None
+    if isinstance(checklist_items, list):
+        for item in checklist_items:
+            if isinstance(item, dict) and item.get("id") == task_id:
+                current_item = item
+                break
+    rel_checklist = _relative_to_workspace(workspace, resolved.path)
+    harness_state = {
+        "project": workspace.id,
+        "harness_root": rel_root,
+        "generated_at": now,
+        "source": {
+            "checklist_path": rel_checklist,
+            "checklist_sha256": sha256_bytes(checklist_raw),
+        },
+        "current_status": f"{display_title} is ready for worker implementation.",
+        "current_item": current_item,
+        "checklist_summary": {"todo": 1},
+        "workflow_summary": {"todo": 1},
+        "paths": {
+            "checklist": rel_checklist,
+            "progress": f"{rel_root}/progress.md",
+            "config": f"{rel_root}/harness-config.json",
+            "events": rel_events,
+            "current_task_plan": f"{rel_root}/tasks/{task_id}/plan.md",
+        },
+        "commands": {},
+        "message_bus": {
+            "event_log": rel_events,
+            "visible_bus": "coordinator",
+        },
+        "open_risks": [
+            "No harnessctl runtime is present yet; coordinator can read file state but cannot perform harness mutation lifecycle operations."
+        ],
+        "recent_events": [event_line],
+    }
+    (root_path / "harness-state.json").write_text(
+        json.dumps(harness_state, ensure_ascii=False, indent=2) + "\n",
+        encoding="utf-8",
     )
+
     event_result = append_event(
         conn,
         workspace_id=workspace.id,
@@ -865,7 +1130,7 @@ def init_file_harness(
             "harness_root": str(root_path),
             "harness_root_relative": rel_root,
             "source_plan": rel_plan,
-            "initialized_files": sorted([*written.keys(), "events.jsonl"]),
+            "initialized_files": sorted([*written.keys(), "events.jsonl", "harness-state.json", "harness-config.json"]),
             "human_gate_required": True,
         },
     )
@@ -873,10 +1138,18 @@ def init_file_harness(
     return InitHarnessResult(
         workspace=updated_workspace,
         harness_root=str(root_path),
-        files=sorted([str(root_path / p) for p in [*written.keys(), "events.jsonl"]]),
+        files=sorted([
+            str(root_path / p)
+            for p in [
+                *written.keys(),
+                "events.jsonl",
+                "harness-state.json",
+                "harness-config.json",
+            ]
+        ]),
         event=row_to_dict(event_result.row),
         event_created=event_result.created,
-        task=task_result.task,
+        task=record_result.task,
     )
 
 
@@ -951,6 +1224,291 @@ PROTOCOL_TEMPLATES = {
 }
 
 
+# ---------------------------------------------------------------------------
+# Full-init runtime source contract (P1-3)
+# ---------------------------------------------------------------------------
+# ``init_full_harness`` copies a runtime into ``scripts/harness``. The only
+# approved source is the U1 long-running-project-harness template, which
+# instantiates exactly these four placeholders; an already-rendered runtime is
+# accepted only when its embedded root/layout can be proven to match the
+# target. Everything unprovable fails closed before the first mutation.
+RUNTIME_TEMPLATE_PLACEHOLDERS = frozenset({
+    "{{HARNESS_ROOT}}",
+    "{{PROJECT_ROOT_DEPTH}}",
+    "{{SCRIPTS_DIR}}",
+    "{{PROJECT_NAME}}",
+})
+# Any {{...}} shape (not just {{UPPER_}}) counts as an unrendered
+# placeholder: {{lowercase}} and {{MIXED-NAME}} must enter template/render
+# validation and fail closed as residuals instead of being copied verbatim.
+_PLACEHOLDER_RE = re.compile(r"\{\{.*?\}\}", re.DOTALL)
+# Files required to run ``harnessctl validate`` / ``harnessctl state``.
+_RUNTIME_KEY_FILES = (
+    "harnessctl",
+    "harness_common.py",
+    "validate_checklist.py",
+    "build_harness_state.py",
+)
+# Files that embed the harness root locator / script depth once rendered.
+_RUNTIME_ROOT_CARRIER_FILES = frozenset({"harness_common.py", "harnessctl"})
+_HARNESS_ROOT_LOCATOR_RE = re.compile(r'return project_root\(\) / "([^"]+)"')
+_HARNESSCTL_ROOT_LOCATOR_RE = re.compile(r'HARNESS_ROOT="\$root/([^"]+)"')
+_PROJECT_ROOT_DEPTH_RE = re.compile(r"parents\[([0-9]+)\]")
+
+REASON_RUNTIME_SOURCE_INCOMPLETE = "runtime_source_incomplete"
+REASON_RUNTIME_TEMPLATE_PLACEHOLDER = "runtime_template_placeholder"
+REASON_RUNTIME_ROOT_INCOMPATIBLE = "runtime_root_incompatible"
+REASON_RUNTIME_DESTINATION_MISMATCH = "runtime_destination_mismatch"
+
+
+class RuntimeSourceError(ValueError):
+    """Full-init runtime source/destination preflight failure.
+
+    Raised before any file/DB/event mutation; ``reason`` is a stable
+    machine-readable classification.
+    """
+
+    def __init__(self, message: str, reason: str) -> None:
+        super().__init__(message)
+        self.reason = reason
+
+
+_TEMPLATE_SOURCE_HINT = (
+    "use the U1 template source (files containing {{HARNESS_ROOT}}, "
+    "{{PROJECT_ROOT_DEPTH}}, {{SCRIPTS_DIR}}, {{PROJECT_NAME}}) instead of a "
+    "hand-rendered runtime"
+)
+_DESTINATION_HINT = (
+    "refresh/clean the target workspace explicitly (or use the U1 template "
+    "source) before re-running full init"
+)
+
+
+def _extract_single_embedding(
+    pattern: re.Pattern[str],
+    body: str,
+    *,
+    file_name: str,
+    what: str,
+    hint: str,
+) -> str:
+    matches = list(pattern.finditer(body))
+    if len(matches) != 1:
+        raise RuntimeSourceError(
+            f"cannot prove runtime root/layout compatibility: expected exactly "
+            f"one {what} in {file_name}, found {len(matches)}; {hint}",
+            REASON_RUNTIME_ROOT_INCOMPATIBLE,
+        )
+    return matches[0].group(1)
+
+
+def _prove_rendered_root_carrier(
+    file_name: str,
+    body: str,
+    *,
+    harness_root_locator: str,
+    target_depth: int,
+    hint: str,
+) -> None:
+    """Prove a placeholder-free root-carrier file resolves the target root.
+
+    ``harness_common.py`` must embed exactly one harness root locator and one
+    script depth; ``harnessctl`` exactly one locator. Both must equal the
+    target, otherwise the copied runtime would resolve a different harness
+    root and ``harnessctl validate/state`` would fail — never guess-rewrite
+    the embedded string.
+    """
+    if file_name == "harness_common.py":
+        locator = _extract_single_embedding(
+            _HARNESS_ROOT_LOCATOR_RE,
+            body,
+            file_name=file_name,
+            what="harness root locator (`return project_root() / \"...\"`)",
+            hint=hint,
+        )
+        depth = _extract_single_embedding(
+            _PROJECT_ROOT_DEPTH_RE,
+            body,
+            file_name=file_name,
+            what="project root depth (`parents[N]`)",
+            hint=hint,
+        )
+        if depth != str(target_depth):
+            raise RuntimeSourceError(
+                f"already-rendered runtime {file_name} embeds script depth "
+                f"{depth!r}, but the target layout requires depth "
+                f"{target_depth} (scripts live under scripts/harness); {hint}",
+                REASON_RUNTIME_ROOT_INCOMPATIBLE,
+            )
+    else:  # harnessctl
+        locator = _extract_single_embedding(
+            _HARNESSCTL_ROOT_LOCATOR_RE,
+            body,
+            file_name=file_name,
+            what="harness root locator (`HARNESS_ROOT=\"$root/...\"`)",
+            hint=hint,
+        )
+    if locator != harness_root_locator:
+        raise RuntimeSourceError(
+            f"already-rendered runtime {file_name} embeds harness root "
+            f"{locator!r}, which does not match the target harness root "
+            f"{harness_root_locator!r}; {hint}",
+            REASON_RUNTIME_ROOT_INCOMPATIBLE,
+        )
+
+
+def _render_template_body(
+    file_name: str,
+    body: str,
+    *,
+    harness_root_locator: str,
+    scripts_dir: str,
+    project_name: str,
+    target_depth: int,
+) -> bytes:
+    rendered = (
+        body.replace("{{HARNESS_ROOT}}", harness_root_locator)
+        .replace("{{PROJECT_ROOT_DEPTH}}", str(target_depth))
+        .replace("{{SCRIPTS_DIR}}", scripts_dir)
+        .replace("{{PROJECT_NAME}}", project_name)
+    )
+    residual = _PLACEHOLDER_RE.search(rendered)
+    if residual is not None:
+        raise RuntimeSourceError(
+            f"runtime template source {file_name} contains unknown/residual "
+            f"placeholder {residual.group(0)!r} after rendering; only the four "
+            f"U1 placeholders ({', '.join(sorted(RUNTIME_TEMPLATE_PLACEHOLDERS))}) "
+            "may be consumed",
+            REASON_RUNTIME_TEMPLATE_PLACEHOLDER,
+        )
+    return rendered.encode("utf-8")
+
+
+def _preflight_runtime_source(
+    source_path: Path,
+    *,
+    harness_root_locator: str,
+    scripts_dir: str,
+    project_name: str,
+    target_depth: int,
+) -> dict[str, bytes]:
+    """Render/validate the full-init runtime source entirely in memory.
+
+    Returns ``{filename: bytes}`` that must end up under ``scripts/harness``.
+    Files containing ``{{...}}`` placeholders are rendered with the four U1
+    placeholders; placeholder-free root-carrier files (``harness_common.py`` /
+    ``harnessctl``) must prove they embed the target root/layout; the key
+    files required by ``harnessctl validate`` / ``harnessctl state`` must
+    exist. Every failure raises before any mutation.
+    """
+    raw: dict[str, bytes] = {}
+    for entry in sorted(source_path.iterdir()):
+        if entry.is_file():
+            raw[entry.name] = entry.read_bytes()
+    missing = [name for name in _RUNTIME_KEY_FILES if name not in raw]
+    if missing:
+        raise RuntimeSourceError(
+            f"runtime source {source_path} is missing key runtime file(s) "
+            f"required by `harnessctl validate` / `harnessctl state`: "
+            f"{', '.join(missing)}. Refusing to claim success over an "
+            "incomplete runtime.",
+            REASON_RUNTIME_SOURCE_INCOMPLETE,
+        )
+    rendered: dict[str, bytes] = {}
+    for name, data in sorted(raw.items()):
+        body = data.decode("utf-8", errors="replace")
+        if _PLACEHOLDER_RE.search(body) is not None:
+            rendered[name] = _render_template_body(
+                name,
+                body,
+                harness_root_locator=harness_root_locator,
+                scripts_dir=scripts_dir,
+                project_name=project_name,
+                target_depth=target_depth,
+            )
+        else:
+            if name in _RUNTIME_ROOT_CARRIER_FILES:
+                _prove_rendered_root_carrier(
+                    name,
+                    body,
+                    harness_root_locator=harness_root_locator,
+                    target_depth=target_depth,
+                    hint=_TEMPLATE_SOURCE_HINT,
+                )
+            rendered[name] = data
+    return rendered
+
+
+def _preflight_existing_runtime_destination(
+    ws_root: Path,
+    runtime_files: dict[str, bytes],
+    *,
+    harness_root_locator: str,
+    target_depth: int,
+) -> None:
+    """Prove every existing destination collision is this init's own runtime.
+
+    For every file this init would place under ``scripts/harness`` that
+    already exists at the destination, the uniform proof is exact byte
+    equality with the rendered bytes: a collision must be a readable regular
+    file, contain no residual ``{{...}}``, and be byte-identical to what this
+    init would render. Anything else cannot be proven to be the same runtime
+    and fails closed before any protocol/checklist/DB mutation — the file is
+    never silently kept and never blindly overwritten. Root-carrier files get
+    a more specific diagnostic when they differ, but byte equality is the
+    only proof that matters.
+    """
+    for name in sorted(runtime_files):
+        dst = ws_root / "scripts" / "harness" / name
+        if not os.path.lexists(dst):
+            continue
+        # The collision itself must be a regular file: lstat (never is_file,
+        # which follows links) rejects live AND dangling symlinks, so an
+        # identical-bytes symlink cannot smuggle a second authority past the
+        # byte-equality proof.
+        try:
+            mode = dst.lstat().st_mode
+        except OSError as exc:
+            raise RuntimeSourceError(
+                f"existing runtime destination {dst} cannot be inspected: {exc}; "
+                f"cannot prove it is the same runtime; {_DESTINATION_HINT}",
+                REASON_RUNTIME_ROOT_INCOMPATIBLE,
+            ) from exc
+        if not stat.S_ISREG(mode):
+            raise RuntimeSourceError(
+                f"existing runtime destination {dst} is not a regular file "
+                f"(directory, symlink, or other entry); cannot prove "
+                f"it is the same runtime; {_DESTINATION_HINT}",
+                REASON_RUNTIME_ROOT_INCOMPATIBLE,
+            )
+        existing = dst.read_bytes()
+        text = existing.decode("utf-8", errors="replace")
+        if _PLACEHOLDER_RE.search(text) is not None:
+            raise RuntimeSourceError(
+                f"existing runtime destination {dst} still contains "
+                f"{{{{...}}}} placeholders (unrendered template); cannot prove "
+                f"it is the same runtime; {_DESTINATION_HINT}",
+                REASON_RUNTIME_TEMPLATE_PLACEHOLDER,
+            )
+        if existing != runtime_files[name]:
+            # Give the most specific diagnosable reason when the collision is
+            # a root-carrier; otherwise the uniform proof fails closed.
+            if name in _RUNTIME_ROOT_CARRIER_FILES:
+                _prove_rendered_root_carrier(
+                    name,
+                    text,
+                    harness_root_locator=harness_root_locator,
+                    target_depth=target_depth,
+                    hint=_DESTINATION_HINT,
+                )
+            raise RuntimeSourceError(
+                f"existing runtime destination {dst} differs from the runtime "
+                f"this init would render; cannot prove it is the same "
+                f"runtime; {_DESTINATION_HINT}",
+                REASON_RUNTIME_DESTINATION_MISMATCH,
+            )
+
+
 def init_full_harness(
     conn: sqlite3.Connection,
     *,
@@ -959,6 +1517,17 @@ def init_full_harness(
     dry_run: bool = False,
     actor: str = "operator",
 ) -> FullInitResult:
+    """Full harness init: render/copy a U1 runtime under ``scripts/harness``.
+
+    The source must be either the U1 template (files containing the four
+    placeholders ``{{HARNESS_ROOT}}`` / ``{{PROJECT_ROOT_DEPTH}}`` /
+    ``{{SCRIPTS_DIR}}`` / ``{{PROJECT_NAME}}``, rendered in memory against the
+    registered harness root) or an already-rendered runtime whose embedded
+    root/layout provably matches the target. Unknown/residual placeholders,
+    unprovable rendered sources, missing key runtime files, and incompatible
+    existing destinations all fail closed before any file/DB/event mutation;
+    dry-run runs the same compatibility preflight without writing.
+    """
     workspace = get_workspace(conn, workspace_id)
     if workspace is None:
         raise ValueError(f"unknown workspace: {workspace_id}")
@@ -967,19 +1536,38 @@ def init_full_harness(
     if not source_path.is_dir():
         raise ValueError(f"source directory does not exist: {source_path}")
 
-    # Validate source is within workspace to prevent path traversal
+    # source can be external (e.g. another workspace), but the target harness
+    # root must be inside the workspace.
     ws_root = Path(workspace.path).resolve()
-    # source can be external (e.g. another workspace), but target must be inside workspace
     hr_path = Path(workspace.harness_root).resolve()
+    _require_workspace_contained(workspace, hr_path, label="harness_root")
 
-    # Security: ensure harness_root is within workspace
-    try:
-        hr_path.relative_to(ws_root)
-    except ValueError:
-        raise ValueError(
-            f"harness_root ({hr_path}) is outside workspace path ({ws_root}); "
-            "refusing to write files outside workspace"
-        )
+    # Preflight the checklist authority BEFORE copying any runtime/protocol
+    # file or touching the DB: dual authority or a non-regular candidate must
+    # leave the workspace and DB completely untouched.
+    checklist_resolved, checklist_create_new = resolve_checklist_for_init(hr_path)
+
+    # P1-3: preflight the runtime source and the existing destination before
+    # any mutation. Template sources are rendered in memory here; anything
+    # that cannot be proven compatible with the target root/layout fails
+    # closed (no guessing, no second root config).
+    scripts_dir = "scripts/harness"
+    target_depth = len(Path(scripts_dir).parts)
+    # POSIX locator per the U1 placeholder contract (never os-native slashes).
+    harness_root_locator = hr_path.relative_to(ws_root).as_posix()
+    runtime_files = _preflight_runtime_source(
+        source_path,
+        harness_root_locator=harness_root_locator,
+        scripts_dir=scripts_dir,
+        project_name=workspace.id,
+        target_depth=target_depth,
+    )
+    _preflight_existing_runtime_destination(
+        ws_root,
+        runtime_files,
+        harness_root_locator=harness_root_locator,
+        target_depth=target_depth,
+    )
 
     scripts_copied: list[str] = []
     scripts_existing: list[str] = []
@@ -987,30 +1575,25 @@ def init_full_harness(
     files_existing: list[str] = []
     warnings: list[str] = []
 
-    # 1. Copy scripts/harness/ runtime from source
-    source_files = sorted(source_path.iterdir()) if source_path.is_dir() else []
-    harness_scripts = [f for f in source_files if f.is_file()]
-
-    if not harness_scripts:
-        warnings.append(f"no files found in source directory: {source_path}")
-
-    for src_file in harness_scripts:
-        rel_script = f"scripts/harness/{src_file.name}"
+    # 1. Copy/render scripts/harness/ runtime from source (rendered above).
+    for name in sorted(runtime_files):
+        rel_script = f"{scripts_dir}/{name}"
         dst = ws_root / rel_script
         if dst.exists():
             scripts_existing.append(rel_script)
             continue
-        # Security: verify destination is within workspace
+        # Security: verify destination is within workspace (a dangling symlink
+        # or odd pre-existing entry must not redirect writes outside).
         try:
             dst.resolve().relative_to(ws_root)
         except ValueError:
-            warnings.append(f"skipped {src_file.name}: destination outside workspace")
+            warnings.append(f"skipped {name}: destination outside workspace")
             continue
         if not dry_run:
             dst.parent.mkdir(parents=True, exist_ok=True)
-            shutil.copy2(src_file, dst)
+            dst.write_bytes(runtime_files[name])
             # Ensure executable for script files
-            if src_file.suffix in ("", ".sh", ".py"):
+            if Path(name).suffix in ("", ".sh", ".py"):
                 dst.chmod(dst.stat().st_mode | stat.S_IXUSR | stat.S_IXGRP | stat.S_IXOTH)
         scripts_copied.append(rel_script)
 
@@ -1031,9 +1614,19 @@ def init_full_harness(
             fpath.write_text(content, encoding="utf-8")
         files_created.append(str(fpath))
 
-    # 4. Ensure minimal harness files exist (harness-config.json, mvp-checklist.json,
-    #    events.jsonl, progress.md) — create empty/stub versions if missing
-    _ensure_minimal_files(hr_path, project, dry_run, files_created, files_existing, warnings)
+    # 4. Ensure minimal harness files exist (harness-config.json, checklist,
+    #    events.jsonl, progress.md) — create validator-passing versions if missing
+    _ensure_minimal_files(
+        hr_path,
+        ws_root,
+        project,
+        dry_run,
+        files_created,
+        files_existing,
+        warnings,
+        resolved_checklist=checklist_resolved,
+        create_new=checklist_create_new,
+    )
 
     # 5. Update workspace harnessctl_path if scripts/harness/harnessctl was created
     harnessctl_updated = False
@@ -1093,65 +1686,138 @@ def init_full_harness(
 
 def _ensure_minimal_files(
     hr_path: Path,
+    workspace_path: Path,
     project: str,
     dry_run: bool,
     files_created: list[str],
     files_existing: list[str],
     warnings: list[str],
+    resolved_checklist: ResolvedChecklist,
+    create_new: bool,
 ) -> None:
-    """Create stub versions of minimal harness files if they don't exist."""
+    """Create validator-passing minimal harness files if they don't exist.
+
+    The checklist authority decision (none/new-only/legacy-only/both; existing
+    candidates regular + readable + schema-valid) was already made by
+    ``checklist_io.resolve_checklist_for_init`` before any mutation; this
+    function only materializes the decision. New projects get the new
+    checklist filename through the unified validator + atomic writer; a
+    legacy-only existing checklist is treated as existing compatible (no
+    competing new file is created). The config pins
+    ``deployment_profile=coordinate-managed`` and a workspace-relative event
+    log, and the state stub carries the real checklist path + digest so it is
+    never a source-less cache.
+    """
+    try:
+        rel_hr = str(hr_path.resolve().relative_to(workspace_path.resolve()))
+    except ValueError:
+        rel_hr = str(hr_path.resolve())
+    rel_events = f"{rel_hr}/events.jsonl"
+
     stubs: dict[str, str] = {}
+    existing_names: list[str] = []
 
     # harness-config.json
     config_path = hr_path / "harness-config.json"
     if not config_path.exists():
         stubs["harness-config.json"] = json.dumps({
             "project": project,
+            "deployment_profile": "coordinate-managed",
             "runtime": {
                 "session_init_commands": [],
                 "lease_ttl_minutes": 120,
             },
             "git": {},
-            "message_bus": {"event_log": "events.jsonl"},
+            "message_bus": {"event_log": rel_events},
         }, indent=2) + "\n"
+    else:
+        existing_names.append("harness-config.json")
 
-    # mvp-checklist.json
-    checklist_path = hr_path / "mvp-checklist.json"
-    if not checklist_path.exists():
-        stubs["mvp-checklist.json"] = json.dumps({
+    # Checklist: the authority decision came from the checklist_io init
+    # boundary. Only the none case creates a new checklist — through the
+    # unified validator + atomic writer, and its bytes feed the state digest
+    # below (never a lookalike prediction).
+    if create_new:
+        checklist_updated_at = utc_now().split("T")[0]
+        checklist_body = json.dumps({
             "project": project,
-            "harness_root": str(hr_path),
+            "harness_root": rel_hr,
             "version": 1,
+            "updated_at": checklist_updated_at,
             "items": [],
-        }, indent=2) + "\n"
+        }, ensure_ascii=False, indent=2) + "\n"
+        if not dry_run:
+            create_empty_checklist(
+                hr_path,
+                project=project,
+                harness_root_rel=rel_hr,
+                updated_at=checklist_updated_at,
+            )
+        files_created.append(str(resolved_checklist.path))
+    else:
+        existing_names.append(resolved_checklist.path.name)
+        if resolved_checklist.kind == "legacy":
+            warnings.append(
+                f"legacy {CHECKLIST_LEGACY_NAME} found; treating as existing "
+                "compatible checklist (no new file created)"
+            )
 
     # events.jsonl
     events_path = hr_path / "events.jsonl"
     if not events_path.exists():
         stubs["events.jsonl"] = ""
+    else:
+        existing_names.append("events.jsonl")
 
     # progress.md
     progress_path = hr_path / "progress.md"
     if not progress_path.exists():
-        stubs["progress.md"] = f"# {project} Harness Progress\n\nInitialized by coordinator full harness init.\n"
+        stubs["progress.md"] = (
+            f"# {project} Harness Progress\n\n"
+            "Initialized by coordinator full harness init.\n"
+        )
+    else:
+        existing_names.append("progress.md")
 
-    # harness-state.json
+    # harness-state.json — must carry the real checklist path + digest, so it
+    # is written after the checklist stub (source is never a lookalike cache).
     state_path = hr_path / "harness-state.json"
     if not state_path.exists():
+        if create_new:
+            checklist_bytes = checklist_body.encode("utf-8")
+        else:
+            try:
+                checklist_bytes = resolved_checklist.path.read_bytes()
+            except OSError:
+                checklist_bytes = b""
+        rel_checklist = (
+            f"{rel_hr}/{resolved_checklist.path.name}"
+        )
         stubs["harness-state.json"] = json.dumps({
             "project": project,
-            "harness_root": str(hr_path),
+            "harness_root": rel_hr,
             "generated_at": utc_now(),
+            "source": {
+                "checklist_path": rel_checklist,
+                "checklist_sha256": sha256_bytes(checklist_bytes),
+            },
             "current_status": "",
             "current_item": None,
             "checklist_summary": {"todo": 0, "doing": 0, "done": 0, "blocked": 0},
             "workflow_summary": {"closed": 0, "running": 0},
-            "paths": {},
+            "paths": {
+                "checklist": rel_checklist,
+                "events": rel_events,
+                "config": f"{rel_hr}/harness-config.json",
+                "progress": f"{rel_hr}/progress.md",
+            },
             "commands": {},
-            "message_bus": {"event_log": "events.jsonl"},
+            "message_bus": {"event_log": rel_events},
             "open_risks": [],
             "recent_events": [],
         }, indent=2) + "\n"
+    else:
+        existing_names.append("harness-state.json")
 
     for fname, content in stubs.items():
         fpath = hr_path / fname
@@ -1160,9 +1826,7 @@ def _ensure_minimal_files(
             fpath.write_text(content, encoding="utf-8")
         files_created.append(str(fpath))
 
-    # Track existing files
-    for fname in ["harness-config.json", "mvp-checklist.json", "events.jsonl",
-                   "progress.md", "harness-state.json"]:
+    for fname in existing_names:
         fpath = hr_path / fname
         if fpath.exists() and fname not in stubs:
             files_existing.append(str(fpath))

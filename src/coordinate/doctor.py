@@ -13,6 +13,11 @@ from pathlib import Path
 from typing import Any
 
 from .db import Workspace
+from .checklist_io import (
+    CHECKLIST_LEGACY_NAME,
+    CHECKLIST_NEW_NAME,
+    checklist_candidates,
+)
 from .harness import HarnessAdapter
 from .projection_doctor import diagnose_projections, ProjectionReport
 
@@ -73,7 +78,6 @@ class DoctorReport:
 
 REQUIRED_HARNESS_FILES = [
     "harness-config.json",
-    "mvp-checklist.json",
     "events.jsonl",
     "harness-state.json",
     "progress.md",
@@ -85,6 +89,25 @@ OPTIONAL_HARNESS_FILES = [
     "domain-model.md",
     "runbook.md",
 ]
+
+
+def _checklist_file_check(hr_path: Path) -> tuple[bool, str]:
+    """Return (exists, label) for the single active checklist under *hr_path*.
+
+    Uses the resolver matrix: new-only/legacy-only are present; dual authority
+    is present but reported as a warning by the caller; none is absent. The
+    label is the actual filename when it exists, else the new default name.
+    """
+    candidates = checklist_candidates(hr_path)
+    has_new = candidates["new"].is_file()
+    has_legacy = candidates["legacy"].is_file()
+    if has_new and has_legacy:
+        return True, CHECKLIST_NEW_NAME
+    if has_new:
+        return True, CHECKLIST_NEW_NAME
+    if has_legacy:
+        return True, CHECKLIST_LEGACY_NAME
+    return False, CHECKLIST_NEW_NAME
 
 
 def diagnose_workspace(
@@ -141,11 +164,15 @@ def diagnose_workspace(
     for fname in REQUIRED_HARNESS_FILES:
         fpath = hr_path / fname
         file_checks.append(FileCheck(path=str(fpath), exists=fpath.is_file()))
+    checklist_exists, checklist_label = _checklist_file_check(hr_path)
+    file_checks.append(
+        FileCheck(path=str(hr_path / checklist_label), exists=checklist_exists)
+    )
     for fname in OPTIONAL_HARNESS_FILES:
         fpath = hr_path / fname
         file_checks.append(FileCheck(path=str(fpath), exists=fpath.is_file()))
 
-    all_required = all(f.exists for f in file_checks[:len(REQUIRED_HARNESS_FILES)])
+    all_required = all(f.exists for f in file_checks[:len(REQUIRED_HARNESS_FILES) + 1])
 
     if not hr_exists or not all_required:
         mode = "minimal_file_backed" if hr_exists else "none"
@@ -159,20 +186,27 @@ def diagnose_workspace(
                 "run chmod +x or rely on bash fallback"
             )
 
-    # Checklist validation
+    # Checklist validation (via the resolver: never a hardcoded filename)
     checklist_valid: bool | None = None
-    checklist_path = hr_path / "mvp-checklist.json"
-    if checklist_path.is_file():
+    candidates = checklist_candidates(hr_path)
+    if candidates["new"].is_file() and candidates["legacy"].is_file():
+        warnings.append(
+            f"dual checklist authority under {hr_path}: both "
+            f"{CHECKLIST_NEW_NAME} and {CHECKLIST_LEGACY_NAME} exist; keep "
+            "exactly one authority before mutating"
+        )
+    if checklist_exists:
+        checklist_path = hr_path / checklist_label
         try:
             raw = checklist_path.read_text(encoding="utf-8")
             data = json.loads(raw)
             items = data.get("items", [])
             checklist_valid = isinstance(items, list)
             if not checklist_valid:
-                warnings.append("mvp-checklist.json has invalid structure: items is not a list")
+                warnings.append(f"{checklist_label} has invalid structure: items is not a list")
         except (json.JSONDecodeError, UnicodeDecodeError) as exc:
             checklist_valid = False
-            warnings.append(f"mvp-checklist.json is invalid: {exc}")
+            warnings.append(f"{checklist_label} is invalid: {exc}")
 
     # harnessctl health checks
     harnessctl_version_ok: bool | None = None

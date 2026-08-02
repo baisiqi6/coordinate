@@ -125,7 +125,7 @@ def register_completion_commands(assignment_subcommands) -> None:
         "mark-done-files",
         help=(
             "Coding-host half of host-aware mark-done. Writes local "
-            "mvp-checklist.json only. Normal path requires --receipt and a "
+            "checklist file half only. Normal path requires --receipt and a "
             "remote coord CLI (--event-cli-path) to verify/claim the receipt "
             "online before any file mutation. --repair-reason selects the "
             "explicit repair-only path."

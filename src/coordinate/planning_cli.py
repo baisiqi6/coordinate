@@ -10,12 +10,14 @@ from .cli_support import open_connection, print_json
 from .db import append_event, list_events, row_to_dict
 from .handoff import prepare_handoff
 from .onboarding import (
+    TaskCreateRecoveryError,
     create_plan_task,
     create_plan_task_files,
     create_plan_task_record,
 )
 from .operator import list_pending_actions, pending_snapshot_metadata
 from .plan_gate import approve_plan, reject_plan, review_request_plan
+from .split_operations import SplitOperationError
 
 
 # Compatibility aliases so handlers read like the originals.
@@ -65,21 +67,38 @@ def handle_task_create(args: argparse.Namespace) -> int:
     if not isinstance(payload, dict):
         print("error: --payload-json must decode to an object", file=sys.stderr)
         return 1
-    with _conn(args) as conn:
-        result = create_plan_task(
-            conn,
-            workspace_id=args.workspace_id,
-            task_id=args.task_id,
-            plan_doc=args.plan_doc,
-            title=args.title,
-            owner=args.owner,
-            branch=args.branch,
-            phase=args.phase,
-            actor=args.actor,
-            target=args.target,
-            payload=payload,
-            idempotency_key=args.idempotency_key,
-        )
+    try:
+        with _conn(args) as conn:
+            result = create_plan_task(
+                conn,
+                workspace_id=args.workspace_id,
+                task_id=args.task_id,
+                plan_doc=args.plan_doc,
+                title=args.title,
+                owner=args.owner,
+                branch=args.branch,
+                phase=args.phase,
+                priority=args.priority,
+                actor=args.actor,
+                target=args.target,
+                payload=payload,
+                idempotency_key=args.idempotency_key,
+                operation_id=args.operation_id,
+                allow_runtime_copy=args.allow_runtime_copy,
+            )
+    except TaskCreateRecoveryError as exc:
+        # File half committed; DB half failed. Emit the same-operation recovery
+        # material as structured JSON and a copyable display command.
+        _print_json({"error": {"message": str(exc), **exc.recovery.to_dict()}})
+        return 1
+    except (SplitOperationError, ValueError) as exc:
+        _print_json({
+            "error": {
+                "message": str(exc),
+                "reason": getattr(exc, "reason", None),
+            }
+        })
+        return 1
     _print_json({"result": result.to_dict()})
     return 0
 
@@ -254,7 +273,10 @@ def register_planning_commands(subcommands) -> None:
     task = subcommands.add_parser("task", help="Create and inspect coordinator task mirrors")
     task_subcommands = task.add_subparsers(dest="task_command")
 
-    task_create = task_subcommands.add_parser("create", help="Create a plan-backed task and plan.ready event")
+    task_create = task_subcommands.add_parser(
+        "create",
+        help="Combined managed create: checklist file half first, DB record half second (idempotent; --operation-id to pin)",
+    )
     task_create.add_argument("workspace_id")
     task_create.add_argument("--task-id", required=True)
     task_create.add_argument("--plan-doc", required=True)
@@ -262,15 +284,22 @@ def register_planning_commands(subcommands) -> None:
     task_create.add_argument("--owner")
     task_create.add_argument("--branch")
     task_create.add_argument("--phase", default="ready")
+    task_create.add_argument("--priority", default="p1", choices=["p0", "p1", "p2"])
     task_create.add_argument("--actor", default="operator")
     task_create.add_argument("--target", default="worker")
     task_create.add_argument("--payload-json", default="{}")
     task_create.add_argument("--idempotency-key")
+    task_create.add_argument("--operation-id", help="Pin the split operation id (default: fresh UUIDv4 or reuse the deployed envelope)")
+    task_create.add_argument(
+        "--allow-runtime-copy",
+        action="store_true",
+        help="Override the /opt runtime-copy guard",
+    )
     task_create.set_defaults(handler=handle_task_create)
 
     task_create_files = task_subcommands.add_parser(
         "create-files",
-        help="Coding-host half of host-aware task create: sync mvp-checklist.json only (no DB write)",
+        help="Coding-host half of host-aware task create: checklist file half only (no DB write)",
     )
     task_create_files.add_argument("--workspace-path", required=True)
     task_create_files.add_argument("--harness-root", required=True)

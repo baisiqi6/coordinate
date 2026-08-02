@@ -139,6 +139,7 @@ def _build_handoff_text(
     test_baseline = plan_payload.get("test_baseline") or "No validation baseline recorded. See source plan for acceptance criteria."
 
     harness_rel = _harness_root_relative(workspace)
+    checklist_rel = _resolved_checklist_relative(workspace)
     profile = _materialize_handoff_profile(workspace, execution_profile)
     workspace_path = profile["workspace_path"]
     execution_harness = profile["harness_root"]
@@ -173,7 +174,7 @@ def _build_handoff_text(
         f"git branch --show-current\n"
         f"git log --oneline -8\n"
         f"cat {harness_rel}/harness-state.json\n"
-        f"cat {harness_rel}/mvp-checklist.json\n"
+        f"cat {shlex.quote(checklist_rel)}\n"
         f"cat {execution_source_plan}\n"
         f"```\n\n"
         f"### Implementation Scope\n"
@@ -198,6 +199,28 @@ def _harness_root_relative(workspace: Workspace) -> str:
         return str(Path(workspace.harness_root).relative_to(Path(workspace.path)))
     except ValueError:
         return str(workspace.harness_root)
+
+
+def _resolved_checklist_relative(workspace: Workspace) -> str:
+    """Workspace-relative path of the single resolver-selected checklist.
+
+    Preflight has already passed, so the resolver picks exactly one authority
+    (new-only/legacy-only); never render a compat candidate that does not exist.
+    """
+    from .checklist_io import ChecklistError, resolve_checklist
+
+    try:
+        resolved = resolve_checklist(workspace.harness_root, purpose="read")
+    except ChecklistError as exc:
+        # Unreachable in the normal path (preflight already resolved); keep the
+        # renderer total instead of crashing on a mid-flight authority change.
+        raise ValueError(
+            f"cannot resolve the checklist for handoff recovery commands: {exc}"
+        ) from exc
+    try:
+        return str(resolved.path.relative_to(Path(workspace.path)))
+    except ValueError:
+        return str(resolved.path)
 
 
 def _materialize_handoff_profile(
