@@ -104,6 +104,30 @@ $MAC reconcile WORKSPACE --no-refresh --task-id TASK
 
 `workspace audit --no-refresh` 将 file-backed 状态能力与 `harnessctl` 能力分开报告。如果 `assignment_lifecycle_available=false`，还不要使用 assignment mutation 命令；在 harness 运行时存在之前，使用 `task create`、events、jobs 和 deliveries。
 
+## 从 GitHub Issue 认领重要任务
+
+对 GitHub-backed 团队项目，先在实时 GitHub 状态中完成 cooperative claim，再把重要或跨 session
+任务登记进 Coordinate：
+
+```text
+live check: open + unassigned + no active implementation PR
+-> claim by assignee/agreed label
+-> re-read GitHub state
+-> issue scan
+-> issue triage --decision accept --task-id ...
+-> issue materialize (same-host) 或 materialize-files/record (split-host)
+```
+
+- `issue scan` 是候选快照，不是认领；scan/triage 均不会代替 operator 更新 assignee/label。
+- 单仓库使用 `issue-N`；同一 Coordinate workspace 涉及多个 repo 时，显式使用 repo-qualified
+  `task_id`，因为 Issue number 只在 repo 内唯一。
+- 分支中的 checklist 是 merge candidate；`main` checklist 是 accepted snapshot；团队实时工作
+  视图来自 open/assigned Issue 与 active PR。
+- 合并候选必须运行 checklist validator。Coordinate `merge gate` 只消费当前 head 的 CI/review
+  结果，不另外证明 validator 已执行。
+- 若发现别人已经认领、已有 active PR，或两个 Issue 的范围实际重叠，停止 materialize，在 Issue/PR
+  中协调；不要静默抢占、改号或创建第二份 checklist。
+
 ## 登记重要任务（managed）
 
 重要/跨 session 任务必须经 Coordinate 入口登记，不裸跑 harnessctl mutation：

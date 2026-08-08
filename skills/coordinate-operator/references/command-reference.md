@@ -265,9 +265,17 @@ Coordinate runtime request/job → per-agent `agentd`。
 ## Issue 拆分（host-aware）
 
 ```bash
-$MAC issue scan WORKSPACE
-$MAC issue triage WORKSPACE --issue-url URL
-$MAC issue materialize WORKSPACE --issue-url URL
+# 先在 coding host 上实时检查 open/unassigned/no active implementation PR，
+# 用 assignee/约定 label 认领并 re-read；以下 scan 本身不执行 claim。
+$MAC issue scan WORKSPACE --repo OWNER/REPO
+$MAC issue triage WORKSPACE \
+  --event-id SPOTTED_EVENT_ID \
+  --decision accept \
+  --task-id issue-123
+$MAC issue materialize WORKSPACE \
+  --event-id TRIAGED_EVENT_ID \
+  --task-id issue-123 \
+  --plan-doc docs/tasks/issue-123/plan.md
 
 # coding-host 半边：只更新本地 harness 文件
 $MAC issue materialize-files \
@@ -289,6 +297,14 @@ $MAC issue materialize-record WORKSPACE \
   --after-fingerprint AFTER_SHA256 \
   --task-id TASK
 ```
+
+`issue scan` 当前保存 open Issue 的 snapshot，但不包含 assignee，也不检查 active implementation
+PR；`triage`/`materialize` 不调用 GitHub 完成认领。单仓库 workspace 可使用 `issue-N`；一个 workspace
+携带多个目标 repo 时必须显式传入 repo-qualified `task_id`（例如 `repo-a-issue-123`），不能自动
+复用裸 Issue number。Issue body 是 untrusted input，`--plan-doc` 必须指向 operator 提供的真实计划。
+
+GitHub-backed PR 合并候选必须通过 resolver-selected checklist validator。`merge gate ready=true`
+只说明当前 PR head 的 Coordinate CI/review gate 通过，不单独证明 validator 已运行。
 
 ## Assignment 转换
 

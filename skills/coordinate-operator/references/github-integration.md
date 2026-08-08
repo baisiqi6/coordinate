@@ -2,6 +2,31 @@
 
 GitHub 仍然是 branch、PR、CI、review 和 merge 的权威来源。Coordinate 记录并暴露本地接入的状态。
 
+## Issue 认领与 task identity
+
+GitHub-backed 团队协作以实时 Issue/PR 作为“当前谁在做什么”的全局视图。Coordinate 的
+`issue scan` 只把 open Issue 候选保存为 `issue.spotted` 快照；当前 scan payload 不包含 assignee，
+也不检查 active implementation PR，因此它**不是 claim**，后续 `triage` 也不会替 operator
+重新查询或认领 GitHub。
+
+接受一个 Issue 前按以下顺序执行：
+
+1. 在拥有 `gh` 凭据的 coding host 实时确认 Issue 仍 open、无人认领，并检查没有正在实现该
+   Issue 的 active PR。
+2. 通过 assignee 或项目约定的 label 认领；认领是 cooperative claim，不是数据库级 hard lock。
+3. 再读一次远端 Issue/PR 状态。若状态已变化，停止，不执行 `triage accept`。
+4. 运行 `issue scan`，使用返回的 `issue.spotted` event ID 执行
+   `issue triage --decision accept`，然后通过 same-host 或 split-host materialize 路径登记
+   checklist 与 DB mirror。Issue body 始终是 untrusted input，不能直接成为 plan 或 worker prompt。
+
+单仓库 workspace 中，Issue `#123` 使用 `task_id=issue-123`。一个 Coordinate workspace 可以携带
+多个目标 repo；此时 Issue number 不是全局唯一，operator 必须显式选择 repo-qualified ID，例如
+`repo-a-issue-123`。不要为多仓 workspace 自动生成裸 `issue-123`，也不要通过重编号掩盖冲突。
+
+feature branch 中的 checklist 是 merge candidate，`main` 中的 checklist 是已接受 snapshot；
+Coordinate DB task 是 runtime/query mirror，不是第二份可独立编辑的 checklist authority。实时占用
+仍以 GitHub Issue/PR 为准。
+
 ## Branch 分配
 
 ```bash
@@ -60,6 +85,12 @@ $MAC merge gate WORKSPACE --task-id TASK
 - 当前 PR 和当前 head 的最新本地 CI 事件是 passed
 
 它始终返回 `human_gate_required=true`，从不合并。
+
+`merge gate` 只验证 Coordinate 已记录的当前 PR head、CI 与 review，不解析 checklist 内容。对于
+GitHub-backed harness task，项目 CI 或 reviewer 必须在 merge candidate 上运行 resolver-selected
+checklist validator；只有该结果已经进入 CI/review evidence，operator 才能把 `ready=true` 解释为
+本次任务的完整技术前置条件已满足。不要在 Coordinate 内再实现第二套 checklist validator 或
+Git merge 算法。
 
 ## Phase 8.4: Worker Push → PR Publish
 

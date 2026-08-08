@@ -119,8 +119,8 @@ skills/coordinate-operator/scripts/mac.sh ...
 - 默认需要用户明确授权。
 - 已存在目标、范围、时限和操作边界明确的持久授权时，不机械重复询问。
 - preflight、review、receipt、recovery 和 fail-closed gate 不因授权而省略。
-- `merge gate ready=true` 只证明技术前置条件满足，不自动授予 merge，除非现有
-  授权明确覆盖。
+- `merge gate ready=true` 只证明 Coordinate 所记录的当前 head CI/review 前置条件满足，
+  不自动证明 checklist validator 已运行，也不自动授予 merge；只有现有授权明确覆盖时才可执行。
 - 只有当前明确授权或有界持久授权覆盖 merge/deploy 时才执行；不得把技术 gate
   或历史授权推断成新的权限。
 
@@ -139,6 +139,16 @@ skills/coordinate-operator/scripts/mac.sh ...
 稳定规则：
 
 - **old/new resolver**：只有 `harness-checklist.json` 时用新名，只有 `mvp-checklist.json` 时用旧名；两者皆无或并存 fail closed。既有实例继续使用其现有 filename，不自动迁移。
+- **GitHub-backed claim**：`issue scan` 只保存候选 Issue 的只读快照，不认领任务，也不证明
+  Issue 仍无人负责。接受前在 GitHub 实时确认 Issue 仍 open、无人认领且没有 active
+  implementation PR；通过 assignee/约定 label 认领后再次读取远端状态，再执行
+  `issue triage --decision accept` 与 materialize。assignee/label 是 cooperative claim，不是 hard lock。
+- **GitHub-backed task ID**：单仓库 workspace 可把 Issue `#123` 映射为 `issue-123`；一个
+  Coordinate workspace 操作多个 repo 时，Issue number 不再唯一，operator 必须显式提供稳定的
+  repo-qualified `task_id`，不得让 Coordinate 静默自动推导裸 `issue-123`。
+- **GitHub-backed merge candidate**：feature branch 中的 checklist 是 merge candidate，`main`
+  中的是已接受 snapshot；实时工作占用看 GitHub Issue/PR。合并前必须由项目 CI 或 reviewer 对
+  resolver-selected checklist 运行 validator。`merge gate ready=true` 不额外证明 checklist 已校验。
 - **combined create 部分失败恢复**：`coordinate task create` 是 file-first、record-second 的 combined contract；`--operation-id` 固定 split operation。file 半边已提交而 DB 半边失败时，用同一 `--operation-id` 重跑（或按 recovery 参数重跑 `task create-record`）幂等补齐，不重复 mutation。
 - **freshness**：`harness-state.json` 与 `docs/current/*` 是可重建 cache/pointer，不是 authority；与 checklist bytes 不一致时以 checklist 为准，重新运行 `harnessctl state`。
 - **filename migration** 必须独立 authority；`--ack-managed-profile` 等 acknowledgement flag 不等于 authority。
