@@ -299,6 +299,39 @@ class ExecutionContextResolverTests(unittest.TestCase):
         )
         self.assertEqual(ctx2.worktree_path, "/host/ws/feature")
 
+    def test_windows_worktree_path_is_canonical_before_context_freeze(self) -> None:
+        from coordinate.db import get_workspace, get_workspace_host_profile
+
+        upsert_workspace_host_profile(
+            self.conn,
+            workspace_id="ws",
+            host_id="host1",
+            workspace_path="C:\\Users\\ADMIN\\projects\\multinexus",
+            harness_root="C:\\Users\\ADMIN\\projects\\multinexus\\docs\\project-harness",
+        )
+        workspace = get_workspace(self.conn, "ws")
+        profile = get_workspace_host_profile(
+            self.conn, workspace_id="ws", host_id="host1"
+        )
+        ctx = resolve_execution_context_v1(
+            job_id="request:windows-path",
+            workspace=workspace,
+            task=None,
+            assigned_agent="agent1",
+            host_id="host1",
+            profile=profile,
+            origin={"session_scope_id": "local:windows-path"},
+        )
+
+        self.assertEqual(
+            ctx.worktree_path,
+            "c:\\users\\admin\\projects\\multinexus",
+        )
+        self.assertEqual(
+            build_worktree_resource(ctx.host_id, ctx.worktree_path).normalized_path,
+            ctx.worktree_path,
+        )
+
     def test_explicit_job_worktree_rejects_relative_path(self) -> None:
         from coordinate.db import get_workspace, get_workspace_host_profile
 

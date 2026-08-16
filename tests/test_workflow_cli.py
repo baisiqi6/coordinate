@@ -33,7 +33,7 @@ _CANONICAL_AST_HASHES = {
     "handle_ci_check": "b8d47ef70afb0f863cfd617ffd0f255de772ffc293c08fcaa105e2805aca1c3c",
     "handle_review_check": "63f4d093b9dab623dde9c3697157bd70933aad06d1a64f8c3b154b287883bf89",
     "handle_merge_gate": "d1dc4486d1160e3636dbbd3f908de758c56e59c33438ba3ea9c30226f5857ea6",
-    "handle_assignment_request": "e186254f57d77fadb4a76acbc241513eeb6df9a2b08b3bc71294b0f88f123554",
+    "handle_assignment_request": "e954da9f6174ff8fd95f90ea86ac4b18afe0930c3a179209efb7adf5a8190f69",
     "handle_assignment_accept": "2e2d7641a7b691facff73c8f98820695b7ffe6488e04f5d2baa057efec85e616",
     "handle_assignment_handoff": "6c8f5a8e3bb482dab3bb110f6216eafa61168050bc8a42979b17b6f78fb20f98",
     "handle_assignment_blocker": "5e692869bb9ad87bd6c0099a85b201cfbe711163968b494fab271357e2ea3b72",
@@ -270,6 +270,8 @@ class WorkflowCLIRegistrationTests(unittest.TestCase):
                 "runtime",
                 "assignment",
                 "operator",
+                "mcp",
+                "runtime-http",
                 "serve",
             ],
         )
@@ -527,14 +529,25 @@ class WorkflowCLIBranchForgeDelegationTests(unittest.TestCase):
 class WorkflowCLIAssignmentDelegationTests(unittest.TestCase):
     """Mocked service delegation and envelope tests for assignment workflow."""
 
-    def _make_assignment_result(self, mutation: Mock | None = None, mutation_failed: bool = False) -> Mock:
-        event = {"event_type": "harness.mutation_failed" if mutation_failed else "assignment.accepted"}
+    def _make_assignment_result(
+        self,
+        mutation: Mock | None = None,
+        mutation_failed: bool = False,
+        delivery_error: str | None = None,
+        event_type: str | None = None,
+    ) -> Mock:
+        if event_type is None:
+            event_type = (
+                "harness.mutation_failed" if mutation_failed else "assignment.accepted"
+            )
+        event = {"event_type": event_type}
         result = Mock(
             mutation=mutation,
             event=event,
             event_created=True,
             delivery=None,
             delivery_created=False,
+            delivery_error=delivery_error,
         )
         return result
 
@@ -584,6 +597,56 @@ class WorkflowCLIAssignmentDelegationTests(unittest.TestCase):
                 ):
                     code = coordinate.workflow_cli.handle_assignment_request(args)
         self.assertEqual(code, 1)
+
+    def test_assignment_request_delivery_error_returns_zero_with_authority_fields(self) -> None:
+        args = SimpleNamespace(
+            workspace_id="ws1", task_id="t1", owner="alice", session="s1",
+            actor="operator", branch=None, platform=None, destination=None,
+            idempotency_hint=None,
+        )
+        mutation = Mock(to_dict=Mock(return_value={"id": "m1"}))
+        result = self._make_assignment_result(
+            mutation=mutation, delivery_error="delivery failed: database is locked",
+            event_type="assignment.requested",
+        )
+        captured, capture_ctx = _capture_json()
+        with capture_ctx:
+            with _mock_conn():
+                with patch(
+                    "coordinate.workflow_cli.request_assignment",
+                    return_value=result,
+                ):
+                    code = coordinate.workflow_cli.handle_assignment_request(args)
+        self.assertEqual(code, 0)
+        output = captured[-1]["result"]
+        self.assertTrue(output["authority_committed"])
+        self.assertTrue(output["partial"])
+        self.assertEqual(output["delivery_error"], "delivery failed: database is locked")
+
+    def test_assignment_request_authority_committed_false_when_mutation_failed(self) -> None:
+        args = SimpleNamespace(
+            workspace_id="ws1", task_id="t1", owner="alice", session="s1",
+            actor="operator", branch=None, platform=None, destination=None,
+            idempotency_hint=None,
+        )
+        mutation = Mock(to_dict=Mock(return_value={"id": "m1", "success": False}))
+        result = self._make_assignment_result(
+            mutation=mutation, mutation_failed=True, delivery_error="delivery failed: boom",
+            event_type="harness.mutation_failed",
+        )
+        captured, capture_ctx = _capture_json()
+        with capture_ctx:
+            with _mock_conn():
+                with patch(
+                    "coordinate.workflow_cli.request_assignment",
+                    return_value=result,
+                ):
+                    code = coordinate.workflow_cli.handle_assignment_request(args)
+        self.assertEqual(code, 1)
+        output = captured[-1]["result"]
+        self.assertFalse(output["authority_committed"])
+        self.assertTrue(output["partial"])
+        self.assertEqual(output["delivery_error"], "delivery failed: boom")
 
     def test_assignment_accept_includes_bootstrap_output(self) -> None:
         args = SimpleNamespace(

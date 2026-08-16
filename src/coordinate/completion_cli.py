@@ -4,7 +4,6 @@ from __future__ import annotations
 import argparse
 from datetime import datetime, timezone
 import json
-import re
 import subprocess
 import sys
 from typing import Any
@@ -16,20 +15,12 @@ from .completion import (
     claim_completion_receipt,
     compute_mark_done_fingerprints,
     consume_completion_receipt,
+    lookup_receipt_for_preflight,
     parse_iso_timestamp,
     prepare_completion_receipt,
 )
 from .transitions import mark_done_files, mark_done_record
 from .cli_support import open_connection, print_json
-from .db import find_events
-
-_SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
-
-
-def _is_canonical_sha256(value: Any) -> bool:
-    """Return True if *value* is a canonical SHA-256 hex digest (64 lowercase)."""
-    return isinstance(value, str) and bool(_SHA256_RE.fullmatch(value))
-
 
 # Compatibility aliases so handlers read like the originals.
 _conn = open_connection
@@ -39,16 +30,6 @@ STATUS_AUTHORIZED = "authorized"
 STATUS_CLAIMED = "claimed"
 STATUS_APPLIED = "applied"
 STATUS_CONSUMED = "consumed"
-
-
-def _json_loads(value: str | None) -> dict[str, Any]:
-    if not value:
-        return {}
-    try:
-        data = json.loads(value)
-    except json.JSONDecodeError:
-        return {}
-    return data if isinstance(data, dict) else {}
 
 
 def register_completion_commands(assignment_subcommands) -> None:
@@ -126,9 +107,11 @@ def register_completion_commands(assignment_subcommands) -> None:
         help=(
             "Coding-host half of host-aware mark-done. Writes local "
             "checklist file half only. Normal path requires --receipt and a "
-            "remote coord CLI (--event-cli-path) to verify/claim the receipt "
-            "online before any file mutation. --repair-reason selects the "
-            "explicit repair-only path."
+            "remote verification transport — either a remote coord CLI "
+            "(--event-cli-path) or the narrow Remote MCP transport "
+            "(--event-mcp-url/--event-mcp-token-env) — to verify/claim the "
+            "receipt online before any file mutation. --repair-reason "
+            "selects the explicit repair-only path."
         ),
     )
     assignment_mark_done_files.add_argument("--workspace-path", required=True)
@@ -143,9 +126,27 @@ def register_completion_commands(assignment_subcommands) -> None:
         help=(
             "Path to a coord CLI that runs mark-done-preflight / "
             "mark-done-claim against the control-plane DB "
-            "(e.g. <HOME>/.local/bin/coord-ssh). Required for the "
-            "normal receipt path so the host verifies the receipt online "
-            "before mutating files."
+            "(e.g. <HOME>/.local/bin/coord-ssh). Alternative to "
+            "--event-mcp-url/--event-mcp-token-env; mutually exclusive."
+        ),
+    )
+    assignment_mark_done_files.add_argument(
+        "--event-mcp-url",
+        metavar="HTTPS_URL",
+        help=(
+            "HTTPS URL of a Coordinate Remote MCP streamable-HTTP endpoint "
+            "for the narrow completion transport (preflight/claim/apply "
+            "only). Requires --event-mcp-token-env and --workspace-id; "
+            "mutually exclusive with --event-cli-path."
+        ),
+    )
+    assignment_mark_done_files.add_argument(
+        "--event-mcp-token-env",
+        metavar="ENV_NAME",
+        help=(
+            "Name of an environment variable holding the Remote MCP bearer "
+            "token; the token itself never appears in argv, logs, results or "
+            "receipts. Requires --event-mcp-url."
         ),
     )
     assignment_mark_done_files.add_argument("--repair-reason")
@@ -180,18 +181,20 @@ def handle_assignment_mark_done_files(args: argparse.Namespace) -> int:
 
     Two paths:
 
-    - **Normal (receipt)**: requires ``--receipt`` and ``--event-cli-path``.
-      Before any canonical file mutation, forwards a read-only
-      ``mark-done-preflight`` and then an atomic ``mark-done-claim`` to the
-      control-plane coord CLI. The remote re-derives workspace/task/expiry
-      from the ledger; the host never trusts its own claims.
+    - **Normal (receipt)**: requires ``--receipt`` and one remote
+      verification transport — ``--event-cli-path`` or the narrow Remote
+      MCP pair ``--event-mcp-url``/``--event-mcp-token-env``. Before any
+      canonical file mutation, forwards a read-only receipt preflight and
+      then an atomic receipt claim to the remote transport. The remote
+      re-derives workspace/task/expiry from the ledger; the host never
+      trusts its own claims.
     - **Repair-only**: requires non-empty ``--repair-reason``. Bypasses the
       receipt protocol and stamps ``repair_only=true`` plus the reason into
       the result for audit.
 
     No path mutates the file before the receipt is claimed. Without either a
-    receipt+remote-CLI pair or an explicit repair reason, the command fails
-    closed.
+    receipt+remote-transport pair or an explicit repair reason, the command
+    fails closed.
     """
     receipt_id = args.receipt
     repair_reason = (args.repair_reason or "").strip() or None
@@ -213,14 +216,10 @@ def handle_assignment_mark_done_files(args: argparse.Namespace) -> int:
         }})
         return 1
 
-    if receipt_id and not args.event_cli_path:
-        _print_json({"error": {
-            "message": (
-                "normal mark-done-files path requires --event-cli-path to "
-                "verify/claim the receipt online before file mutation"
-            ),
-            "reason": "no_remote_verification_path",
-        }})
+    remote_error = _remote_verification_error(args)
+    if remote_error is not None:
+        message, reason = remote_error
+        _print_json({"error": {"message": message, "reason": reason}})
         return 1
 
     try:
@@ -270,8 +269,8 @@ def _run_mark_done_files_receipt(args: argparse.Namespace, receipt_id: str) -> A
     workspace_id = args.workspace_id
     task_id = args.task_id
 
-    pre = _forward_mark_done_preflight(
-        args.event_cli_path,
+    pre = _remote_preflight(
+        args,
         receipt_id=receipt_id,
         workspace_id=workspace_id,
         task_id=task_id,
@@ -311,12 +310,11 @@ def _run_mark_done_files_receipt(args: argparse.Namespace, receipt_id: str) -> A
     # Reserve: authorized -> claimed, recording before + expected-after. The
     # server rejects if the local before does not match the receipt's
     # harness_fingerprint (binding the coding host's state to prepare time).
-    claim = _forward_mark_done_claim(
-        args.event_cli_path,
+    claim = _remote_claim(
+        args,
         receipt_id=receipt_id,
         workspace_id=claim_workspace,
         task_id=claim_task,
-        actor=args.actor,
         before_fingerprint=fps.before_fingerprint,
         expected_after_fingerprint=fps.after_fingerprint,
     )
@@ -364,15 +362,148 @@ def _run_mark_done_files_receipt(args: argparse.Namespace, receipt_id: str) -> A
     # Apply ack: claimed -> applied. On failure the receipt stays claimed
     # (diagnosable partial); retrying files re-runs reserve (idempotent) and
     # re-runs apply (idempotent).
-    apply = _forward_mark_done_apply(
-        args.event_cli_path,
+    apply = _remote_apply(
+        args,
         receipt_id=receipt_id,
         workspace_id=claim_workspace,
         task_id=claim_task,
-        actor=args.actor,
         after_fingerprint=fps.after_fingerprint,
     )
     return result, {"claim": claim, "apply": apply}
+
+
+# --------------------------------------------------------------------------
+# Remote verification transport selection (R5B)
+# --------------------------------------------------------------------------
+
+
+def _remote_verification_error(args: argparse.Namespace) -> tuple[str, str] | None:
+    """Fail-closed validation of the remote verification option pair.
+
+    ``--event-cli-path`` and the ``--event-mcp-url``/``--event-mcp-token-env``
+    pair are mutually exclusive; the MCP pair must appear together; the MCP
+    mode additionally requires ``--workspace-id`` so the remote endpoint can
+    scope the receipt preflight; and the normal receipt path requires exactly
+    one remote verification mode. Returns ``(message, reason)`` or None.
+    """
+    cli_path = args.event_cli_path
+    mcp_url = args.event_mcp_url
+    token_env = args.event_mcp_token_env
+    if cli_path and (mcp_url or token_env):
+        return (
+            "specify either --event-cli-path or the "
+            "--event-mcp-url/--event-mcp-token-env pair, not both",
+            "conflicting_remote",
+        )
+    if bool(mcp_url) != bool(token_env):
+        return (
+            "--event-mcp-url and --event-mcp-token-env must be used together",
+            "incomplete_mcp_pair",
+        )
+    if mcp_url and not args.workspace_id:
+        return (
+            "--event-mcp-url requires --workspace-id so the remote endpoint "
+            "can scope the receipt preflight",
+            "missing_workspace_id",
+        )
+    if args.receipt and not (cli_path or mcp_url):
+        return (
+            "normal mark-done-files path requires --event-cli-path or "
+            "--event-mcp-url/--event-mcp-token-env to verify/claim the "
+            "receipt online before file mutation",
+            "no_remote_verification_path",
+        )
+    return None
+
+
+def _remote_preflight(
+    args: argparse.Namespace,
+    *,
+    receipt_id: str,
+    workspace_id: str | None,
+    task_id: str | None,
+) -> dict[str, Any]:
+    """Run one remote receipt preflight through the configured transport."""
+    if args.event_cli_path:
+        return _forward_mark_done_preflight(
+            args.event_cli_path,
+            receipt_id=receipt_id,
+            workspace_id=workspace_id,
+            task_id=task_id,
+        )
+    from .completion_mcp_transport import CompletionMCPTransport
+
+    transport = CompletionMCPTransport(
+        url=args.event_mcp_url, token_env=args.event_mcp_token_env,
+    )
+    return transport.preflight(
+        receipt_id=receipt_id, workspace_id=workspace_id,
+    )
+
+
+def _remote_claim(
+    args: argparse.Namespace,
+    *,
+    receipt_id: str,
+    workspace_id: str,
+    task_id: str,
+    before_fingerprint: str,
+    expected_after_fingerprint: str,
+) -> dict[str, Any]:
+    """Reserve the receipt through the configured transport."""
+    if args.event_cli_path:
+        return _forward_mark_done_claim(
+            args.event_cli_path,
+            receipt_id=receipt_id,
+            workspace_id=workspace_id,
+            task_id=task_id,
+            actor=args.actor,
+            before_fingerprint=before_fingerprint,
+            expected_after_fingerprint=expected_after_fingerprint,
+        )
+    from .completion_mcp_transport import CompletionMCPTransport
+
+    transport = CompletionMCPTransport(
+        url=args.event_mcp_url, token_env=args.event_mcp_token_env,
+    )
+    return transport.claim(
+        receipt_id=receipt_id,
+        workspace_id=workspace_id,
+        task_id=task_id,
+        before_fingerprint=before_fingerprint,
+        expected_after_fingerprint=expected_after_fingerprint,
+    )
+
+
+def _remote_apply(
+    args: argparse.Namespace,
+    *,
+    receipt_id: str,
+    workspace_id: str,
+    task_id: str,
+    after_fingerprint: str,
+) -> dict[str, Any]:
+    """Acknowledge the receipt through the configured transport."""
+    if args.event_cli_path:
+        return _forward_mark_done_apply(
+            args.event_cli_path,
+            receipt_id=receipt_id,
+            workspace_id=workspace_id,
+            task_id=task_id,
+            actor=args.actor,
+            after_fingerprint=after_fingerprint,
+        )
+    from .completion_mcp_transport import CompletionMCPTransport
+
+    transport = CompletionMCPTransport(
+        url=args.event_mcp_url, token_env=args.event_mcp_token_env,
+    )
+    return transport.apply(
+        receipt_id=receipt_id,
+        workspace_id=workspace_id,
+        task_id=task_id,
+        after_fingerprint=after_fingerprint,
+    )
 
 
 def handle_assignment_mark_done_record(args: argparse.Namespace) -> int:
@@ -590,280 +721,14 @@ def handle_assignment_mark_done_apply(args: argparse.Namespace) -> int:
 
 
 def _lookup_receipt_for_preflight(conn, receipt_id: str) -> dict[str, Any] | None:
-    """Derive the authoritative receipt state from its event chain.
+    """CLI-facing alias of the shared domain receipt-state derivation.
 
-    Precedence is ``consumed > applied > claimed > authorized``.  Partial,
-    duplicate, or inconsistent chains fail closed.  All immutable links
-    (workspace, task, actor, fingerprints, required task.done) are verified.
+    The chain-derivation state machine lives once in
+    ``completion.lookup_receipt_for_preflight`` and is shared with the MCP
+    facade; this alias keeps the CLI call sites and the P9/S4-D ownership
+    contract unchanged.
     """
-    from .db import get_event, row_to_dict
-    rows = find_events(
-        conn,
-        event_type=None,
-        workspace_id=None,
-        task_id=None,
-        payload_key="receipt_id",
-        payload_value=receipt_id,
-    )
-    events = [
-        row_to_dict(row)
-        for row in rows
-        if (row_to_dict(row).get("event_type") or "").startswith("completion.")
-    ]
-    events.sort(key=lambda e: e.get("rowid", 0))
-
-    if not events:
-        return None
-
-    if events[0].get("event_type") != "completion.authorized":
-        return {
-            "broken": True,
-            "reason": "receipt_chain_incomplete",
-            "message": f"receipt {receipt_id} chain does not start with completion.authorized",
-        }
-
-    status_order = ["authorized", "claimed", "applied", "consumed"]
-    seen: set[str] = set()
-    workspace_id: str | None = None
-    task_id: str | None = None
-    actor: str | None = None
-    state: dict[str, Any] = {}
-    authorized_harness_fingerprint: str | None = None
-    claimed_expected_after: str | None = None
-    applied_after: str | None = None
-
-    for event in events:
-        payload = event.get("payload") or {}
-        ev_status = payload.get("status")
-        if ev_status not in status_order:
-            return {
-                "broken": True,
-                "reason": "receipt_chain_conflict",
-                "message": f"unknown receipt status {ev_status!r} in chain",
-            }
-        idx = status_order.index(ev_status)
-        required = set(status_order[:idx])
-        if not required.issubset(seen):
-            return {
-                "broken": True,
-                "reason": "receipt_chain_incomplete",
-                "message": f"{ev_status} event missing required predecessors",
-            }
-        if ev_status in seen:
-            return {
-                "broken": True,
-                "reason": "receipt_chain_conflict",
-                "message": f"duplicate {ev_status} transition in chain",
-            }
-        seen.add(ev_status)
-
-        ev_ws = payload.get("workspace_id")
-        ev_task = payload.get("task_id")
-        ev_actor = payload.get("authorized_actor") or payload.get("actor")
-        if workspace_id is None:
-            workspace_id = ev_ws
-        if task_id is None:
-            task_id = ev_task
-        if actor is None:
-            actor = ev_actor
-        if ev_ws and ev_ws != workspace_id:
-            return {
-                "broken": True,
-                "reason": "receipt_chain_conflict",
-                "message": f"workspace_id mismatch in receipt chain: {ev_ws!r} != {workspace_id!r}",
-            }
-        if ev_task and ev_task != task_id:
-            return {
-                "broken": True,
-                "reason": "receipt_chain_conflict",
-                "message": f"task_id mismatch in receipt chain: {ev_task!r} != {task_id!r}",
-            }
-        if ev_actor and ev_actor != actor:
-            return {
-                "broken": True,
-                "reason": "receipt_chain_conflict",
-                "message": f"actor mismatch in receipt chain: {ev_actor!r} != {actor!r}",
-            }
-
-        if ev_status == STATUS_AUTHORIZED:
-            fp = payload.get("harness_fingerprint")
-            if not fp:
-                return {
-                    "broken": True,
-                    "reason": "receipt_chain_incomplete",
-                    "message": "authorized event missing harness_fingerprint",
-                }
-            if not _is_canonical_sha256(fp):
-                return {
-                    "broken": True,
-                    "reason": "receipt_chain_conflict",
-                    "message": f"authorized harness_fingerprint {fp!r} is not a canonical SHA-256",
-                }
-            authorized_harness_fingerprint = fp
-        elif ev_status == STATUS_CLAIMED:
-            before_fingerprint = payload.get("before_fingerprint")
-            if not before_fingerprint:
-                return {
-                    "broken": True,
-                    "reason": "receipt_chain_incomplete",
-                    "message": "claimed event missing before_fingerprint",
-                }
-            if not _is_canonical_sha256(before_fingerprint):
-                return {
-                    "broken": True,
-                    "reason": "receipt_chain_conflict",
-                    "message": f"claimed before_fingerprint {before_fingerprint!r} is not a canonical SHA-256",
-                }
-            if before_fingerprint != authorized_harness_fingerprint:
-                return {
-                    "broken": True,
-                    "reason": "receipt_chain_conflict",
-                    "message": (
-                        f"claimed before_fingerprint {before_fingerprint!r} does not match "
-                        f"authorized harness_fingerprint {authorized_harness_fingerprint!r}"
-                    ),
-                }
-            expected_after = payload.get("expected_after_fingerprint")
-            if not expected_after:
-                return {
-                    "broken": True,
-                    "reason": "receipt_chain_incomplete",
-                    "message": "claimed event missing expected_after_fingerprint",
-                }
-            if not _is_canonical_sha256(expected_after):
-                return {
-                    "broken": True,
-                    "reason": "receipt_chain_conflict",
-                    "message": f"claimed expected_after_fingerprint {expected_after!r} is not a canonical SHA-256",
-                }
-            claimed_expected_after = expected_after
-        elif ev_status == STATUS_APPLIED:
-            before_fp = payload.get("before_fingerprint")
-            if not before_fp:
-                return {
-                    "broken": True,
-                    "reason": "receipt_chain_incomplete",
-                    "message": "applied event missing before_fingerprint",
-                }
-            if not _is_canonical_sha256(before_fp):
-                return {
-                    "broken": True,
-                    "reason": "receipt_chain_conflict",
-                    "message": f"applied before_fingerprint {before_fp!r} is not a canonical SHA-256",
-                }
-            if before_fp != authorized_harness_fingerprint:
-                return {
-                    "broken": True,
-                    "reason": "receipt_chain_conflict",
-                    "message": (
-                        f"applied before_fingerprint {before_fp!r} does not match "
-                        f"claimed before_fingerprint {authorized_harness_fingerprint!r}"
-                    ),
-                }
-            after_fp = payload.get("after_fingerprint")
-            if not after_fp:
-                return {
-                    "broken": True,
-                    "reason": "receipt_chain_incomplete",
-                    "message": "applied event missing after_fingerprint",
-                }
-            if not _is_canonical_sha256(after_fp):
-                return {
-                    "broken": True,
-                    "reason": "receipt_chain_conflict",
-                    "message": f"applied after_fingerprint {after_fp!r} is not a canonical SHA-256",
-                }
-            if after_fp != claimed_expected_after:
-                return {
-                    "broken": True,
-                    "reason": "receipt_chain_conflict",
-                    "message": (
-                        f"applied after_fingerprint {after_fp!r} does not match "
-                        f"claimed expected_after_fingerprint {claimed_expected_after!r}"
-                    ),
-                }
-            applied_after = after_fp
-        elif ev_status == STATUS_CONSUMED:
-            task_done_event_id = payload.get("task_done_event_id")
-            if not task_done_event_id:
-                return {
-                    "broken": True,
-                    "reason": "receipt_chain_incomplete",
-                    "message": "consumed event missing task_done_event_id",
-                }
-            if not applied_after:
-                return {
-                    "broken": True,
-                    "reason": "receipt_chain_incomplete",
-                    "message": "consumed event missing applied after_fingerprint predecessor",
-                }
-            try:
-                task_done_row = get_event(conn, task_done_event_id)
-            except KeyError:
-                return {
-                    "broken": True,
-                    "reason": "receipt_chain_incomplete",
-                    "message": f"consumed event references missing task.done {task_done_event_id}",
-                }
-            if task_done_row["event_type"] != "task.done":
-                return {
-                    "broken": True,
-                    "reason": "receipt_chain_incomplete",
-                    "message": f"consumed event references non-task.done event {task_done_event_id}",
-                }
-            if (
-                task_done_row["workspace_id"] != workspace_id
-                or task_done_row["task_id"] != task_id
-            ):
-                return {
-                    "broken": True,
-                    "reason": "receipt_chain_conflict",
-                    "message": f"consumed event task.done {task_done_event_id} has wrong workspace/task",
-                }
-            task_done_payload = _json_loads(task_done_row["payload_json"])
-            if task_done_payload.get("receipt_id") != receipt_id:
-                return {
-                    "broken": True,
-                    "reason": "receipt_chain_conflict",
-                    "message": f"consumed event task.done {task_done_event_id} references another receipt",
-                }
-            applied_fingerprint = task_done_payload.get("applied_fingerprint")
-            if not applied_fingerprint:
-                return {
-                    "broken": True,
-                    "reason": "receipt_chain_incomplete",
-                    "message": f"task.done {task_done_event_id} missing applied_fingerprint",
-                }
-            if not _is_canonical_sha256(applied_fingerprint):
-                return {
-                    "broken": True,
-                    "reason": "receipt_chain_conflict",
-                    "message": f"task.done applied_fingerprint {applied_fingerprint!r} is not a canonical SHA-256",
-                }
-            if applied_fingerprint != applied_after:
-                return {
-                    "broken": True,
-                    "reason": "receipt_chain_conflict",
-                    "message": (
-                        f"consumed task.done applied_fingerprint {applied_fingerprint!r} does not match "
-                        f"applied after_fingerprint {applied_after!r}"
-                    ),
-                }
-
-        state["status"] = ev_status
-        if ev_status == "consumed":
-            state["terminal_event_id"] = event.get("id")
-
-    authorized_payload = events[0].get("payload") or {}
-    return {
-        "workspace_id": workspace_id,
-        "task_id": task_id,
-        "actor": actor,
-        "status": state.get("status", "authorized"),
-        "issued_at": authorized_payload.get("issued_at"),
-        "expires_at": authorized_payload.get("expires_at"),
-        "terminal_event_id": state.get("terminal_event_id"),
-    }
+    return lookup_receipt_for_preflight(conn, receipt_id)
 
 
 def _build_mark_done_event_cli_argv(event_cli_path: str, sub_args: list[str]) -> list[str]:

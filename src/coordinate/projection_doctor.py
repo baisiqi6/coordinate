@@ -1418,6 +1418,18 @@ def _immutable_identity_errors(
             f"artifacts.plan: deployed={artifacts_plan!r} recorded={recorded_plan_doc!r}"
         )
 
+    # Optional legacy alias: absent/null stays compatible with historical
+    # items, but a present value must be a non-empty string matching the
+    # recorded plan document, or the item has drifted.
+    artifact_path = item.get("artifact_path")
+    if artifact_path is not None:
+        if not isinstance(artifact_path, str) or not artifact_path:
+            errors.append(f"artifact_path: malformed ({artifact_path!r})")
+        elif artifact_path != recorded_plan_doc:
+            errors.append(
+                f"artifact_path: deployed={artifact_path!r} recorded={recorded_plan_doc!r}"
+            )
+
     if (
         isinstance(plan_path, str)
         and isinstance(artifacts_plan, str)

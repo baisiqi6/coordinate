@@ -255,6 +255,9 @@ def handle_assignment_request(args: argparse.Namespace) -> int:
             "event_created": result.event_created,
             "delivery": result.delivery,
             "delivery_created": result.delivery_created,
+            "delivery_error": result.delivery_error,
+            "authority_committed": result.event.get("event_type") == "assignment.requested",
+            "partial": result.delivery_error is not None,
         }
     }
     _print_json(output)

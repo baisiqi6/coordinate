@@ -13,11 +13,29 @@ import discord
 from . import bus, db, policy
 from .agent_report import AgentReport, parse_agent_report
 from .bus import discord_content, message_text
+from .channel_provisioning import (
+    ensure_discord_delivery_route,
+    finish_discord_channel_request,
+    inspect_discord_provisioning,
+    list_pending_discord_channel_requests,
+    normalize_discord_channel_name,
+    workspace_topic_marker,
+)
 from .db import AppendEventResult, append_event
 from .handoff import prepare_handoff
 from .transitions import mark_done_task
 
 logger = logging.getLogger("coordinator.daemon")
+
+
+def _discord_snowflake(value: str) -> int:
+    text = str(value)
+    if not text or not text.isascii() or not text.isdecimal():
+        raise ValueError(f"invalid Discord destination: {value!r}")
+    channel_id = int(text)
+    if channel_id <= 0:
+        raise ValueError(f"invalid Discord destination: {value!r}")
+    return channel_id
 
 
 def _resolve_proxy_url() -> str | None:
@@ -34,19 +52,19 @@ def _resolve_proxy_url() -> str | None:
 class BotBus:
     """Send deliveries via the Discord bot API (transport for discord_webhook platform)."""
 
-    def __init__(self, client: discord.Client, channel_id: int):
+    def __init__(self, client: discord.Client):
         self._client = client
-        self._channel_id = channel_id
 
     def send(self, *, destination: str, payload: dict[str, Any], message_key: str) -> str:
+        channel_id = _discord_snowflake(destination)
         loop = self._client.loop
-        future = asyncio.run_coroutine_threadsafe(self._async_send(payload), loop)
+        future = asyncio.run_coroutine_threadsafe(self._async_send(channel_id, payload), loop)
         return future.result(timeout=30)
 
-    async def _async_send(self, payload: dict[str, Any]) -> str:
-        channel = self._client.get_channel(self._channel_id)
+    async def _async_send(self, channel_id: int, payload: dict[str, Any]) -> str:
+        channel = self._client.get_channel(channel_id)
         if channel is None:
-            channel = await self._client.fetch_channel(self._channel_id)
+            channel = await self._client.fetch_channel(channel_id)
 
         content = discord_content(payload)
         mention_users = payload.get("mention_users")
@@ -87,6 +105,7 @@ class CoordinatorDaemon:
 
         self._bot_bus: BotBus | None = None
         self._agent_discord_ids: dict[int, dict[str, str]] = {}
+        self._channel_provision_locks: dict[str, asyncio.Lock] = {}
         self._pump_cursor_rowid: int | None = None
 
         intents = discord.Intents.default()
@@ -104,7 +123,7 @@ class CoordinatorDaemon:
 
     async def on_ready(self) -> None:
         logger.info("Coordinator bot online: %s (id=%s)", self.client.user, self.client.user.id)
-        self._bot_bus = BotBus(self.client, self.channel_id)
+        self._bot_bus = BotBus(self.client)
         await asyncio.to_thread(self._load_agent_registry)
         self.client.loop.create_task(self._pump_loop())
 
@@ -128,9 +147,6 @@ class CoordinatorDaemon:
         if message.author == self.client.user:
             return
 
-        if message.channel.id != self.channel_id:
-            return
-
         try:
             registry = await asyncio.to_thread(self._refresh_agent_registry)
         except Exception:
@@ -140,16 +156,25 @@ class CoordinatorDaemon:
 
         author_id = message.author.id
         is_agent = author_id in self._agent_discord_ids
+        in_control_channel = message.channel.id == self.channel_id
+        mentioned = self.client.user.mentioned_in(message)
 
-        if is_agent:
-            await self._ingest_agent_message(message)
+        if in_control_channel and mentioned and author_id in self.allowed_user_ids:
+            await self._dispatch(message, self._strip_mention(message))
             return
 
-        if self.client.user.mentioned_in(message):
-            if author_id in self.allowed_user_ids:
-                await self._dispatch(message, self._strip_mention(message))
-            else:
+        if in_control_channel and mentioned and not is_agent:
+            if author_id not in self.allowed_user_ids:
                 logger.warning("Unauthorized command from %s (%s)", message.author, author_id)
+            return
+
+        if is_agent:
+            workspace_id = await asyncio.to_thread(
+                self._resolve_message_workspace,
+                message.channel,
+            )
+            if workspace_id is not None:
+                await self._ingest_agent_message(message, workspace_id=workspace_id)
             return
 
     def _strip_mention(self, message: discord.Message) -> str:
@@ -160,11 +185,25 @@ class CoordinatorDaemon:
 
     # --- Inbound ingest ---
 
-    async def _ingest_agent_message(self, message: discord.Message) -> None:
+    async def _ingest_agent_message(
+        self,
+        message: discord.Message,
+        *,
+        workspace_id: str | None = None,
+    ) -> None:
         text = message.content
 
         match = parse_agent_report(text)
         if match is None:
+            return
+
+        if workspace_id is not None and match.workspace_id != workspace_id:
+            logger.warning(
+                "Rejected channel/workspace mismatch: channel_workspace=%s report_workspace=%s task=%s",
+                workspace_id,
+                match.workspace_id,
+                match.task_id,
+            )
             return
 
         workspace_memberships = self._agent_discord_ids.get(message.author.id, {})
@@ -283,7 +322,7 @@ class CoordinatorDaemon:
     async def _dispatch(self, message: discord.Message, text: str) -> None:
         parts = text.split()
         if not parts:
-            await self._reply(message, "Commands: status | task list | handoff | pump | help")
+            await self._reply(message, "Commands: status | task list | handoff | channel create | pump | help")
             return
 
         cmd = parts[0].lower()
@@ -296,10 +335,12 @@ class CoordinatorDaemon:
                 await self._cmd_task(message, parts[1:])
             elif cmd == "handoff":
                 await self._cmd_handoff(message, parts[1:])
+            elif cmd == "channel":
+                await self._cmd_channel(message, parts[1:])
             elif cmd == "pump":
                 await self._cmd_pump(message)
             else:
-                await self._reply(message, f"未知命令：`{cmd}`。可用：help, status, task, handoff, pump")
+                await self._reply(message, f"未知命令：`{cmd}`。可用：help, status, task, handoff, channel, pump")
         except Exception as exc:
             logger.exception("Command error: %s", cmd)
             await self._reply(message, f"执行失败：{exc}")
@@ -313,6 +354,7 @@ class CoordinatorDaemon:
             "`task list [workspace]` — 列出任务\n"
             "`task show <ws> <task-id>` — 查看任务详情\n"
             "`handoff <ws> <task-id> <agent>` — 交接任务给 agent\n"
+            "`channel create <ws> <channel-name>` — 为 workspace 创建并绑定 Discord 频道\n"
             "`pump` — 触发一次事件/消息投递"
         ))
 
@@ -349,6 +391,21 @@ class CoordinatorDaemon:
         text = await asyncio.to_thread(self._do_pump)
         await self._reply(message, text)
 
+    async def _cmd_channel(self, message: discord.Message, args: list[str]) -> None:
+        if len(args) < 3 or args[0] != "create":
+            await self._reply(message, "用法：channel create <workspace> <channel-name>")
+            return
+        workspace_id = args[1]
+        channel_name = normalize_discord_channel_name(" ".join(args[2:]))
+        if message.author.bot:
+            memberships = self._agent_discord_ids.get(message.author.id, {})
+            if workspace_id not in memberships:
+                raise ValueError(
+                    f"agent {message.author.id} is not registered for workspace {workspace_id!r}"
+                )
+        text = await self._provision_discord_channel(workspace_id, channel_name)
+        await self._reply(message, text)
+
     # --- DB operations (run in thread) ---
 
     def _open_db(self) -> sqlite3.Connection:
@@ -356,6 +413,133 @@ class CoordinatorDaemon:
         db.migrate(conn)
         conn.commit()
         return conn
+
+    def _resolve_message_workspace(self, channel: Any) -> str | None:
+        channel_id = getattr(channel, "parent_id", None) or getattr(channel, "id", None)
+        if channel_id is None:
+            return None
+        conn = self._open_db()
+        try:
+            binding = db.resolve_channel_workspace(
+                conn,
+                platform="discord",
+                channel_id=str(channel_id),
+            )
+            return binding.workspace_id if binding is not None else None
+        finally:
+            conn.close()
+
+    async def _provision_discord_channel(self, workspace_id: str, channel_name: str) -> str:
+        lock = self._channel_provision_locks.setdefault(workspace_id, asyncio.Lock())
+        async with lock:
+            return await self._provision_discord_channel_once(workspace_id, channel_name)
+
+    async def _provision_discord_channel_once(
+        self,
+        workspace_id: str,
+        channel_name: str,
+    ) -> str:
+        state = await asyncio.to_thread(self._inspect_discord_provisioning, workspace_id)
+        if state.channel_id is not None:
+            await asyncio.to_thread(
+                self._finalize_discord_provisioning,
+                workspace_id,
+                state.channel_id,
+                channel_name,
+                True,
+            )
+            return (
+                f"已存在绑定：workspace=`{workspace_id}` "
+                f"channel=<#{state.channel_id}>（已校准默认投递路由）"
+            )
+
+        control = self.client.get_channel(self.channel_id)
+        if control is None:
+            control = await self.client.fetch_channel(self.channel_id)
+        guild = getattr(control, "guild", None)
+        if guild is None:
+            raise ValueError("control channel is not a guild channel")
+        category = getattr(control, "category", None)
+        if category is None:
+            raise ValueError("control channel must belong to a Discord category")
+
+        marker = workspace_topic_marker(workspace_id)
+        matches = [channel for channel in getattr(guild, "channels", []) if getattr(channel, "topic", None) == marker]
+        if len(matches) > 1:
+            raise ValueError(
+                f"multiple Discord channels carry the recovery marker for workspace {workspace_id!r}"
+            )
+        if matches:
+            channel = matches[0]
+        else:
+            channel = await guild.create_text_channel(
+                channel_name,
+                category=category,
+                topic=marker,
+                reason=f"Coordinate workspace provisioning: {workspace_id}",
+            )
+
+        await asyncio.to_thread(
+            self._finalize_discord_provisioning,
+            workspace_id,
+            str(channel.id),
+            channel_name,
+            bool(matches),
+        )
+        return f"频道已就绪：workspace=`{workspace_id}` channel=<#{channel.id}>"
+
+    def _inspect_discord_provisioning(self, workspace_id: str):
+        conn = self._open_db()
+        try:
+            return inspect_discord_provisioning(conn, workspace_id=workspace_id)
+        finally:
+            conn.close()
+
+    def _finalize_discord_provisioning(
+        self,
+        workspace_id: str,
+        channel_id: str,
+        channel_name: str,
+        recovered: bool,
+    ) -> None:
+        conn = self._open_db()
+        try:
+            state = inspect_discord_provisioning(conn, workspace_id=workspace_id)
+            if state.channel_id is not None and state.channel_id != channel_id:
+                raise ValueError(
+                    f"workspace {workspace_id!r} is already bound to Discord channel "
+                    f"{state.channel_id!r}"
+                )
+            db.bind_channel_workspace(
+                conn,
+                platform="discord",
+                channel_id=channel_id,
+                workspace_id=workspace_id,
+                actor="coordinator-daemon",
+                reason="provision workspace Discord channel",
+                idempotency_key=f"{workspace_id}:discord-channel-provision:{channel_id}",
+            )
+            ensure_discord_delivery_route(
+                conn,
+                workspace=state.workspace,
+                channel_id=channel_id,
+            )
+            append_event(
+                conn,
+                event_type="channel.provisioned",
+                actor="coordinator-daemon",
+                target=f"discord:{channel_id}",
+                workspace_id=workspace_id,
+                idempotency_key=f"{workspace_id}:discord-channel-provisioned:{channel_id}",
+                payload={
+                    "platform": "discord",
+                    "channel_id": channel_id,
+                    "channel_name": channel_name,
+                    "recovered": recovered,
+                },
+            )
+        finally:
+            conn.close()
 
     def _do_status(self) -> str:
         conn = self._open_db()
@@ -516,11 +700,83 @@ class CoordinatorDaemon:
 
     async def _pump_loop(self) -> None:
         while not self.client.is_closed():
-            await asyncio.sleep(self.pump_interval)
             try:
+                await self._consume_pending_channel_provision_requests()
                 await asyncio.to_thread(self._do_pump)
             except Exception:
                 logger.exception("Pump loop error")
+            await asyncio.sleep(self.pump_interval)
+
+    async def _consume_pending_channel_provision_requests(self) -> None:
+        """Consume durable requests without relying on the delivery cursor."""
+        requests = await asyncio.to_thread(self._list_pending_channel_requests)
+        for request in requests:
+            try:
+                payload = json.loads(request["payload_json"] or "{}")
+                await self._provision_discord_channel(
+                    request["workspace_id"], payload["channel_name"]
+                )
+                state = await asyncio.to_thread(
+                    self._inspect_discord_provisioning, request["workspace_id"]
+                )
+                if state.channel_id is None:
+                    raise RuntimeError("provisioning completed without binding")
+                await asyncio.to_thread(
+                    self._finish_channel_request,
+                    request["id"],
+                    state.channel_id,
+                    None,
+                )
+            except Exception as exc:
+                logger.exception(
+                    "Discord channel provisioning request failed: request_event_id=%s",
+                    request["id"],
+                )
+                await asyncio.to_thread(
+                    self._finish_channel_request,
+                    request["id"],
+                    None,
+                    self._channel_failure_reason(exc),
+                )
+
+    def _list_pending_channel_requests(self):
+        conn = self._open_db()
+        try:
+            return list_pending_discord_channel_requests(conn)
+        finally:
+            conn.close()
+
+    def _finish_channel_request(
+        self,
+        request_event_id: str,
+        channel_id: str | None,
+        reason_code: str | None,
+    ) -> None:
+        conn = self._open_db()
+        try:
+            finish_discord_channel_request(
+                conn,
+                request_event_id=request_event_id,
+                channel_id=channel_id,
+                reason_code=reason_code,
+            )
+        finally:
+            conn.close()
+
+    @staticmethod
+    def _channel_failure_reason(exc: Exception) -> str:
+        text = str(exc).lower()
+        if "unknown workspace" in text:
+            return "unknown_workspace"
+        if "multiple discord channels carry" in text:
+            return "recovery_marker_conflict"
+        if "multiple discord channel bindings" in text or "already bound" in text:
+            return "binding_conflict"
+        if "control channel" in text:
+            return "control_channel_unavailable"
+        if isinstance(exc, (OSError, TimeoutError)):
+            return "discord_api_unavailable"
+        return "internal"
 
     # --- Helpers ---
 

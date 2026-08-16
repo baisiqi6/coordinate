@@ -14,6 +14,7 @@ from coordinate.cli import main
 from coordinate.db import (
     append_event,
     initialize,
+    list_events,
     mark_delivery_sending,
     upsert_task_mirror,
     upsert_workspace,
@@ -2139,6 +2140,139 @@ class CliTests(unittest.TestCase):
             )
             self.assertIsNotNone(result["delivery"])
             self.assertEqual(result["delivery"]["payload"]["visible_header"], "[BLOCKER]")
+
+    def test_assignment_request_unsupported_platform_rejected_before_mutation(self):
+        # The original incident: `--platform none --destination audit` must be
+        # rejected before ANY checklist/DB mutation, with zero adapter runs.
+        with tempfile.TemporaryDirectory() as tmp:
+            db_path = str(Path(tmp) / "coordinator.sqlite3")
+            harnessctl_path = Path(tmp) / "fake-harnessctl"
+            counter_path = Path(tmp) / "runs.txt"
+            harnessctl_path.write_text(
+                f"#!/bin/bash\necho run >> {counter_path}\nexit 0\n"
+            )
+            harnessctl_path.chmod(0o755)
+            self.run_cli(
+                "--db", db_path,
+                "workspace", "add", "demo",
+                "--path", tmp,
+                "--harness-root", tmp,
+                "--harnessctl-path", str(harnessctl_path),
+            )
+
+            code, stdout, stderr = self.run_cli_raw(
+                "--db", db_path,
+                "assignment", "request", "demo",
+                "--task-id", "mvp-001",
+                "--owner", "codex",
+                "--session", "sess-1",
+                "--platform", "none",
+                "--destination", "audit",
+            )
+
+            self.assertEqual(code, 1)
+            self.assertIn("error: unsupported policy platform", stderr)
+            self.assertNotIn("Traceback", stderr)
+            # Zero adapter runs, zero events, zero deliveries.
+            self.assertFalse(counter_path.exists())
+            conn = initialize(db_path)
+            self.addCleanup(conn.close)
+            self.assertEqual(len(list(list_events(conn, "demo"))), 0)
+            self.assertEqual(len(conn.execute("SELECT * FROM deliveries").fetchall()), 0)
+            conn.close()
+
+    def test_assignment_request_unsupported_default_bus_rejected_before_mutation(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            db_path = str(Path(tmp) / "coordinator.sqlite3")
+            harnessctl_path = Path(tmp) / "fake-harnessctl"
+            counter_path = Path(tmp) / "runs.txt"
+            harnessctl_path.write_text(
+                f"#!/bin/bash\necho run >> {counter_path}\nexit 0\n"
+            )
+            harnessctl_path.chmod(0o755)
+            self.run_cli(
+                "--db", db_path,
+                "workspace", "add", "demo",
+                "--path", tmp,
+                "--harness-root", tmp,
+                "--harnessctl-path", str(harnessctl_path),
+                "--default-bus", "slack",
+                "--default-destination", "ops",
+            )
+
+            code, stdout, stderr = self.run_cli_raw(
+                "--db", db_path,
+                "assignment", "request", "demo",
+                "--task-id", "mvp-001",
+                "--owner", "codex",
+                "--session", "sess-1",
+            )
+
+            self.assertEqual(code, 1)
+            self.assertIn("error: unsupported policy platform: slack", stderr)
+            self.assertFalse(counter_path.exists())
+
+    def test_assignment_request_post_authority_delivery_failure_partial_json(self):
+        # Authority committed, delivery failed: exit 0 with structured partial
+        # outcome and no traceback.
+        with tempfile.TemporaryDirectory() as tmp:
+            db_path = self._setup_assignment_workspace(
+                tmp, default_bus="stdout", default_destination="local",
+            )
+            with patch(
+                "coordinate.policy.create_delivery_for_event",
+                side_effect=sqlite3.OperationalError("database is locked"),
+            ):
+                code, stdout, stderr = self.run_cli_raw(
+                    "--db", db_path,
+                    "assignment", "request", "demo",
+                    "--task-id", "mvp-001",
+                    "--owner", "codex",
+                    "--session", "sess-1",
+                )
+                payload = json.loads(stdout)
+
+            self.assertEqual(code, 0)
+            result = payload["result"]
+            self.assertTrue(result["authority_committed"])
+            self.assertTrue(result["partial"])
+            self.assertIn("database is locked", result["delivery_error"])
+            self.assertNotIn("Traceback", result["delivery_error"])
+            self.assertTrue(result["event_created"])
+            self.assertEqual(result["event"]["event_type"], "assignment.requested")
+            self.assertTrue(result["mutation"]["success"])
+            self.assertIsNone(result["delivery"])
+            self.assertNotIn("Traceback", stderr)
+
+    def test_assignment_request_mutation_and_delivery_failure_structured(self):
+        # Mutation failed AND delivery failed: exit 1, both outcomes structured.
+        with tempfile.TemporaryDirectory() as tmp:
+            db_path = self._setup_assignment_workspace(
+                tmp, success=False,
+                default_bus="stdout", default_destination="local",
+            )
+            with patch(
+                "coordinate.policy.create_delivery_for_event",
+                side_effect=sqlite3.OperationalError("boom"),
+            ):
+                code, stdout, stderr = self.run_cli_raw(
+                    "--db", db_path,
+                    "assignment", "request", "demo",
+                    "--task-id", "mvp-001",
+                    "--owner", "codex",
+                    "--session", "sess-1",
+                )
+                payload = json.loads(stdout)
+
+            self.assertEqual(code, 1)
+            result = payload["result"]
+            self.assertFalse(result["authority_committed"])
+            self.assertTrue(result["partial"])
+            self.assertIn("boom", result["delivery_error"])
+            self.assertEqual(result["event"]["event_type"], "harness.mutation_failed")
+            self.assertEqual(result["event"]["payload"]["stderr"].strip(), "error")
+            self.assertFalse(result["mutation"]["success"])
+            self.assertNotIn("Traceback", stderr)
 
     def test_assignment_request_invalid_workspace_path_returns_json_failure(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -4443,11 +4577,19 @@ class CliTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             db_path = self._setup_receipt_workspace(tmp)
             receipt_id, fps = self._prepare_claim_apply_receipt(db_path, tmp)
+            # Legitimate terminal state: owner/session released so consume can
+            # accept the deployed done/closed item (U2 fail-closed contract).
+            deployed_item = _mark_done_item(
+                "mvp-001", status="done", workflow_status="closed",
+                branch="feat-x",
+            )
+            deployed_item["owner"] = None
+            deployed_item["selected_in_session"] = None
             (Path(tmp) / "mvp-checklist.json").write_text(json.dumps({
                 "project": "demo",
                 "harness_root": ".",
                 "updated_at": "2026-01-01",
-                "items": [_mark_done_item("mvp-001", status="done", workflow_status="closed", branch="feat-x")],
+                "items": [deployed_item],
             }))
 
             code, payload = self.run_cli(

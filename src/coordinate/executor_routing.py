@@ -15,6 +15,7 @@ import unicodedata
 from dataclasses import dataclass
 from typing import Any
 
+from coordinate.agent_liveness import is_agent_liveness_fresh
 from coordinate.db import (
     get_runner_profile,
     get_workspace,
@@ -457,6 +458,8 @@ def _resolve_candidate(
     if agent_row is None:
         return None
     if agent_row["client_type"] != "agentd" or agent_row["online_state"] != "online":
+        return None
+    if not is_agent_liveness_fresh(agent_row["last_seen_at"]):
         return None
 
     host_id = agent_row["host_id"]

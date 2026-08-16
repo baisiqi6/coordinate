@@ -29,6 +29,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import re
 import sqlite3
 import uuid
 from dataclasses import dataclass
@@ -38,6 +39,23 @@ from typing import Any
 from .db import append_event, find_events, get_workspace, latest_event, row_to_dict
 from .harness import HarnessAdapter, HarnessError
 from .checklist_io import ChecklistError, load_checklist
+
+_SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
+
+
+def _is_canonical_sha256(value: Any) -> bool:
+    """Return True if *value* is a canonical SHA-256 hex digest (64 lowercase)."""
+    return isinstance(value, str) and bool(_SHA256_RE.fullmatch(value))
+
+
+def _json_loads(value: str | None) -> dict[str, Any]:
+    if not value:
+        return {}
+    try:
+        data = json.loads(value)
+    except json.JSONDecodeError:
+        return {}
+    return data if isinstance(data, dict) else {}
 
 
 # --------------------------------------------------------------------------
@@ -169,6 +187,46 @@ def compute_mark_done_fingerprints(*, harness_root: str, task_id: str) -> MarkDo
         after_fingerprint=compute_item_fingerprint(_would_be_done_item(item)),
         task_id=task_id,
     )
+
+
+# --------------------------------------------------------------------------
+# Terminal ownership release (shared with transitions.mark_done_files)
+# --------------------------------------------------------------------------
+
+
+def terminal_ownership_problem(item: dict[str, Any]) -> str | None:
+    """Return a description of unreleased terminal ownership on an item.
+
+    A terminal task has no executing owner: ``owner`` and
+    ``selected_in_session`` must be exactly JSON null (an empty string is not
+    released), and a present lease must carry a non-empty ``released_at``.
+    Returns ``None`` when the terminal state is properly released, else a
+    short human-readable description of the first offending field.
+    """
+    if item.get("owner") is not None:
+        return f"owner={item.get('owner')!r}"
+    if item.get("selected_in_session") is not None:
+        return f"selected_in_session={item.get('selected_in_session')!r}"
+    lease = item.get("lease")
+    if isinstance(lease, dict) and not lease.get("released_at"):
+        return "lease without released_at"
+    return None
+
+
+def release_terminal_ownership(item: dict[str, Any], now: str) -> None:
+    """Release terminal ownership on an item being (or already) marked done.
+
+    Mirrors the monolithic ``harnessctl mark-done`` terminal projection:
+    ``owner`` and ``selected_in_session`` are cleared, and a present lease is
+    stamped with the non-empty ``now`` as ``released_at`` exactly once. The
+    lease's history fields (owner/session/acquired_at/expires_at/ttl and any
+    unknown keys) are preserved untouched.
+    """
+    lease = item.get("lease")
+    if isinstance(lease, dict) and not lease.get("released_at"):
+        lease["released_at"] = now
+    item["owner"] = None
+    item["selected_in_session"] = None
 
 
 def read_checklist_item(harness_root: str, task_id: str) -> dict[str, Any]:
@@ -860,10 +918,20 @@ def consume_completion_receipt(
     actor: str,
     deployed_adapter: HarnessAdapter | None = None,
     verification: str | None = None,
+    expected_workspace_id: str | None = None,
 ) -> CompletionConsumeResult:
     payload = _receipt_payload(conn, receipt_id)
     workspace_id = payload.get("workspace_id")
     task_id = payload.get("task_id")
+    if (
+        expected_workspace_id is not None
+        and payload.get("workspace_id") != expected_workspace_id
+    ):
+        raise CompletionReceiptError(
+            f"receipt workspace {payload.get('workspace_id')!r} does not match "
+            f"{expected_workspace_id!r}",
+            reason="workspace_mismatch",
+        )
     _validate_binding(
         payload, workspace_id=workspace_id, task_id=task_id, actor=actor,
     )
@@ -930,6 +998,17 @@ def consume_completion_receipt(
             f"{deployed_item.get('status')!r}/workflow={workflow.get('status')!r}, "
             f"expected done/closed",
             reason="deployed_not_done",
+        )
+    # Fail closed on an incomplete terminal state: done/closed must not retain
+    # an executing owner/session or an unreleased lease (U2).
+    ownership_problem = terminal_ownership_problem(deployed_item)
+    if ownership_problem is not None:
+        raise CompletionReceiptError(
+            f"deployed harness for task {task_id} is done/closed but still "
+            f"carries terminal ownership ({ownership_problem}); the terminal "
+            f"item must clear owner/selected_in_session and stamp the lease "
+            f"released_at before the receipt can be consumed",
+            reason="deployed_terminal_ownership_unreleased",
         )
     deployed_fingerprint = compute_item_fingerprint(deployed_item)
     if not after_fingerprint or deployed_fingerprint != after_fingerprint:
@@ -1030,3 +1109,301 @@ def _deployed_task_item(deployed_adapter, task_id: str) -> dict[str, Any]:
         f"task {task_id} not found in deployed harness",
         reason="deployed_task_missing",
     )
+
+
+# --------------------------------------------------------------------------
+# Shared preflight derivation (single source for CLI and MCP facade)
+# --------------------------------------------------------------------------
+
+
+def lookup_receipt_for_preflight(conn, receipt_id: str) -> dict[str, Any] | None:
+    """Derive the authoritative receipt state from its event chain.
+
+    Precedence is ``consumed > applied > claimed > authorized``.  Partial,
+    duplicate, or inconsistent chains fail closed.  All immutable links
+    (workspace, task, actor, fingerprints, required task.done) are verified.
+    """
+    from .db import get_event, row_to_dict
+    rows = find_events(
+        conn,
+        event_type=None,
+        workspace_id=None,
+        task_id=None,
+        payload_key="receipt_id",
+        payload_value=receipt_id,
+    )
+    events = [
+        row_to_dict(row)
+        for row in rows
+        if (row_to_dict(row).get("event_type") or "").startswith("completion.")
+    ]
+    events.sort(key=lambda e: e.get("rowid", 0))
+
+    if not events:
+        return None
+
+    if events[0].get("event_type") != "completion.authorized":
+        return {
+            "broken": True,
+            "reason": "receipt_chain_incomplete",
+            "message": f"receipt {receipt_id} chain does not start with completion.authorized",
+        }
+
+    status_order = ["authorized", "claimed", "applied", "consumed"]
+    seen: set[str] = set()
+    workspace_id: str | None = None
+    task_id: str | None = None
+    actor: str | None = None
+    state: dict[str, Any] = {}
+    authorized_harness_fingerprint: str | None = None
+    claimed_expected_after: str | None = None
+    applied_after: str | None = None
+
+    for event in events:
+        payload = event.get("payload") or {}
+        ev_status = payload.get("status")
+        if ev_status not in status_order:
+            return {
+                "broken": True,
+                "reason": "receipt_chain_conflict",
+                "message": f"unknown receipt status {ev_status!r} in chain",
+            }
+        idx = status_order.index(ev_status)
+        required = set(status_order[:idx])
+        if not required.issubset(seen):
+            return {
+                "broken": True,
+                "reason": "receipt_chain_incomplete",
+                "message": f"{ev_status} event missing required predecessors",
+            }
+        if ev_status in seen:
+            return {
+                "broken": True,
+                "reason": "receipt_chain_conflict",
+                "message": f"duplicate {ev_status} transition in chain",
+            }
+        seen.add(ev_status)
+
+        ev_ws = payload.get("workspace_id")
+        ev_task = payload.get("task_id")
+        ev_actor = payload.get("authorized_actor") or payload.get("actor")
+        if workspace_id is None:
+            workspace_id = ev_ws
+        if task_id is None:
+            task_id = ev_task
+        if actor is None:
+            actor = ev_actor
+        if ev_ws and ev_ws != workspace_id:
+            return {
+                "broken": True,
+                "reason": "receipt_chain_conflict",
+                "message": f"workspace_id mismatch in receipt chain: {ev_ws!r} != {workspace_id!r}",
+            }
+        if ev_task and ev_task != task_id:
+            return {
+                "broken": True,
+                "reason": "receipt_chain_conflict",
+                "message": f"task_id mismatch in receipt chain: {ev_task!r} != {task_id!r}",
+            }
+        if ev_actor and ev_actor != actor:
+            return {
+                "broken": True,
+                "reason": "receipt_chain_conflict",
+                "message": f"actor mismatch in receipt chain: {ev_actor!r} != {actor!r}",
+            }
+
+        if ev_status == STATUS_AUTHORIZED:
+            fp = payload.get("harness_fingerprint")
+            if not fp:
+                return {
+                    "broken": True,
+                    "reason": "receipt_chain_incomplete",
+                    "message": "authorized event missing harness_fingerprint",
+                }
+            if not _is_canonical_sha256(fp):
+                return {
+                    "broken": True,
+                    "reason": "receipt_chain_conflict",
+                    "message": f"authorized harness_fingerprint {fp!r} is not a canonical SHA-256",
+                }
+            authorized_harness_fingerprint = fp
+        elif ev_status == STATUS_CLAIMED:
+            before_fingerprint = payload.get("before_fingerprint")
+            if not before_fingerprint:
+                return {
+                    "broken": True,
+                    "reason": "receipt_chain_incomplete",
+                    "message": "claimed event missing before_fingerprint",
+                }
+            if not _is_canonical_sha256(before_fingerprint):
+                return {
+                    "broken": True,
+                    "reason": "receipt_chain_conflict",
+                    "message": f"claimed before_fingerprint {before_fingerprint!r} is not a canonical SHA-256",
+                }
+            if before_fingerprint != authorized_harness_fingerprint:
+                return {
+                    "broken": True,
+                    "reason": "receipt_chain_conflict",
+                    "message": (
+                        f"claimed before_fingerprint {before_fingerprint!r} does not match "
+                        f"authorized harness_fingerprint {authorized_harness_fingerprint!r}"
+                    ),
+                }
+            expected_after = payload.get("expected_after_fingerprint")
+            if not expected_after:
+                return {
+                    "broken": True,
+                    "reason": "receipt_chain_incomplete",
+                    "message": "claimed event missing expected_after_fingerprint",
+                }
+            if not _is_canonical_sha256(expected_after):
+                return {
+                    "broken": True,
+                    "reason": "receipt_chain_conflict",
+                    "message": f"claimed expected_after_fingerprint {expected_after!r} is not a canonical SHA-256",
+                }
+            claimed_expected_after = expected_after
+        elif ev_status == STATUS_APPLIED:
+            before_fp = payload.get("before_fingerprint")
+            if not before_fp:
+                return {
+                    "broken": True,
+                    "reason": "receipt_chain_incomplete",
+                    "message": "applied event missing before_fingerprint",
+                }
+            if not _is_canonical_sha256(before_fp):
+                return {
+                    "broken": True,
+                    "reason": "receipt_chain_conflict",
+                    "message": f"applied before_fingerprint {before_fp!r} is not a canonical SHA-256",
+                }
+            if before_fp != authorized_harness_fingerprint:
+                return {
+                    "broken": True,
+                    "reason": "receipt_chain_conflict",
+                    "message": (
+                        f"applied before_fingerprint {before_fp!r} does not match "
+                        f"claimed before_fingerprint {authorized_harness_fingerprint!r}"
+                    ),
+                }
+            after_fp = payload.get("after_fingerprint")
+            if not after_fp:
+                return {
+                    "broken": True,
+                    "reason": "receipt_chain_incomplete",
+                    "message": "applied event missing after_fingerprint",
+                }
+            if not _is_canonical_sha256(after_fp):
+                return {
+                    "broken": True,
+                    "reason": "receipt_chain_conflict",
+                    "message": f"applied after_fingerprint {after_fp!r} is not a canonical SHA-256",
+                }
+            if after_fp != claimed_expected_after:
+                return {
+                    "broken": True,
+                    "reason": "receipt_chain_conflict",
+                    "message": (
+                        f"applied after_fingerprint {after_fp!r} does not match "
+                        f"claimed expected_after_fingerprint {claimed_expected_after!r}"
+                    ),
+                }
+            applied_after = after_fp
+        elif ev_status == STATUS_CONSUMED:
+            task_done_event_id = payload.get("task_done_event_id")
+            if not task_done_event_id:
+                return {
+                    "broken": True,
+                    "reason": "receipt_chain_incomplete",
+                    "message": "consumed event missing task_done_event_id",
+                }
+            if not applied_after:
+                return {
+                    "broken": True,
+                    "reason": "receipt_chain_incomplete",
+                    "message": "consumed event missing applied after_fingerprint predecessor",
+                }
+            try:
+                task_done_row = get_event(conn, task_done_event_id)
+            except KeyError:
+                return {
+                    "broken": True,
+                    "reason": "receipt_chain_incomplete",
+                    "message": f"consumed event references missing task.done {task_done_event_id}",
+                }
+            if task_done_row["event_type"] != "task.done":
+                return {
+                    "broken": True,
+                    "reason": "receipt_chain_incomplete",
+                    "message": f"consumed event references non-task.done event {task_done_event_id}",
+                }
+            if (
+                task_done_row["workspace_id"] != workspace_id
+                or task_done_row["task_id"] != task_id
+            ):
+                return {
+                    "broken": True,
+                    "reason": "receipt_chain_conflict",
+                    "message": f"consumed event task.done {task_done_event_id} has wrong workspace/task",
+                }
+            task_done_payload = _json_loads(task_done_row["payload_json"])
+            if task_done_payload.get("receipt_id") != receipt_id:
+                return {
+                    "broken": True,
+                    "reason": "receipt_chain_conflict",
+                    "message": f"consumed event task.done {task_done_event_id} references another receipt",
+                }
+            applied_fingerprint = task_done_payload.get("applied_fingerprint")
+            if not applied_fingerprint:
+                return {
+                    "broken": True,
+                    "reason": "receipt_chain_incomplete",
+                    "message": f"task.done {task_done_event_id} missing applied_fingerprint",
+                }
+            if not _is_canonical_sha256(applied_fingerprint):
+                return {
+                    "broken": True,
+                    "reason": "receipt_chain_conflict",
+                    "message": f"task.done applied_fingerprint {applied_fingerprint!r} is not a canonical SHA-256",
+                }
+            if applied_fingerprint != applied_after:
+                return {
+                    "broken": True,
+                    "reason": "receipt_chain_conflict",
+                    "message": (
+                        f"consumed task.done applied_fingerprint {applied_fingerprint!r} does not match "
+                        f"applied after_fingerprint {applied_after!r}"
+                    ),
+                }
+
+        state["status"] = ev_status
+        if ev_status == "consumed":
+            state["terminal_event_id"] = event.get("id")
+
+    authorized_payload = events[0].get("payload") or {}
+    return {
+        "workspace_id": workspace_id,
+        "task_id": task_id,
+        "actor": actor,
+        "status": state.get("status", "authorized"),
+        "issued_at": authorized_payload.get("issued_at"),
+        "expires_at": authorized_payload.get("expires_at"),
+        "terminal_event_id": state.get("terminal_event_id"),
+    }
+
+
+def preflight_expired(state: dict[str, Any]) -> bool:
+    """Expiry projection shared by the CLI preflight handler and the MCP
+    facade: only an unused ``authorized`` receipt is invalidated by its
+    authorization window. A claimed/applied/consumed chain is authoritative
+    regardless of the original expiry, and a malformed expiry fails closed
+    as expired."""
+    status = state.get("status")
+    expires_at = state.get("expires_at")
+    if status != STATUS_AUTHORIZED or not expires_at:
+        return False
+    try:
+        return datetime.now(timezone.utc) > parse_iso_timestamp(expires_at)
+    except ValueError:
+        return True

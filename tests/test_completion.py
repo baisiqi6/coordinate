@@ -21,7 +21,9 @@ from coordinate.completion import (
     compute_item_fingerprint,
     compute_mark_done_fingerprints,
     consume_completion_receipt,
+    lookup_receipt_for_preflight,
     parse_iso_timestamp,
+    preflight_expired,
     prepare_completion_receipt,
 )
 from coordinate.db import (
@@ -99,6 +101,26 @@ def _done_fingerprint(task_id="mvp-001", branch="feat-x"):
         {"id": task_id, "status": "done",
          "workflow": {"status": "closed", "branch": branch}}
     )
+
+
+def _released_done_item(task_id="mvp-001", branch="feat-x", **overrides):
+    """A legitimately terminal deployed item: done/closed with owner and
+    session cleared and the lease stamped released_at."""
+    item = _item(task_id=task_id, status="done", workflow_status="closed",
+                 branch=branch)
+    item["verification"] = "evidence"
+    item["owner"] = None
+    item["selected_in_session"] = None
+    item["lease"] = {
+        "owner": "codex",
+        "session": "session-1",
+        "acquired_at": "2026-01-01T00:00:00Z",
+        "expires_at": "2026-01-02T00:00:00Z",
+        "ttl_minutes": 90,
+        "released_at": "2026-01-01T01:00:00Z",
+    }
+    item.update(overrides)
+    return item
 
 
 class _ReceiptHarness(unittest.TestCase):
@@ -240,8 +262,7 @@ class ActorBindingTests(_ReceiptHarness):
             workspace_id="demo", task_id="mvp-001", actor="operator",
             after_fingerprint=_done_fingerprint(),
         )
-        deployed = self._adapter(conn, items=[_item(status="done",
-                                                    workflow_status="closed")])
+        deployed = self._adapter(conn, items=[_released_done_item()])
         with self.assertRaises(CompletionReceiptError) as ctx:
             consume_completion_receipt(
                 conn, receipt_id=receipt.receipt_id, actor="intruder",
@@ -332,8 +353,7 @@ class ConsumeExpiryTests(_ReceiptHarness):
             ("2020-01-01T00:00:00Z", receipt.event["id"]),
         )
         conn.commit()
-        deployed = self._adapter(conn, items=[_item(status="done",
-                                                    workflow_status="closed")])
+        deployed = self._adapter(conn, items=[_released_done_item()])
         with self.assertRaises(CompletionReceiptError) as ctx:
             consume_completion_receipt(
                 conn, receipt_id=receipt.receipt_id, actor="operator",
@@ -362,8 +382,7 @@ class ConsumeExpiryTests(_ReceiptHarness):
             ("not-a-date", receipt.event["id"]),
         )
         conn.commit()
-        deployed = self._adapter(conn, items=[_item(status="done",
-                                                    workflow_status="closed")])
+        deployed = self._adapter(conn, items=[_released_done_item()])
         with self.assertRaises(CompletionReceiptError) as ctx:
             consume_completion_receipt(
                 conn, receipt_id=receipt.receipt_id, actor="operator",
@@ -443,8 +462,7 @@ class TwoPhaseProtocolTests(_ReceiptHarness):
             before_fingerprint=receipt.harness_fingerprint,
             expected_after_fingerprint=_done_fingerprint(),
         )
-        deployed = self._adapter(conn, items=[_item(status="done",
-                                                    workflow_status="closed")])
+        deployed = self._adapter(conn, items=[_released_done_item()])
         with self.assertRaises(CompletionReceiptError) as ctx:
             consume_completion_receipt(
                 conn, receipt_id=receipt.receipt_id, actor="operator",
@@ -697,8 +715,7 @@ class ConsumeCorrectnessTests(_ReceiptHarness):
         conn = self._make_conn()
         receipt = self._prepare(conn)
         self._claim_apply(conn, receipt)
-        deployed = self._adapter(conn, items=[_item(status="done",
-                                                    workflow_status="closed")])
+        deployed = self._adapter(conn, items=[_released_done_item()])
         result = consume_completion_receipt(
             conn, receipt_id=receipt.receipt_id, actor="operator",
             deployed_adapter=deployed,
@@ -713,8 +730,7 @@ class ConsumeCorrectnessTests(_ReceiptHarness):
         conn = self._make_conn()
         receipt = self._prepare(conn)
         self._claim_apply(conn, receipt)
-        deployed = self._adapter(conn, items=[_item(status="done",
-                                                    workflow_status="closed")])
+        deployed = self._adapter(conn, items=[_released_done_item()])
         first = consume_completion_receipt(
             conn, receipt_id=receipt.receipt_id, actor="operator",
             deployed_adapter=deployed,
@@ -742,14 +758,96 @@ class ConsumeCorrectnessTests(_ReceiptHarness):
         self.assertEqual(ctx.exception.reason, "deployed_not_done")
         self.assertEqual(self._count_events(conn, "task.done"), 0)
 
+    def test_consume_rejects_deployed_terminal_owner_retained(self):
+        """done/closed with a stale owner is an incomplete terminal state and
+        must fail closed with a dedicated reason."""
+        conn = self._make_conn()
+        receipt = self._prepare(conn)
+        self._claim_apply(conn, receipt)
+        item = _released_done_item()
+        item["owner"] = "codex"
+        deployed = self._adapter(conn, items=[item])
+        with self.assertRaises(CompletionReceiptError) as ctx:
+            consume_completion_receipt(
+                conn, receipt_id=receipt.receipt_id, actor="operator",
+                deployed_adapter=deployed,
+            )
+        self.assertEqual(ctx.exception.reason, "deployed_terminal_ownership_unreleased")
+        self.assertEqual(self._count_events(conn, "task.done"), 0)
+
+    def test_consume_rejects_deployed_terminal_session_retained(self):
+        """done/closed with a stale selected_in_session must fail closed."""
+        conn = self._make_conn()
+        receipt = self._prepare(conn)
+        self._claim_apply(conn, receipt)
+        item = _released_done_item()
+        item["selected_in_session"] = "session-1"
+        deployed = self._adapter(conn, items=[item])
+        with self.assertRaises(CompletionReceiptError) as ctx:
+            consume_completion_receipt(
+                conn, receipt_id=receipt.receipt_id, actor="operator",
+                deployed_adapter=deployed,
+            )
+        self.assertEqual(ctx.exception.reason, "deployed_terminal_ownership_unreleased")
+        self.assertEqual(self._count_events(conn, "task.done"), 0)
+
+    def test_consume_rejects_deployed_unreleased_lease(self):
+        """done/closed with an active lease (no released_at) must fail closed
+        even when owner/selected_in_session are already cleared."""
+        conn = self._make_conn()
+        receipt = self._prepare(conn)
+        self._claim_apply(conn, receipt)
+        item = _released_done_item()
+        del item["lease"]["released_at"]
+        deployed = self._adapter(conn, items=[item])
+        with self.assertRaises(CompletionReceiptError) as ctx:
+            consume_completion_receipt(
+                conn, receipt_id=receipt.receipt_id, actor="operator",
+                deployed_adapter=deployed,
+            )
+        self.assertEqual(ctx.exception.reason, "deployed_terminal_ownership_unreleased")
+        self.assertEqual(self._count_events(conn, "task.done"), 0)
+
+    def test_consume_rejects_deployed_empty_string_owner(self):
+        """owner="" is not JSON null: it must fail closed, not be treated
+        as released by truthiness."""
+        conn = self._make_conn()
+        receipt = self._prepare(conn)
+        self._claim_apply(conn, receipt)
+        item = _released_done_item()
+        item["owner"] = ""
+        deployed = self._adapter(conn, items=[item])
+        with self.assertRaises(CompletionReceiptError) as ctx:
+            consume_completion_receipt(
+                conn, receipt_id=receipt.receipt_id, actor="operator",
+                deployed_adapter=deployed,
+            )
+        self.assertEqual(ctx.exception.reason, "deployed_terminal_ownership_unreleased")
+        self.assertEqual(self._count_events(conn, "task.done"), 0)
+
+    def test_consume_rejects_deployed_empty_string_session(self):
+        """selected_in_session="" is not JSON null: it must fail closed."""
+        conn = self._make_conn()
+        receipt = self._prepare(conn)
+        self._claim_apply(conn, receipt)
+        item = _released_done_item()
+        item["selected_in_session"] = ""
+        deployed = self._adapter(conn, items=[item])
+        with self.assertRaises(CompletionReceiptError) as ctx:
+            consume_completion_receipt(
+                conn, receipt_id=receipt.receipt_id, actor="operator",
+                deployed_adapter=deployed,
+            )
+        self.assertEqual(ctx.exception.reason, "deployed_terminal_ownership_unreleased")
+        self.assertEqual(self._count_events(conn, "task.done"), 0)
+
     def test_consume_rejects_deployed_fingerprint_mismatch(self):
         conn = self._make_conn()
         receipt = self._prepare(conn)
         self._claim_apply(conn, receipt)
         # Deployed done/closed but on a DIFFERENT branch.
         deployed = self._adapter(
-            conn, items=[_item(status="done", workflow_status="closed",
-                              branch="other-branch")],
+            conn, items=[_released_done_item(branch="other-branch")],
         )
         with self.assertRaises(CompletionReceiptError) as ctx:
             consume_completion_receipt(
@@ -769,8 +867,7 @@ class ConsumeCorrectnessTests(_ReceiptHarness):
             idempotency_key="legacy:mvp-001:task.done",
             payload={"task_id": "mvp-001", "host_aware": "legacy"},
         )
-        deployed = self._adapter(conn, items=[_item(status="done",
-                                                    workflow_status="closed")])
+        deployed = self._adapter(conn, items=[_released_done_item()])
         with self.assertRaises(CompletionReceiptError) as ctx:
             consume_completion_receipt(
                 conn, receipt_id=receipt.receipt_id, actor="operator",
@@ -778,6 +875,29 @@ class ConsumeCorrectnessTests(_ReceiptHarness):
             )
         self.assertEqual(ctx.exception.reason, "task_already_done_other_authority")
         self.assertEqual(self._count_events(conn, "task.done"), 1)  # only the legacy one
+
+
+class TerminalOwnershipProblemTests(unittest.TestCase):
+    """Boundary of the shared terminal-ownership predicate: only exact JSON
+    null releases owner/selected_in_session; released_at must be non-empty."""
+
+    def test_empty_string_owner_is_not_released(self):
+        self.assertIsNotNone(completion.terminal_ownership_problem({"owner": ""}))
+        self.assertIsNotNone(completion.terminal_ownership_problem(
+            {"owner": "", "selected_in_session": None}))
+        self.assertIsNotNone(completion.terminal_ownership_problem(
+            {"selected_in_session": ""}))
+        self.assertIsNone(completion.terminal_ownership_problem(
+            {"owner": None, "selected_in_session": None}))
+
+    def test_lease_released_at_must_be_non_empty(self):
+        self.assertIsNotNone(completion.terminal_ownership_problem(
+            {"lease": {"released_at": ""}}))
+        self.assertIsNotNone(completion.terminal_ownership_problem(
+            {"lease": {"released_at": None}}))
+        self.assertIsNone(completion.terminal_ownership_problem(
+            {"lease": {"released_at": "2026-01-01T01:00:00Z"}}))
+        self.assertIsNone(completion.terminal_ownership_problem({}))
 
 
 # --------------------------------------------------------------------------
@@ -936,6 +1056,279 @@ class FingerprintTests(unittest.TestCase):
         dt = parse_iso_timestamp("2026-01-02T03:04:05Z")
         self.assertEqual(dt.tzinfo, timezone.utc)
         self.assertEqual(dt.year, 2026)
+
+
+# --------------------------------------------------------------------------
+# R5B: shared preflight derivation (CLI and MCP facade use one state machine)
+# --------------------------------------------------------------------------
+
+
+class LookupReceiptForPreflightTests(_ReceiptHarness):
+    """The shared receipt-state derivation used by the CLI preflight handler
+    and the MCP completion_preflight facade (single source, no copy)."""
+
+    def _claim_apply(self, conn, receipt, *, actor="operator"):
+        claim_completion_receipt(
+            conn, receipt_id=receipt.receipt_id,
+            workspace_id="demo", task_id="mvp-001", actor=actor,
+            before_fingerprint=receipt.harness_fingerprint,
+            expected_after_fingerprint=_done_fingerprint(),
+        )
+        apply_completion_receipt(
+            conn, receipt_id=receipt.receipt_id,
+            workspace_id="demo", task_id="mvp-001", actor=actor,
+            after_fingerprint=_done_fingerprint(),
+        )
+
+    def test_unknown_receipt_returns_none(self):
+        conn = self._make_conn()
+        self.assertIsNone(
+            lookup_receipt_for_preflight(conn, "missing-receipt")
+        )
+
+    def test_authorized_only_state(self):
+        conn = self._make_conn()
+        receipt = self._prepare(conn)
+        state = lookup_receipt_for_preflight(conn, receipt.receipt_id)
+        self.assertIsNotNone(state)
+        self.assertEqual(state["status"], "authorized")
+        self.assertEqual(state["workspace_id"], "demo")
+        self.assertEqual(state["task_id"], "mvp-001")
+        self.assertEqual(state["actor"], "operator")
+        self.assertEqual(state["issued_at"], receipt.issued_at)
+        self.assertEqual(state["expires_at"], receipt.expires_at)
+        self.assertIsNone(state.get("terminal_event_id"))
+
+    def test_consumed_chain_wins_and_carries_terminal_event_id(self):
+        conn = self._make_conn()
+        receipt = self._prepare(conn)
+        self._claim_apply(conn, receipt)
+        deployed = self._adapter(conn, items=[_released_done_item()])
+        consume_completion_receipt(
+            conn, receipt_id=receipt.receipt_id, actor="operator",
+            deployed_adapter=deployed,
+        )
+        consumed_row = next(
+            r for r in list_events(conn, "demo")
+            if row_to_dict(r)["event_type"] == "completion.consumed"
+        )
+        state = lookup_receipt_for_preflight(conn, receipt.receipt_id)
+        self.assertEqual(state["status"], "consumed")
+        self.assertEqual(state["terminal_event_id"], consumed_row["id"])
+
+    def test_chain_without_authorized_start_is_broken(self):
+        conn = self._make_conn()
+        append_event(
+            conn, event_type="completion.claimed", actor="operator",
+            workspace_id="demo", target="mvp-001", task_id="mvp-001",
+            idempotency_key="r5b:claimed",
+            payload={
+                "receipt_id": "r1", "workspace_id": "demo",
+                "task_id": "mvp-001", "authorized_actor": "operator",
+                "before_fingerprint": "a" * 64,
+                "expected_after_fingerprint": "b" * 64,
+                "status": "claimed",
+            },
+        )
+        state = lookup_receipt_for_preflight(conn, "r1")
+        self.assertIsNotNone(state)
+        self.assertTrue(state["broken"])
+        self.assertEqual(state["reason"], "receipt_chain_incomplete")
+
+    def test_duplicate_transition_is_broken(self):
+        conn = self._make_conn()
+        receipt = self._prepare(conn)
+        # Two completion.authorized events for the same receipt.
+        append_event(
+            conn, event_type="completion.authorized", actor="operator",
+            workspace_id="demo", target="mvp-001", task_id="mvp-001",
+            idempotency_key="r5b:authorized-dup",
+            payload={
+                "receipt_id": receipt.receipt_id, "workspace_id": "demo",
+                "task_id": "mvp-001", "authorized_actor": "operator",
+                "harness_fingerprint": receipt.harness_fingerprint,
+                "status": "authorized",
+            },
+        )
+        state = lookup_receipt_for_preflight(conn, receipt.receipt_id)
+        self.assertTrue(state["broken"])
+        self.assertEqual(state["reason"], "receipt_chain_conflict")
+
+    def test_claimed_before_mismatching_authorized_fingerprint_is_broken(self):
+        conn = self._make_conn()
+        receipt = self._prepare(conn)
+        append_event(
+            conn, event_type="completion.claimed", actor="operator",
+            workspace_id="demo", target="mvp-001", task_id="mvp-001",
+            idempotency_key="r5b:claimed-drift",
+            payload={
+                "receipt_id": receipt.receipt_id, "workspace_id": "demo",
+                "task_id": "mvp-001", "authorized_actor": "operator",
+                "before_fingerprint": "f" * 64,
+                "expected_after_fingerprint": _done_fingerprint(),
+                "status": "claimed",
+            },
+        )
+        state = lookup_receipt_for_preflight(conn, receipt.receipt_id)
+        self.assertTrue(state["broken"])
+        self.assertEqual(state["reason"], "receipt_chain_conflict")
+
+    def test_applied_after_mismatching_claimed_expected_is_broken(self):
+        conn = self._make_conn()
+        receipt = self._prepare(conn)
+        claim_completion_receipt(
+            conn, receipt_id=receipt.receipt_id,
+            workspace_id="demo", task_id="mvp-001", actor="operator",
+            before_fingerprint=receipt.harness_fingerprint,
+            expected_after_fingerprint=_done_fingerprint(),
+        )
+        append_event(
+            conn, event_type="completion.applied", actor="operator",
+            workspace_id="demo", target="mvp-001", task_id="mvp-001",
+            idempotency_key="r5b:applied-drift",
+            payload={
+                "receipt_id": receipt.receipt_id, "workspace_id": "demo",
+                "task_id": "mvp-001", "authorized_actor": "operator",
+                "before_fingerprint": receipt.harness_fingerprint,
+                "after_fingerprint": "c" * 64,
+                "status": "applied",
+            },
+        )
+        state = lookup_receipt_for_preflight(conn, receipt.receipt_id)
+        self.assertTrue(state["broken"])
+        self.assertEqual(state["reason"], "receipt_chain_conflict")
+
+    def test_consumed_referencing_wrong_receipt_is_broken(self):
+        conn = self._make_conn()
+        receipt = self._prepare(conn)
+        self._claim_apply(conn, receipt)
+        done = append_event(
+            conn, event_type="task.done", actor="operator",
+            workspace_id="demo", target="mvp-001", task_id="mvp-001",
+            idempotency_key="r5b:task.done",
+            payload={
+                "task_id": "mvp-001", "receipt_id": "other-receipt",
+                "applied_fingerprint": _done_fingerprint(),
+            },
+        )
+        consumed = append_event(
+            conn, event_type="completion.consumed", actor="operator",
+            workspace_id="demo", target="mvp-001", task_id="mvp-001",
+            idempotency_key="r5b:consumed",
+            payload={
+                "receipt_id": receipt.receipt_id, "workspace_id": "demo",
+                "task_id": "mvp-001", "authorized_actor": "operator",
+                "task_done_event_id": done.row["id"],
+                "status": "consumed",
+            },
+        )
+        state = lookup_receipt_for_preflight(conn, receipt.receipt_id)
+        self.assertTrue(state["broken"])
+        self.assertEqual(state["reason"], "receipt_chain_conflict")
+
+    def test_broken_chain_keeps_workspace_task_fields(self):
+        conn = self._make_conn()
+        receipt = self._prepare(conn)
+        append_event(
+            conn, event_type="completion.claimed", actor="operator",
+            workspace_id="demo", target="mvp-001", task_id="mvp-001",
+            idempotency_key="r5b:claimed-dup",
+            payload={
+                "receipt_id": receipt.receipt_id, "workspace_id": "demo",
+                "task_id": "mvp-001", "authorized_actor": "operator",
+                "before_fingerprint": receipt.harness_fingerprint,
+                "expected_after_fingerprint": _done_fingerprint(),
+                "status": "claimed",
+            },
+        )
+        state = lookup_receipt_for_preflight(conn, receipt.receipt_id)
+        self.assertEqual(state["workspace_id"], "demo")
+        self.assertEqual(state["task_id"], "mvp-001")
+
+
+class PreflightExpiryHelperTests(_ReceiptHarness):
+    """The authorized-only expiry projection shared with the MCP facade."""
+
+    def test_authorized_receipt_expired_true(self):
+        self.assertTrue(preflight_expired({
+            "status": "authorized",
+            "expires_at": "2020-01-01T00:00:00Z",
+        }))
+
+    def test_authorized_receipt_not_expired_false(self):
+        future = (datetime.now(timezone.utc) + __import__("datetime").timedelta(hours=1))
+        stamp = future.strftime("%Y-%m-%dT%H:%M:%SZ")
+        self.assertFalse(preflight_expired({
+            "status": "authorized", "expires_at": stamp,
+        }))
+
+    def test_terminal_chain_ignores_authorization_expiry(self):
+        for status in ("claimed", "applied", "consumed"):
+            with self.subTest(status=status):
+                self.assertFalse(preflight_expired({
+                    "status": status, "expires_at": "2020-01-01T00:00:00Z",
+                }))
+
+    def test_malformed_expiry_treated_as_expired(self):
+        self.assertTrue(preflight_expired({
+            "status": "authorized", "expires_at": "not-a-date",
+        }))
+
+
+class ConsumeWorkspaceBindingTests(_ReceiptHarness):
+    """R5B: consume takes an expected workspace so the MCP middleware can
+    scope first and the domain can bind the receipt to it."""
+
+    def _claim_apply(self, conn, receipt):
+        claim_completion_receipt(
+            conn, receipt_id=receipt.receipt_id,
+            workspace_id="demo", task_id="mvp-001", actor="operator",
+            before_fingerprint=receipt.harness_fingerprint,
+            expected_after_fingerprint=_done_fingerprint(),
+        )
+        apply_completion_receipt(
+            conn, receipt_id=receipt.receipt_id,
+            workspace_id="demo", task_id="mvp-001", actor="operator",
+            after_fingerprint=_done_fingerprint(),
+        )
+
+    def test_consume_rejects_expected_workspace_mismatch(self):
+        conn = self._make_conn()
+        receipt = self._prepare(conn)
+        self._claim_apply(conn, receipt)
+        deployed = self._adapter(conn, items=[_released_done_item()])
+        with self.assertRaises(CompletionReceiptError) as ctx:
+            consume_completion_receipt(
+                conn, receipt_id=receipt.receipt_id, actor="operator",
+                deployed_adapter=deployed,
+                expected_workspace_id="other",
+            )
+        self.assertEqual(ctx.exception.reason, "workspace_mismatch")
+        self.assertEqual(self._count_events(conn, "task.done"), 0)
+
+    def test_consume_accepts_matching_expected_workspace(self):
+        conn = self._make_conn()
+        receipt = self._prepare(conn)
+        self._claim_apply(conn, receipt)
+        deployed = self._adapter(conn, items=[_released_done_item()])
+        result = consume_completion_receipt(
+            conn, receipt_id=receipt.receipt_id, actor="operator",
+            deployed_adapter=deployed,
+            expected_workspace_id="demo",
+        )
+        self.assertTrue(result.event_created)
+        self.assertEqual(self._count_events(conn, "task.done"), 1)
+
+    def test_consume_without_expected_workspace_keeps_legacy_behavior(self):
+        conn = self._make_conn()
+        receipt = self._prepare(conn)
+        self._claim_apply(conn, receipt)
+        deployed = self._adapter(conn, items=[_released_done_item()])
+        result = consume_completion_receipt(
+            conn, receipt_id=receipt.receipt_id, actor="operator",
+            deployed_adapter=deployed,
+        )
+        self.assertTrue(result.event_created)
 
 
 if __name__ == "__main__":

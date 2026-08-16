@@ -22,6 +22,7 @@ from .db import (
     row_to_dict,
 )
 from .executor_routing import is_routed_job
+from .execution_leases import release_attempt_lease
 
 
 class JobError(RuntimeError):
@@ -190,25 +191,48 @@ def cancel_job(
     reason: str | None = None,
     actor: str = "operator",
 ) -> CancelJobResult:
-    job = get_job(conn, job_id)
-    if job["status"] in {"done", "failed"}:
-        raise JobError(f"job {job_id} is {job['status']}; completed jobs cannot be cancelled")
+    with conn:
+        job = get_job(conn, job_id)
+        if job["status"] in {"done", "failed"}:
+            raise JobError(
+                f"job {job_id} is {job['status']}; completed jobs cannot be cancelled"
+            )
 
-    cancelled = mark_job_cancelled(conn, job_id=job_id, reason=reason)
-    event = append_event(
-        conn,
-        workspace_id=job["workspace_id"],
-        event_type="job.cancelled",
-        actor=actor,
-        task_id=job["task_id"],
-        idempotency_key=f"job:{job_id}:cancelled",
-        payload={
-            "job_id": job_id,
-            "status": "cancelled",
-            "previous_status": job["status"],
-            "reason": reason,
-        },
-    )
+        lease = conn.execute(
+            """
+            SELECT * FROM execution_attempt_leases
+            WHERE job_id = ? AND attempt_token = ? AND status = 'active'
+            """,
+            (job_id, job["attempt_count"]),
+        ).fetchone()
+        if lease is not None:
+            release_attempt_lease(
+                conn,
+                lease_id=lease["lease_id"],
+                job_id=job_id,
+                attempt_token=lease["attempt_token"],
+                agent_id=lease["agent_id"],
+                reason="job_cancelled",
+            )
+
+        cancelled = mark_job_cancelled(
+            conn, job_id=job_id, reason=reason, commit=False
+        )
+        event = append_event(
+            conn,
+            workspace_id=job["workspace_id"],
+            event_type="job.cancelled",
+            actor=actor,
+            task_id=job["task_id"],
+            idempotency_key=f"job:{job_id}:cancelled",
+            payload={
+                "job_id": job_id,
+                "status": "cancelled",
+                "previous_status": job["status"],
+                "reason": reason,
+            },
+            commit=False,
+        )
     return CancelJobResult(
         job=row_to_dict(cancelled),
         event=row_to_dict(event.row),

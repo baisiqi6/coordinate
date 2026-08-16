@@ -12,7 +12,7 @@ import sqlite3
 
 from .db import append_event, get_workspace, row_to_dict, upsert_task_mirror
 from .onboarding import create_plan_task
-from .policy import create_delivery_for_event
+from .policy import attempt_delivery_for_event, resolve_delivery_intent
 from .split_operations import (
     REASON_FILES_NOT_DEPLOYED,
     REASON_OPERATION_CONFLICT,
@@ -318,6 +318,7 @@ class IssueTriageResult:
     task: dict[str, Any] | None
     delivery: dict[str, Any] | None
     delivery_created: bool | None
+    delivery_error: str | None = None
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -330,6 +331,9 @@ class IssueTriageResult:
             "task": self.task,
             "delivery": self.delivery,
             "delivery_created": self.delivery_created,
+            "authority_committed": self.event.get("event_type") == "issue.triaged",
+            "partial": self.delivery_error is not None,
+            "delivery_error": self.delivery_error,
         }
 
 
@@ -407,8 +411,9 @@ def triage_issue(
         prior_decision = prior_payload.get("decision")
         prior_task = prior_payload.get("task_id")
         if prior_decision == decision and prior_task == task_id:
-            delivery_dict, delivery_created = _try_create_delivery(
-                conn, prior["id"], workspace, platform, destination
+            delivery = attempt_delivery_for_event(
+                conn, prior["id"], workspace=workspace,
+                platform=platform, destination=destination,
             )
             return IssueTriageResult(
                 workspace_id=workspace_id,
@@ -418,14 +423,26 @@ def triage_issue(
                 event=prior,
                 event_created=False,
                 task=None,
-                delivery=delivery_dict,
-                delivery_created=delivery_created,
+                delivery=delivery.delivery,
+                delivery_created=delivery.delivery_created,
+                delivery_error=delivery.delivery_error,
             )
         prior_task_suffix = f" (task_id={prior_task})" if prior_task else ""
         raise IssueTriageError(
             f"issue {event_id} already triaged as {prior_decision}{prior_task_suffix}; "
             f"refusing conflicting decision={decision}"
         )
+
+    # Prevalidate the delivery intent BEFORE the first authority write
+    # (task mirror / issue.triaged event): a policy-known unsupported platform
+    # must fail closed with zero mutations. A missing effective value is a
+    # normal skip and does not validate the other value.
+    resolve_delivery_intent(
+        platform=platform,
+        destination=destination,
+        default_bus=workspace.default_bus,
+        default_destination=workspace.default_destination,
+    )
 
     # accept: create task mirror carrying GitHub issue metadata (untrusted).
     task_dict: dict[str, Any] | None = None
@@ -488,8 +505,9 @@ def triage_issue(
     )
     event_dict = row_to_dict(event_result.row)
 
-    delivery_dict, delivery_created = _try_create_delivery(
-        conn, event_result.row["id"], workspace, platform, destination
+    delivery = attempt_delivery_for_event(
+        conn, event_result.row["id"], workspace=workspace,
+        platform=platform, destination=destination,
     )
 
     return IssueTriageResult(
@@ -500,28 +518,10 @@ def triage_issue(
         event=event_dict,
         event_created=event_result.created,
         task=task_dict,
-        delivery=delivery_dict,
-        delivery_created=delivery_created,
+        delivery=delivery.delivery,
+        delivery_created=delivery.delivery_created,
+        delivery_error=delivery.delivery_error,
     )
-
-
-def _try_create_delivery(
-    conn: sqlite3.Connection,
-    event_id: str,
-    workspace: Any,
-    platform: str | None,
-    destination: str | None,
-) -> tuple[dict[str, Any] | None, bool | None]:
-    effective_platform = platform or (workspace.default_bus if workspace else None)
-    effective_destination = destination or (
-        workspace.default_destination if workspace else None
-    )
-    if not effective_platform or not effective_destination:
-        return None, None
-    result = create_delivery_for_event(
-        conn, event_id, platform=effective_platform, destination=effective_destination
-    )
-    return result.delivery, result.created
 
 
 @dataclass(frozen=True)
@@ -537,6 +537,7 @@ class IssueMaterializeResult:
     event_created: bool
     delivery: dict[str, Any] | None
     delivery_created: bool | None
+    delivery_error: str | None = None
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -551,6 +552,9 @@ class IssueMaterializeResult:
             "event_created": self.event_created,
             "delivery": self.delivery,
             "delivery_created": self.delivery_created,
+            "authority_committed": self.event.get("event_type") == "issue.materialized",
+            "partial": self.delivery_error is not None,
+            "delivery_error": self.delivery_error,
         }
 
 
@@ -675,8 +679,9 @@ def materialize_issue(
         prior_task = prior_payload.get("task_id")
         prior_plan = prior_payload.get("plan_doc")
         if prior_task == resolved_task_id and prior_plan == plan_doc:
-            delivery_dict, delivery_created = _try_create_delivery(
-                conn, prior["id"], workspace, platform, destination
+            delivery = attempt_delivery_for_event(
+                conn, prior["id"], workspace=workspace,
+                platform=platform, destination=destination,
             )
             current_task = _read_task_mirror(conn, workspace_id, resolved_task_id)
             return IssueMaterializeResult(
@@ -692,8 +697,9 @@ def materialize_issue(
                 or {},
                 event=prior,
                 event_created=False,
-                delivery=delivery_dict,
-                delivery_created=delivery_created,
+                delivery=delivery.delivery,
+                delivery_created=delivery.delivery_created,
+                delivery_error=delivery.delivery_error,
             )
         raise IssueTriageError(
             f"issue.triaged event {event_id} already materialized as "
@@ -701,6 +707,17 @@ def materialize_issue(
             f"refusing conflicting materialize task_id={resolved_task_id}, "
             f"plan_doc={plan_doc}"
         )
+
+    # Prevalidate the delivery intent BEFORE the first authority write
+    # (create_plan_task / checklist / issue.materialized event): a policy-known
+    # unsupported platform must fail closed with zero mutations. A missing
+    # effective value is a normal skip and does not validate the other value.
+    resolve_delivery_intent(
+        platform=platform,
+        destination=destination,
+        default_bus=workspace.default_bus,
+        default_destination=workspace.default_destination,
+    )
 
     # Reuse create_plan_task: writes plan.ready + syncs the checklist +
     # upserts the task mirror. GitHub issue metadata rides in the payload,
@@ -753,8 +770,9 @@ def materialize_issue(
     )
     event_dict = row_to_dict(event_result.row)
 
-    delivery_dict, delivery_created = _try_create_delivery(
-        conn, event_result.row["id"], workspace, platform, destination
+    delivery = attempt_delivery_for_event(
+        conn, event_result.row["id"], workspace=workspace,
+        platform=platform, destination=destination,
     )
 
     current_task = _read_task_mirror(conn, workspace_id, resolved_task_id)
@@ -768,8 +786,9 @@ def materialize_issue(
         plan_ready_event=plan_result.event,
         event=event_dict,
         event_created=event_result.created,
-        delivery=delivery_dict,
-        delivery_created=delivery_created,
+        delivery=delivery.delivery,
+        delivery_created=delivery.delivery_created,
+        delivery_error=delivery.delivery_error,
     )
 
 

@@ -173,6 +173,7 @@ def mark_job_cancelled(
     *,
     job_id: str,
     reason: str | None = None,
+    commit: bool = True,
 ) -> sqlite3.Row:
     job = get_job(conn, job_id)
     if job["status"] == "cancelled":
@@ -198,5 +199,6 @@ def mark_job_cancelled(
         """,
         ("cancelled", _json_dumps(result), now, now, job_id),
     )
-    conn.commit()
+    if commit:
+        conn.commit()
     return get_job(conn, job_id)

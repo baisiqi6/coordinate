@@ -20,6 +20,8 @@
     "task create",
     "task create-files",
     "task create-record",
+    "task update-dependencies",
+    "task update-dependencies-files",
     "task handoff",
     "plan revise",
     "plan review-request",
@@ -89,12 +91,14 @@
     "assignment mark-done-files",
     "assignment mark-done-record",
     "operator pending",
+    "mcp serve",
+    "runtime-http serve",
     "serve"
   ],
   "metadata": {
     "default_db_path_sha256": "853182c0ba6a6dcd1e5a70dcb45bb3fcb80f31d53e26c28f29d4dae861a389b5",
-    "leaf_count": 90,
-    "node_count": 118,
+    "leaf_count": 94,
+    "node_count": 124,
     "prog": "coordinate",
     "top_level_commands": [
       "workspace",
@@ -117,6 +121,8 @@
       "runtime",
       "assignment",
       "operator",
+      "mcp",
+      "runtime-http",
       "serve"
     ]
   },
@@ -192,6 +198,8 @@
             "runtime",
             "assignment",
             "operator",
+            "mcp",
+            "runtime-http",
             "serve"
           ],
           "const": null,
@@ -206,7 +214,7 @@
         }
       ],
       "defaults": {},
-      "help": "usage: coordinate [-h] [--db DB] [--version]\n                  {workspace,state,event,task,plan,runner,reconcile,branch,pr,ci,review,merge,issue,job,delivery,policy,worker,runtime,assignment,operator,serve}\n                  ...\n\npositional arguments:\n  {workspace,state,event,task,plan,runner,reconcile,branch,pr,ci,review,merge,issue,job,delivery,policy,worker,runtime,assignment,operator,serve}\n    workspace           Manage harness workspaces\n    state               Refresh and print harness state for a workspace\n    event               Append or inspect normalized events\n    task                Create and inspect coordinator task mirrors\n    plan                Plan review and approval gate\n    runner              Manage runner profiles\n    reconcile           Sync coordinator task mirror from harness state\n    branch              Manage branch allocations\n    pr                  Manage PR links\n    ci                  Check CI status\n    review              Check PR review status\n    merge               Check merge readiness\n    issue               Scan and triage GitHub issues\n    job                 Create, run, and list jobs\n    delivery            Create, send, and list bus deliveries\n    policy              Render workflow events into visible deliveries\n    worker              Run coordinator worker loops\n    runtime             Bridge and agentd runtime operations\n    assignment          Manage task assignments\n    operator            Operator-facing pending-action queries\n    serve               Run coordinator daemon with Discord bot\n\noptions:\n  -h, --help            show this help message and exit\n  --db DB               SQLite database path\n  --version             show program's version number and exit\n",
+      "help": "usage: coordinate [-h] [--db DB] [--version]\n                  {workspace,state,event,task,plan,runner,reconcile,branch,pr,ci,review,merge,issue,job,delivery,policy,worker,runtime,assignment,operator,mcp,runtime-http,serve}\n                  ...\n\npositional arguments:\n  {workspace,state,event,task,plan,runner,reconcile,branch,pr,ci,review,merge,issue,job,delivery,policy,worker,runtime,assignment,operator,mcp,runtime-http,serve}\n    workspace           Manage harness workspaces\n    state               Refresh and print harness state for a workspace\n    event               Append or inspect normalized events\n    task                Create and inspect coordinator task mirrors\n    plan                Plan review and approval gate\n    runner              Manage runner profiles\n    reconcile           Sync coordinator task mirror from harness state\n    branch              Manage branch allocations\n    pr                  Manage PR links\n    ci                  Check CI status\n    review              Check PR review status\n    merge               Check merge readiness\n    issue               Scan and triage GitHub issues\n    job                 Create, run, and list jobs\n    delivery            Create, send, and list bus deliveries\n    policy              Render workflow events into visible deliveries\n    worker              Run coordinator worker loops\n    runtime             Bridge and agentd runtime operations\n    assignment          Manage task assignments\n    operator            Operator-facing pending-action queries\n    mcp                 MCP agent interface (stdio / streamable HTTP)\n    runtime-http        Loopback runtime HTTP data plane (R2A)\n    serve               Run coordinator daemon with Discord bot\n\noptions:\n  -h, --help            show this help message and exit\n  --db DB               SQLite database path\n  --version             show program's version number and exit\n",
       "path": [],
       "prog": "coordinate"
     },
@@ -2034,6 +2042,8 @@
             "create",
             "create-files",
             "create-record",
+            "update-dependencies",
+            "update-dependencies-files",
             "handoff"
           ],
           "const": null,
@@ -2048,7 +2058,7 @@
         }
       ],
       "defaults": {},
-      "help": "usage: coordinate task [-h] {create,create-files,create-record,handoff} ...\n\npositional arguments:\n  {create,create-files,create-record,handoff}\n    create              Combined managed create: checklist file half first, DB record half second\n                        (idempotent; --operation-id to pin)\n    create-files        Coding-host half of host-aware task create: checklist file half only (no\n                        DB write)\n    create-record       Server half of host-aware task create: write DB task mirror + plan.ready\n                        only (no checklist write)\n    handoff             Generate a structured worker handoff\n\noptions:\n  -h, --help            show this help message and exit\n",
+      "help": "usage: coordinate task [-h]\n                       {create,create-files,create-record,update-dependencies,update-dependencies-files,handoff}\n                       ...\n\npositional arguments:\n  {create,create-files,create-record,update-dependencies,update-dependencies-files,handoff}\n    create              Combined managed create: checklist file half first, DB record half second\n                        (idempotent; --operation-id to pin)\n    create-files        Coding-host half of host-aware task create: checklist file half only (no\n                        DB write)\n    create-record       Server half of host-aware task create: write DB task mirror + plan.ready\n                        only (no checklist write)\n    update-dependencies\n                        Combined managed dependency update: checklist file mutation first, state\n                        refresh + targeted reconcile second (idempotent)\n    update-dependencies-files\n                        Coding-host half of dependency update: canonical checklist file only (no\n                        DB write, no harnessctl preflight)\n    handoff             Generate a structured worker handoff\n\noptions:\n  -h, --help            show this help message and exit\n",
       "path": [
         "task"
       ],
@@ -2725,6 +2735,242 @@
         "create-record"
       ],
       "prog": "coordinate task create-record"
+    },
+    {
+      "actions": [
+        {
+          "action_class": "_HelpAction",
+          "choices": null,
+          "const": null,
+          "default": "==SUPPRESS==",
+          "dest": "help",
+          "help": "show this help message and exit",
+          "metavar": null,
+          "nargs": 0,
+          "option_strings": [
+            "-h",
+            "--help"
+          ],
+          "required": false,
+          "type": null
+        },
+        {
+          "action_class": "_StoreAction",
+          "choices": null,
+          "const": null,
+          "default": null,
+          "dest": "workspace_id",
+          "help": null,
+          "metavar": null,
+          "nargs": null,
+          "option_strings": [],
+          "required": true,
+          "type": null
+        },
+        {
+          "action_class": "_StoreAction",
+          "choices": null,
+          "const": null,
+          "default": null,
+          "dest": "task_id",
+          "help": null,
+          "metavar": null,
+          "nargs": null,
+          "option_strings": [
+            "--task-id"
+          ],
+          "required": true,
+          "type": null
+        },
+        {
+          "action_class": "_AppendAction",
+          "choices": null,
+          "const": null,
+          "default": [],
+          "dest": "add",
+          "help": "Existing dependency id to add (repeatable; order preserved, duplicates deduped)",
+          "metavar": null,
+          "nargs": null,
+          "option_strings": [
+            "--add"
+          ],
+          "required": false,
+          "type": null
+        },
+        {
+          "action_class": "_AppendAction",
+          "choices": null,
+          "const": null,
+          "default": [],
+          "dest": "remove",
+          "help": "Dependency id to remove (repeatable; order preserved, duplicates deduped)",
+          "metavar": null,
+          "nargs": null,
+          "option_strings": [
+            "--remove"
+          ],
+          "required": false,
+          "type": null
+        },
+        {
+          "action_class": "_StoreTrueAction",
+          "choices": null,
+          "const": true,
+          "default": false,
+          "dest": "allow_runtime_copy",
+          "help": "Override the /opt runtime-copy guard",
+          "metavar": null,
+          "nargs": 0,
+          "option_strings": [
+            "--allow-runtime-copy"
+          ],
+          "required": false,
+          "type": null
+        }
+      ],
+      "defaults": {
+        "handler": "coordinate.planning_cli.handle_task_update_dependencies"
+      },
+      "help": "usage: coordinate task update-dependencies [-h] --task-id TASK_ID [--add ADD] [--remove REMOVE]\n                                           [--allow-runtime-copy]\n                                           workspace_id\n\npositional arguments:\n  workspace_id\n\noptions:\n  -h, --help            show this help message and exit\n  --task-id TASK_ID\n  --add ADD             Existing dependency id to add (repeatable; order preserved, duplicates\n                        deduped)\n  --remove REMOVE       Dependency id to remove (repeatable; order preserved, duplicates deduped)\n  --allow-runtime-copy  Override the /opt runtime-copy guard\n",
+      "path": [
+        "task",
+        "update-dependencies"
+      ],
+      "prog": "coordinate task update-dependencies"
+    },
+    {
+      "actions": [
+        {
+          "action_class": "_HelpAction",
+          "choices": null,
+          "const": null,
+          "default": "==SUPPRESS==",
+          "dest": "help",
+          "help": "show this help message and exit",
+          "metavar": null,
+          "nargs": 0,
+          "option_strings": [
+            "-h",
+            "--help"
+          ],
+          "required": false,
+          "type": null
+        },
+        {
+          "action_class": "_StoreAction",
+          "choices": null,
+          "const": null,
+          "default": null,
+          "dest": "workspace_path",
+          "help": "Absolute path to the coding-host checkout (relative paths rejected)",
+          "metavar": null,
+          "nargs": null,
+          "option_strings": [
+            "--workspace-path"
+          ],
+          "required": true,
+          "type": null
+        },
+        {
+          "action_class": "_StoreAction",
+          "choices": null,
+          "const": null,
+          "default": null,
+          "dest": "harness_root",
+          "help": "Absolute harness root path (relative paths rejected; external roots supported)",
+          "metavar": null,
+          "nargs": null,
+          "option_strings": [
+            "--harness-root"
+          ],
+          "required": true,
+          "type": null
+        },
+        {
+          "action_class": "_StoreAction",
+          "choices": null,
+          "const": null,
+          "default": null,
+          "dest": "workspace_id",
+          "help": null,
+          "metavar": null,
+          "nargs": null,
+          "option_strings": [
+            "--workspace-id"
+          ],
+          "required": true,
+          "type": null
+        },
+        {
+          "action_class": "_StoreAction",
+          "choices": null,
+          "const": null,
+          "default": null,
+          "dest": "task_id",
+          "help": null,
+          "metavar": null,
+          "nargs": null,
+          "option_strings": [
+            "--task-id"
+          ],
+          "required": true,
+          "type": null
+        },
+        {
+          "action_class": "_AppendAction",
+          "choices": null,
+          "const": null,
+          "default": [],
+          "dest": "add",
+          "help": "Existing dependency id to add (repeatable; order preserved, duplicates deduped)",
+          "metavar": null,
+          "nargs": null,
+          "option_strings": [
+            "--add"
+          ],
+          "required": false,
+          "type": null
+        },
+        {
+          "action_class": "_AppendAction",
+          "choices": null,
+          "const": null,
+          "default": [],
+          "dest": "remove",
+          "help": "Dependency id to remove (repeatable; order preserved, duplicates deduped)",
+          "metavar": null,
+          "nargs": null,
+          "option_strings": [
+            "--remove"
+          ],
+          "required": false,
+          "type": null
+        },
+        {
+          "action_class": "_StoreTrueAction",
+          "choices": null,
+          "const": true,
+          "default": false,
+          "dest": "allow_runtime_copy",
+          "help": "Override the /opt runtime-copy guard",
+          "metavar": null,
+          "nargs": 0,
+          "option_strings": [
+            "--allow-runtime-copy"
+          ],
+          "required": false,
+          "type": null
+        }
+      ],
+      "defaults": {
+        "handler": "coordinate.planning_cli.handle_task_update_dependencies_files"
+      },
+      "help": "usage: coordinate task update-dependencies-files [-h] --workspace-path WORKSPACE_PATH\n                                                 --harness-root HARNESS_ROOT --workspace-id\n                                                 WORKSPACE_ID --task-id TASK_ID [--add ADD]\n                                                 [--remove REMOVE] [--allow-runtime-copy]\n\noptions:\n  -h, --help            show this help message and exit\n  --workspace-path WORKSPACE_PATH\n                        Absolute path to the coding-host checkout (relative paths rejected)\n  --harness-root HARNESS_ROOT\n                        Absolute harness root path (relative paths rejected; external roots\n                        supported)\n  --workspace-id WORKSPACE_ID\n  --task-id TASK_ID\n  --add ADD             Existing dependency id to add (repeatable; order preserved, duplicates\n                        deduped)\n  --remove REMOVE       Dependency id to remove (repeatable; order preserved, duplicates deduped)\n  --allow-runtime-copy  Override the /opt runtime-copy guard\n",
+      "path": [
+        "task",
+        "update-dependencies-files"
+      ],
+      "prog": "coordinate task update-dependencies-files"
     },
     {
       "actions": [
@@ -9097,7 +9343,7 @@
         }
       ],
       "defaults": {},
-      "help": "usage: coordinate assignment [-h]\n                             {request,accept,handoff,blocker,unblock,closeout,review-result,mark-done,mark-done-prepare,mark-done-preflight,mark-done-claim,mark-done-apply,mark-done-files,mark-done-record}\n                             ...\n\npositional arguments:\n  {request,accept,handoff,blocker,unblock,closeout,review-result,mark-done,mark-done-prepare,mark-done-preflight,mark-done-claim,mark-done-apply,mark-done-files,mark-done-record}\n    request             Request a task assignment\n    accept              Accept a task assignment\n    handoff             Hand off a task to another agent\n    blocker             Raise a blocker on a task\n    unblock             Resolve a blocker on a task\n    closeout            Request closeout review for a task\n    review-result       Submit a review result for a task\n    mark-done           Mark a task as done\n    mark-done-prepare   Validate the closeout/review gate on the control plane and issue a one-\n                        time completion.authorized receipt binding the host-aware mark-done files\n                        + record pair.\n    mark-done-preflight\n                        Read-only: re-query a receipt from the control-plane DB and return its\n                        authoritative workspace/task/status/expiry. The coding host calls this\n                        through coord-ssh before mutating the canonical checklist so it never\n                        trusts its own claims.\n    mark-done-claim     Atomically reserve a receipt authorized -> claimed on the control plane,\n                        recording before/expected-after fingerprints. Server-side sink invoked by\n                        the coding host through coord-ssh BEFORE the checklist mutation (two-phase\n                        reserve step).\n    mark-done-apply     Acknowledge a claimed receipt -> applied on the control plane, recording\n                        the actual after-fingerprint. Server-side sink invoked by the coding host\n                        through coord-ssh AFTER the canonical checklist write lands (two-phase\n                        apply step).\n    mark-done-files     Coding-host half of host-aware mark-done. Writes local checklist file half\n                        only. Normal path requires --receipt and a remote coord CLI (--event-cli-\n                        path) to verify/claim the receipt online before any file mutation.\n                        --repair-reason selects the explicit repair-only path.\n    mark-done-record    Server half of host-aware mark-done. Writes the control-plane task.done\n                        event after re-verifying the receipt and the deployed harness. Normal path\n                        requires --receipt; --repair-reason selects the explicit repair-only path.\n\noptions:\n  -h, --help            show this help message and exit\n",
+      "help": "usage: coordinate assignment [-h]\n                             {request,accept,handoff,blocker,unblock,closeout,review-result,mark-done,mark-done-prepare,mark-done-preflight,mark-done-claim,mark-done-apply,mark-done-files,mark-done-record}\n                             ...\n\npositional arguments:\n  {request,accept,handoff,blocker,unblock,closeout,review-result,mark-done,mark-done-prepare,mark-done-preflight,mark-done-claim,mark-done-apply,mark-done-files,mark-done-record}\n    request             Request a task assignment\n    accept              Accept a task assignment\n    handoff             Hand off a task to another agent\n    blocker             Raise a blocker on a task\n    unblock             Resolve a blocker on a task\n    closeout            Request closeout review for a task\n    review-result       Submit a review result for a task\n    mark-done           Mark a task as done\n    mark-done-prepare   Validate the closeout/review gate on the control plane and issue a one-\n                        time completion.authorized receipt binding the host-aware mark-done files\n                        + record pair.\n    mark-done-preflight\n                        Read-only: re-query a receipt from the control-plane DB and return its\n                        authoritative workspace/task/status/expiry. The coding host calls this\n                        through coord-ssh before mutating the canonical checklist so it never\n                        trusts its own claims.\n    mark-done-claim     Atomically reserve a receipt authorized -> claimed on the control plane,\n                        recording before/expected-after fingerprints. Server-side sink invoked by\n                        the coding host through coord-ssh BEFORE the checklist mutation (two-phase\n                        reserve step).\n    mark-done-apply     Acknowledge a claimed receipt -> applied on the control plane, recording\n                        the actual after-fingerprint. Server-side sink invoked by the coding host\n                        through coord-ssh AFTER the canonical checklist write lands (two-phase\n                        apply step).\n    mark-done-files     Coding-host half of host-aware mark-done. Writes local checklist file half\n                        only. Normal path requires --receipt and a remote verification transport —\n                        either a remote coord CLI (--event-cli-path) or the narrow Remote MCP\n                        transport (--event-mcp-url/--event-mcp-token-env) — to verify/claim the\n                        receipt online before any file mutation. --repair-reason selects the\n                        explicit repair-only path.\n    mark-done-record    Server half of host-aware mark-done. Writes the control-plane task.done\n                        event after re-verifying the receipt and the deployed harness. Normal path\n                        requires --receipt; --repair-reason selects the explicit repair-only path.\n\noptions:\n  -h, --help            show this help message and exit\n",
       "path": [
         "assignment"
       ],
@@ -10621,11 +10867,41 @@
           "const": null,
           "default": null,
           "dest": "event_cli_path",
-          "help": "Path to a coord CLI that runs mark-done-preflight / mark-done-claim against the control-plane DB (e.g. <HOME>/.local/bin/coord-ssh). Required for the normal receipt path so the host verifies the receipt online before mutating files.",
+          "help": "Path to a coord CLI that runs mark-done-preflight / mark-done-claim against the control-plane DB (e.g. <HOME>/.local/bin/coord-ssh). Alternative to --event-mcp-url/--event-mcp-token-env; mutually exclusive.",
           "metavar": null,
           "nargs": null,
           "option_strings": [
             "--event-cli-path"
+          ],
+          "required": false,
+          "type": null
+        },
+        {
+          "action_class": "_StoreAction",
+          "choices": null,
+          "const": null,
+          "default": null,
+          "dest": "event_mcp_url",
+          "help": "HTTPS URL of a Coordinate Remote MCP streamable-HTTP endpoint for the narrow completion transport (preflight/claim/apply only). Requires --event-mcp-token-env and --workspace-id; mutually exclusive with --event-cli-path.",
+          "metavar": "HTTPS_URL",
+          "nargs": null,
+          "option_strings": [
+            "--event-mcp-url"
+          ],
+          "required": false,
+          "type": null
+        },
+        {
+          "action_class": "_StoreAction",
+          "choices": null,
+          "const": null,
+          "default": null,
+          "dest": "event_mcp_token_env",
+          "help": "Name of an environment variable holding the Remote MCP bearer token; the token itself never appears in argv, logs, results or receipts. Requires --event-mcp-url.",
+          "metavar": "ENV_NAME",
+          "nargs": null,
+          "option_strings": [
+            "--event-mcp-token-env"
           ],
           "required": false,
           "type": null
@@ -10664,7 +10940,7 @@
       "defaults": {
         "handler": "coordinate.completion_cli.handle_assignment_mark_done_files"
       },
-      "help": "usage: coordinate assignment mark-done-files [-h] --workspace-path WORKSPACE_PATH --harness-root\n                                             HARNESS_ROOT --task-id TASK_ID\n                                             [--workspace-id WORKSPACE_ID] [--actor ACTOR]\n                                             [--verification VERIFICATION] [--receipt RECEIPT]\n                                             [--event-cli-path EVENT_CLI_PATH]\n                                             [--repair-reason REPAIR_REASON]\n                                             [--allow-runtime-copy]\n\noptions:\n  -h, --help            show this help message and exit\n  --workspace-path WORKSPACE_PATH\n  --harness-root HARNESS_ROOT\n  --task-id TASK_ID\n  --workspace-id WORKSPACE_ID\n  --actor ACTOR\n  --verification VERIFICATION\n  --receipt RECEIPT\n  --event-cli-path EVENT_CLI_PATH\n                        Path to a coord CLI that runs mark-done-preflight / mark-done-claim\n                        against the control-plane DB (e.g. <HOME>/.local/bin/coord-ssh). Required\n                        for the normal receipt path so the host verifies the receipt online before\n                        mutating files.\n  --repair-reason REPAIR_REASON\n  --allow-runtime-copy  Allow mutation of /opt deployment copy\n",
+      "help": "usage: coordinate assignment mark-done-files [-h] --workspace-path WORKSPACE_PATH --harness-root\n                                             HARNESS_ROOT --task-id TASK_ID\n                                             [--workspace-id WORKSPACE_ID] [--actor ACTOR]\n                                             [--verification VERIFICATION] [--receipt RECEIPT]\n                                             [--event-cli-path EVENT_CLI_PATH]\n                                             [--event-mcp-url HTTPS_URL]\n                                             [--event-mcp-token-env ENV_NAME]\n                                             [--repair-reason REPAIR_REASON]\n                                             [--allow-runtime-copy]\n\noptions:\n  -h, --help            show this help message and exit\n  --workspace-path WORKSPACE_PATH\n  --harness-root HARNESS_ROOT\n  --task-id TASK_ID\n  --workspace-id WORKSPACE_ID\n  --actor ACTOR\n  --verification VERIFICATION\n  --receipt RECEIPT\n  --event-cli-path EVENT_CLI_PATH\n                        Path to a coord CLI that runs mark-done-preflight / mark-done-claim\n                        against the control-plane DB (e.g. <HOME>/.local/bin/coord-ssh).\n                        Alternative to --event-mcp-url/--event-mcp-token-env; mutually exclusive.\n  --event-mcp-url HTTPS_URL\n                        HTTPS URL of a Coordinate Remote MCP streamable-HTTP endpoint for the\n                        narrow completion transport (preflight/claim/apply only). Requires\n                        --event-mcp-token-env and --workspace-id; mutually exclusive with --event-\n                        cli-path.\n  --event-mcp-token-env ENV_NAME\n                        Name of an environment variable holding the Remote MCP bearer token; the\n                        token itself never appears in argv, logs, results or receipts. Requires\n                        --event-mcp-url.\n  --repair-reason REPAIR_REASON\n  --allow-runtime-copy  Allow mutation of /opt deployment copy\n",
       "path": [
         "assignment",
         "mark-done-files"
@@ -10885,6 +11161,314 @@
         "pending"
       ],
       "prog": "coordinate operator pending"
+    },
+    {
+      "actions": [
+        {
+          "action_class": "_HelpAction",
+          "choices": null,
+          "const": null,
+          "default": "==SUPPRESS==",
+          "dest": "help",
+          "help": "show this help message and exit",
+          "metavar": null,
+          "nargs": 0,
+          "option_strings": [
+            "-h",
+            "--help"
+          ],
+          "required": false,
+          "type": null
+        },
+        {
+          "action_class": "_SubParsersAction",
+          "choices": [
+            "serve"
+          ],
+          "const": null,
+          "default": null,
+          "dest": "mcp_command",
+          "help": null,
+          "metavar": null,
+          "nargs": "A...",
+          "option_strings": [],
+          "required": false,
+          "type": null
+        }
+      ],
+      "defaults": {},
+      "help": "usage: coordinate mcp [-h] {serve} ...\n\npositional arguments:\n  {serve}\n    serve     Serve the MCP agent interface (R1: stdio default; R3: streamable HTTP)\n\noptions:\n  -h, --help  show this help message and exit\n",
+      "path": [
+        "mcp"
+      ],
+      "prog": "coordinate mcp"
+    },
+    {
+      "actions": [
+        {
+          "action_class": "_HelpAction",
+          "choices": null,
+          "const": null,
+          "default": "==SUPPRESS==",
+          "dest": "help",
+          "help": "show this help message and exit",
+          "metavar": null,
+          "nargs": 0,
+          "option_strings": [
+            "-h",
+            "--help"
+          ],
+          "required": false,
+          "type": null
+        },
+        {
+          "action_class": "_StoreAction",
+          "choices": [
+            "stdio",
+            "streamable-http"
+          ],
+          "const": null,
+          "default": "stdio",
+          "dest": "transport",
+          "help": "Transport to serve (default: stdio; streamable-http is the R3 remote profile)",
+          "metavar": null,
+          "nargs": null,
+          "option_strings": [
+            "--transport"
+          ],
+          "required": false,
+          "type": null
+        },
+        {
+          "action_class": "_StoreAction",
+          "choices": null,
+          "const": null,
+          "default": "127.0.0.1",
+          "dest": "host",
+          "help": "Loopback bind address (127.0.0.1, ::1 or localhost only)",
+          "metavar": null,
+          "nargs": null,
+          "option_strings": [
+            "--host"
+          ],
+          "required": false,
+          "type": null
+        },
+        {
+          "action_class": "_StoreAction",
+          "choices": null,
+          "const": null,
+          "default": 8766,
+          "dest": "port",
+          "help": "Loopback TCP port (default: 8766)",
+          "metavar": null,
+          "nargs": null,
+          "option_strings": [
+            "--port"
+          ],
+          "required": false,
+          "type": "builtins.int"
+        },
+        {
+          "action_class": "_StoreAction",
+          "choices": null,
+          "const": null,
+          "default": "/mcp",
+          "dest": "path",
+          "help": "Streamable HTTP endpoint path (default: /mcp)",
+          "metavar": null,
+          "nargs": null,
+          "option_strings": [
+            "--path"
+          ],
+          "required": false,
+          "type": null
+        },
+        {
+          "action_class": "_StoreAction",
+          "choices": null,
+          "const": null,
+          "default": null,
+          "dest": "auth_file",
+          "help": "Server-local MCP client policy JSON (digests only; must not be group/world writable)",
+          "metavar": "PATH",
+          "nargs": null,
+          "option_strings": [
+            "--auth-file"
+          ],
+          "required": false,
+          "type": null
+        },
+        {
+          "action_class": "_AppendAction",
+          "choices": null,
+          "const": null,
+          "default": null,
+          "dest": "allowed_host",
+          "help": "Exact Host header value accepted by the endpoint, including port (repeatable; never a wildcard)",
+          "metavar": "HOST",
+          "nargs": null,
+          "option_strings": [
+            "--allowed-host"
+          ],
+          "required": false,
+          "type": null
+        },
+        {
+          "action_class": "_AppendAction",
+          "choices": null,
+          "const": null,
+          "default": null,
+          "dest": "allowed_origin",
+          "help": "Exact Origin header value accepted (repeatable; never a wildcard)",
+          "metavar": "ORIGIN",
+          "nargs": null,
+          "option_strings": [
+            "--allowed-origin"
+          ],
+          "required": false,
+          "type": null
+        },
+        {
+          "action_class": "_StoreAction",
+          "choices": null,
+          "const": null,
+          "default": "mcp",
+          "dest": "actor",
+          "help": "Fixed actor identity recorded for stdio tool mutations; remote identity is derived per principal",
+          "metavar": null,
+          "nargs": null,
+          "option_strings": [
+            "--actor"
+          ],
+          "required": false,
+          "type": null
+        }
+      ],
+      "defaults": {
+        "handler": "coordinate.mcp_cli.handle_mcp_serve"
+      },
+      "help": "usage: coordinate mcp serve [-h] [--transport {stdio,streamable-http}] [--host HOST] [--port PORT]\n                            [--path PATH] [--auth-file PATH] [--allowed-host HOST]\n                            [--allowed-origin ORIGIN] [--actor ACTOR]\n\noptions:\n  -h, --help            show this help message and exit\n  --transport {stdio,streamable-http}\n                        Transport to serve (default: stdio; streamable-http is the R3 remote\n                        profile)\n  --host HOST           Loopback bind address (127.0.0.1, ::1 or localhost only)\n  --port PORT           Loopback TCP port (default: 8766)\n  --path PATH           Streamable HTTP endpoint path (default: /mcp)\n  --auth-file PATH      Server-local MCP client policy JSON (digests only; must not be group/world\n                        writable)\n  --allowed-host HOST   Exact Host header value accepted by the endpoint, including port\n                        (repeatable; never a wildcard)\n  --allowed-origin ORIGIN\n                        Exact Origin header value accepted (repeatable; never a wildcard)\n  --actor ACTOR         Fixed actor identity recorded for stdio tool mutations; remote identity is\n                        derived per principal\n",
+      "path": [
+        "mcp",
+        "serve"
+      ],
+      "prog": "coordinate mcp serve"
+    },
+    {
+      "actions": [
+        {
+          "action_class": "_HelpAction",
+          "choices": null,
+          "const": null,
+          "default": "==SUPPRESS==",
+          "dest": "help",
+          "help": "show this help message and exit",
+          "metavar": null,
+          "nargs": 0,
+          "option_strings": [
+            "-h",
+            "--help"
+          ],
+          "required": false,
+          "type": null
+        },
+        {
+          "action_class": "_SubParsersAction",
+          "choices": [
+            "serve"
+          ],
+          "const": null,
+          "default": null,
+          "dest": "runtime_http_command",
+          "help": null,
+          "metavar": null,
+          "nargs": "A...",
+          "option_strings": [],
+          "required": false,
+          "type": null
+        }
+      ],
+      "defaults": {},
+      "help": "usage: coordinate runtime-http [-h] {serve} ...\n\npositional arguments:\n  {serve}\n    serve     Serve the runtime HTTP core over loopback (R2A)\n\noptions:\n  -h, --help  show this help message and exit\n",
+      "path": [
+        "runtime-http"
+      ],
+      "prog": "coordinate runtime-http"
+    },
+    {
+      "actions": [
+        {
+          "action_class": "_HelpAction",
+          "choices": null,
+          "const": null,
+          "default": "==SUPPRESS==",
+          "dest": "help",
+          "help": "show this help message and exit",
+          "metavar": null,
+          "nargs": 0,
+          "option_strings": [
+            "-h",
+            "--help"
+          ],
+          "required": false,
+          "type": null
+        },
+        {
+          "action_class": "_StoreAction",
+          "choices": null,
+          "const": null,
+          "default": "127.0.0.1",
+          "dest": "host",
+          "help": "Loopback bind address (127.0.0.1, ::1 or localhost only)",
+          "metavar": null,
+          "nargs": null,
+          "option_strings": [
+            "--host"
+          ],
+          "required": false,
+          "type": null
+        },
+        {
+          "action_class": "_StoreAction",
+          "choices": null,
+          "const": null,
+          "default": 8765,
+          "dest": "port",
+          "help": "Loopback TCP port (default: 8765)",
+          "metavar": null,
+          "nargs": null,
+          "option_strings": [
+            "--port"
+          ],
+          "required": false,
+          "type": "builtins.int"
+        },
+        {
+          "action_class": "_StoreAction",
+          "choices": null,
+          "const": null,
+          "default": null,
+          "dest": "auth_file",
+          "help": "Server-local auth policy JSON (digests only; must not be group/world writable)",
+          "metavar": "PATH",
+          "nargs": null,
+          "option_strings": [
+            "--auth-file"
+          ],
+          "required": true,
+          "type": null
+        }
+      ],
+      "defaults": {
+        "handler": "coordinate.runtime_http_cli.handle_runtime_http_serve"
+      },
+      "help": "usage: coordinate runtime-http serve [-h] [--host HOST] [--port PORT] --auth-file PATH\n\noptions:\n  -h, --help        show this help message and exit\n  --host HOST       Loopback bind address (127.0.0.1, ::1 or localhost only)\n  --port PORT       Loopback TCP port (default: 8765)\n  --auth-file PATH  Server-local auth policy JSON (digests only; must not be group/world writable)\n",
+      "path": [
+        "runtime-http",
+        "serve"
+      ],
+      "prog": "coordinate runtime-http serve"
     },
     {
       "actions": [

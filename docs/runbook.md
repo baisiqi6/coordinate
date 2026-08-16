@@ -77,6 +77,35 @@ coordinate workspace channel release <platform> <channel_id> \
   不同或跨操作则 fail closed（exit 1）。
 - 冲突、非法 key、未知 workspace、数据库/CLI failure 一律 exit 1。
 
+### 通过 Coordinator Bot 创建并绑定 Discord Channel
+
+仅当 Coordinator Bot 在 control channel 所属 Category 具有 `Manage Channels`，且发起者 ID 已加入
+`COORDINATOR_ALLOWED_USER_IDS` 时使用：
+
+```text
+@Coordinator channel create <workspace_id> <channel_name>
+```
+
+- 命令只在固定 control channel 生效；不能指定其它 guild、Category、permission overwrite 或 channel type。
+- human actor 只需在 allowlist；Agent Bot actor 还必须已注册到目标 workspace。
+- workspace 已有唯一 Discord binding 时不会再建频道，只会幂等返回并修复默认投递路由；多个 binding
+  或多个 recovery marker 时 fail closed。
+- 创建中断后重复相同命令会复用 deterministic topic marker 对应的频道。不要手工复制 marker。
+- 命令不自动 rename/delete/rebind。改绑继续使用上面的显式 `release` → `bind` 流程。
+- 把 Operator Bot ID 加入 `COORDINATOR_ALLOWED_USER_IDS` 是生产配置 mutation；撤权时移除该 ID 并重启
+  daemon，不要修改数据库来模拟撤权。
+
+已有 Remote MCP Operator principal 时，优先调用 typed tool `coordinate.channel_create`：
+
+```json
+{"input":{"workspace_id":"WORKSPACE","channel_name":"CHANNEL_NAME","idempotency_key":"STABLE_KEY"}}
+```
+
+首次通常返回 `pending`；保持参数和 key 完全一致重放，直到得到 `provisioned`（含 `channel_id`）或
+`failed`（仅静态 `reason_code`）。同 key 异参、同 workspace 并发新 key、缺少 exact tool/workspace/
+`discord` platform grant 均 fail closed。该工具不接收 guild/category/token/permission payload，Discord
+mutation 仍仅由 daemon 完成；失败后先检查原因，再使用新 key 显式重试。
+
 ## Harness 权威来源边界（内部 vs Sidecar vs /opt）
 
 `workspace.path`（代码 checkout）和 `workspace.harness_root`（harness 状态）
@@ -113,6 +142,45 @@ Worker bootstrap（`task handoff`）向 worker 暴露两个值：它渲染
 （读取 `harness-state.json` / `progress.md` 的 harness root），按目标 agent 的
 host profile 重新映射 — 因此 coding host 上的 worker 永远不会被告知把服务器
 `/opt/*` 部署副本当作其工作树。
+
+## Managed Dependency 更新
+
+checklist item 的 `dependencies` 字段是依赖的唯一权威。更新已登记 task 的依赖时
+使用 Coordinate 受控入口，不裸改 JSON、也不裸跑 `harnessctl update-item`：
+
+```bash
+# same-host combined：preflight harnessctl → checklist 原子 mutation →
+# refresh state → 只同步目标 task mirror（禁止 full reconcile）
+coordinate task update-dependencies WORKSPACE \
+  --task-id TASK --add DEP_A [--add DEP_B] [--remove DEP_C]
+
+# coding-host file-only：只写 canonical checklist，不开 DB、不做 harnessctl
+# preflight；调用者显式承担 commit/deploy/refresh/reconcile 边界。
+# --workspace-path 与 --harness-root 必须是 absolute path（相对路径在任何
+# mutation 前 fail closed，绝不相对进程 cwd 解析）
+coordinate task update-dependencies-files \
+  --workspace-path /path/to/repo --harness-root /path/to/repo/docs \
+  --workspace-id WORKSPACE --task-id TASK [--add DEP] [--remove DEP]
+```
+
+规则：
+
+- 至少一个 `--add`/`--remove`；同一 ID 同时 add/remove、target 不存在、**新增的**
+  dependency 不存在、self-dependency 一律 fail closed（零 mutation）。`remove-absent`
+  按 desired-state 语义是 `already_satisfied` no-op，不 fail。
+- desired-state 幂等：add-existing / remove-absent 是 no-op（结果标
+  `already_satisfied`）；结果同时给出每个请求的 `applied`/`already_satisfied` 与
+  本次持锁 mutation snapshot 的 `dependencies`（不承诺解锁后无人再改；targeted
+  reconcile 读取当时最新 canonical checklist，合法并发更新由 mirror 跟随最新权威）。
+- combined 在 mutation 前要求 workspace 的 `harnessctl` 可用；缺失时零 mutation
+  fail closed（minimal workspace 用 `update-dependencies-files`，不要在 combined
+  下把正常缺失伪装成 recovery）。
+- file 半边已提交而 refresh/reconcile 失败时，输出结构化 recovery：checklist 仍
+  是权威，用同一命令重跑（幂等收敛）或
+  `coordinate reconcile WORKSPACE --task-id TASK` 补齐 DB mirror。
+- `/opt` runtime-copy guard 保持 fail closed；`--allow-runtime-copy` 仅用于显式
+  repair。split-host 后半程复用既有 `reconcile WORKSPACE --task-id TASK`，不新增
+  `update-dependencies-record`。
 
 ## Phase 8.4: Worker Push → PR Publish
 
@@ -200,6 +268,110 @@ CI 说明：没有配置 GitHub checks 的开放 PR 是 pending 状态。此时
 `gh pr checks` 返回退出码 1、空 stdout 和 stderr 上的 `no checks reported`；
 `ci check` 将该确切响应规范化为空 check 列表并写入 `ci.pending`。
 其他非 JSON 失败仍然 fail closed。
+
+## MCP agent 接口（R1 stdio / R5 Remote lifecycle）
+
+MCP SDK 是 optional extra，安装 `coordinate[mcp]`（`mcp>=2,<3`）后启动：
+
+```bash
+# --db 是全局参数，必须位于子命令之前；actor 固定为启动配置，调用者不能伪造
+coordinate --db <absolute-path> mcp serve --transport stdio --actor mcp
+```
+
+当前共 12 个工具。原 5 个工具为：`coordinate.operator_pending`、`coordinate.workspace_audit`
+（固定 `refresh=False`，只读 harness 文件）、`coordinate.runtime_request_submit`
+（exact `target_agent` 或 typed `routing_request` 二选一，`idempotency_key` 必填，
+replay 幂等、冲突 fail closed）、`coordinate.runtime_job_get`（只读，不存在返回
+`not_found`）、`coordinate.runtime_agent_list`（无过滤只读）。所有调用返回统一
+envelope（`ok`/`data`/`error`），成功与失败同时写入 `structured_content` 与等价
+JSON `TextContent`。
+
+R5 仅为真实 Windows/多主机 Operator 闭环增加 6 个 workspace-scoped typed tools：
+
+- `coordinate.task_create_record`：split-host `task create-files` 部署后的 DB record 半边；server 从
+  deployed checklist/plan bytes 重算并核验 envelope/fingerprint，不信任 caller 文件内容。
+- `coordinate.completion_prepare`、`coordinate.completion_preflight`、
+  `coordinate.completion_claim`、`coordinate.completion_apply`、
+  `coordinate.completion_consume`：复用既有 completion receipt 状态机；actor 固定为 request principal，
+  consume 再次把 caller workspace 与 receipt workspace 绑定。
+
+六工具要求 exact `{"input": object}` wire shape，inner model `extra="forbid"`；Remote middleware 先做
+principal/tool/workspace scope，再做 shape/domain 校验。旧 principal policy 默认仍只见原 5 工具；新增
+grant 必须逐 principal 显式配置。没有新增 assignment transition、Git、deploy、shell、recovery 或通用
+payload/path tool。
+
+第 12 个 `coordinate.channel_create` 是独立的 typed provisioning request：要求
+`workspace_id`、`channel_name`、显式 `idempotency_key`，Remote path 还要求固定 `discord` platform grant。
+它返回 durable 三态投影，不把 Bot token/client 或 Discord API 搬入 MCP service。
+
+`coordinate.runtime_agent_list` 同时返回声明状态与派生活跃状态：`online_state`
+表示 operator 是否允许该 agent 运行；`liveness_state` 根据 `last_seen_at` 推导为
+`online`、`stale`、`unknown` 或 `offline`，并附带 `last_seen_age_seconds` 与
+`liveness_stale_after_seconds`。声明为 online 但超过 90 秒未见活动的 agent 不再
+参与 executor routing。agentd 的正常 claim 轮询最多每 30 秒刷新一次活动时间，
+长任务由 lease renewal 刷新；这些自动刷新不写 `agent.heartbeat` event，避免把
+运行账本膨胀为轮询日志。显式 `runtime agent heartbeat` 仍保留给兼容和诊断路径。
+
+- MCP 是 adapter：状态、校验、幂等与 transaction 边界全部来自现有 domain/CLI 核心与同一 DB。
+- 未安装 extra 时其它 CLI 不受影响；启动 MCP 只返回安装提示，不抛 import traceback。
+- `stdout` 只写 protocol；日志/诊断只写 `stderr`。
+- R1 不暴露 claim/report/lease/shell/SQL/文件工具，不做 remote transport/auth。
+
+生产 Remote MCP 使用独立的
+`deploy/systemd/coordinate-mcp-http.service`，而不是把 stdio server 暴露到公网：
+
+- unit 只监听 `127.0.0.1:8766`，并要求同时存在 server-local digest-only client
+  policy `/etc/coordinate/mcp-http-clients.json` 与 exact allowed Host 配置
+  `/etc/coordinate/mcp-http.env`；缺任一文件时 `ConditionPathExists` 使其 fail safe；
+- bearer token 明文不得进入 unit、仓库或 argv；client policy 只保存 digest；
+- 外部访问由环境自己的受控 tunnel/reverse proxy 提供，本仓库的 unit 不开放公网 listener；
+- 安装或启用该 unit 属于 deployment/recovery authority。普通源码安装只提供模板，不自动修改
+  systemd 或创建 `/etc/coordinate/*`。
+
+现代协议（2026-07-28）：MCP host 先 `server/discover` 协商，此后每次请求在
+`params._meta` 自带 protocolVersion/clientInfo/capabilities，无需 legacy
+`initialize`；响应带 `resultType=complete`。协议层无 session：没有
+`Mcp-Session-Id`、SSE resumability 或 `Last-Event-ID`。host 断线重连后重试必须
+复用同一 `idempotency_key`，结果以 DB 中持久 job/event 为准；在 2026-07-28
+envelope 上声明其它版本会得到 JSON-RPC `-32022`（`data.supported` 列出可协商
+版本，`2025-11-25` 等旧版本只能走 legacy `initialize` 握手）。
+
+## Runtime HTTP data plane（R2A：loopback）
+
+aiohttp 是 optional extra，安装 `coordinate[runtime-http]`（`aiohttp>=3.9`）后启动：
+
+```bash
+# 只接受 127.0.0.1 / ::1 / localhost；auth policy 是 server-local digest-only JSON
+coordinate --db <absolute-path> runtime-http serve \
+  --host 127.0.0.1 --port 8765 \
+  --auth-file /etc/coordinate/runtime-http-clients.json
+```
+
+- policy 文件 strict schema（`version: 1` + `clients[]`：bridge 必须带
+  `platforms`/`workspace_ids`，agentd 必须带唯一 `agent_id`）；unknown/
+  duplicate/坏 digest/group-world writable 一律启动失败。missing/unknown/bad
+  token 返回同一个静态 `401`；cross-role/scope 越界返回静态 `403`。
+- bridge 的 `workspace_ids` 是静态/bootstrap scope，不是动态 Discord channel 的第二份项目清单。
+  对已获准 `platform` 上的 channel，Coordinate 的 active binding 可以派生动态 workspace scope：
+  resolve 返回 canonical binding；所有带 channel 的 submit（包括静态 scope 内 workspace）都必须让
+  `origin`（以及非 `none` 的 `reply`）精确绑定到同一 workspace；静态 scope 外的 job get 必须从
+  stored origin 重验当前 binding。unbound、mismatch、
+  cross-platform、binding lookup failure 一律静态 `403`，不能仅凭 caller 提供的 workspace/job id 越权。
+- 端点：`GET /healthz`、`GET /readyz`（public loopback）与 7 个受认证业务端点
+  （channel resolve、request submit、workspace-bound job get、normal claim、
+  progress、report、lease renew）。explicit reap/recoverable/operator endpoint
+  不实现；recovery 只走 CLI/SSH。
+- credential rotation 的 zero-inflight proof 使用现有可执行证据：
+  `job list --status running` 为空、8765 端口无 established connection、只读 DB
+  active lease count 为零；顺序为“确认零 in-flight → policy 原子替换 → client
+  secret 切换 → service restart → readiness/auth smoke”。不新增 global
+  lease-list CLI。
+- **本节点 server 不暴露 recoverable/reap endpoint，也不声称 lease 会被动自愈**。
+  恢复必须描述为 operator 先运行现有 lease reap，再在确认 prior process
+  stopped 后显式 `--recoverable` + audited reason；禁止 blind re-claim。
+- 未安装 extra 时其它 CLI 不受影响；启动 runtime-http 只返回安装提示。
+- 生产以独立 systemd unit（`deploy/systemd/coordinate-runtime-http.service`）
+  运行，`ConditionPathExists` 缺 policy 时 fail safe；坏 policy 有界失败。
 
 ## Runtime Bridge / Agentd 冒烟验证
 
@@ -304,15 +476,19 @@ Host-aware mark-done 将 coding host 对 resolver-selected canonical checklist
 - 回执仅在控制面上签发和查询。Coding host 提供 `receipt_id`；服务器从账本
   重新派生 `workspace_id`、`task_id`、`authorized_actor`、过期时间和指纹。
   客户端提供的 workspace/task/过期声明从不被信任。
-- Coding host 通过远端 coord CLI（`--event-cli-path`，通常是 `coord-ssh`
-  wrapper）**在线**验证、预留和确认回执。没有该路径时，正常的
-  `mark-done-files` 命令会 fail closed。
+- Coding host 通过二选一的远端 transport **在线**验证、预留和确认回执：legacy
+  `--event-cli-path`（通常是 `coord-ssh` wrapper），或窄 Remote MCP pair
+  `--event-mcp-url` + `--event-mcp-token-env`。二者互斥；MCP pair 必须同时存在并要求
+  `--workspace-id`，非 loopback 明文 HTTP 在读取 token 前拒绝。没有任一完整路径时，正常的
+  `mark-done-files` 命令 fail closed。
 - 该协议刻意采用两阶段：回执在规范写入*之前*移动到 `claimed`，在写入落地
   *之后*移动到 `applied`。如果主机在中间死亡，账本显示 `claimed`
   （可诊断的部分状态），永远不会是虚假的 `applied`。记录侧要求 `applied`；
   它不会消费仅 `claimed` 的回执。
 
 ### 标准完成流程
+
+以下命令块是 legacy CLI/SSH compatibility 流程，仍可用于没有 Remote MCP principal 的环境：
 
 ```bash
 # 1. 控制面：验证 closeout/review/forge gate 并签发回执。
@@ -333,6 +509,17 @@ coordinate assignment mark-done-files \
   --event-cli-path "$HOME/.local/bin/coord-ssh" \
   --verification "completion authorized by receipt <receipt_id>"
 
+# Remote MCP 形态（Agent 日常路径；token 值仅存在环境变量，不进入 argv）：
+coordinate assignment mark-done-files \
+  --workspace-path /path/to/<workspace> \
+  --harness-root docs \
+  --workspace-id coordinate \
+  --task-id <task_id> \
+  --receipt <receipt_id> \
+  --event-mcp-url "https://coordinate.example/mcp" \
+  --event-mcp-token-env COORDINATE_REMOTE_MCP_TOKEN \
+  --verification "completion authorized by receipt <receipt_id>"
+
 # 3. Commit + push 更新后的 checklist，然后按当前部署配置执行受审部署。
 #    （git add 作用于 resolver-selected checklist：新名或 legacy 名，恰好一个存在）
 git add "$(python3 scripts/harness/harness_common.py --resolved-checklist)"
@@ -349,6 +536,21 @@ coord-ssh assignment mark-done-record coordinate \
 coord-ssh state coordinate
 coord-ssh event list coordinate
 ```
+
+已配置 R5 Remote MCP principal 的 Agent 日常路径不需要 `coord-ssh`：
+
+0. local review 批准后先 commit/push 并受审部署，使 server deployed bytes 能读到 `review_approved`。
+1. 调 `coordinate.completion_prepare`（`workspace_id` + `task_id`；actor 由 principal 固定）取得 receipt。
+2. coding host 运行上面的 `mark-done-files` MCP 形态，执行 preflight → claim → local atomic write → apply。
+3. 再次 commit/push checklist 并受审部署，使 server deployed bytes 能读到 `done/closed`。
+4. 调 `coordinate.completion_consume`（`workspace_id` + `receipt_id`）重新核验 deployed fingerprint，原子写
+   `task.done + completion.consumed`。
+5. 用 `coordinate.workspace_audit` / `coordinate.runtime_job_get` 监督；该轻量路径不伪装成完整
+   `operator_pending` assignment-action parity。
+
+同理，split-host task 创建为：coding host `task create-files` → commit/push/deploy → Remote MCP
+`coordinate.task_create_record`。file half 或 deployed readback 缺失时 DB 保持零 mutation；不得把 checklist
+bytes/full envelope 作为 MCP 参数传入。
 
 回执记录 `before_fingerprint` / `after_fingerprint`（对
 `{id, status, workflow:{status, branch}}` 的 SHA-256）；自由文本 `verification`

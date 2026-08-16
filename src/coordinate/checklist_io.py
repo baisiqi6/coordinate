@@ -248,11 +248,17 @@ def safe_item_id_problem(item_id: Any) -> str | None:
 
 
 def item_plan_locator_fields(item: dict[str, Any]) -> list[tuple[str, str]]:
-    """Non-empty plan_path / artifacts.plan locators on an item."""
+    """Non-empty plan_path / artifacts.plan / artifact_path locators on an item.
+
+    ``artifact_path`` is the legacy file-harness alias; it participates in the
+    same single-locator authority check when present. Items created before the
+    alias existed simply do not carry the key.
+    """
     fields: list[tuple[str, str]] = []
     for key, value in (
         ("plan_path", item.get("plan_path")),
         ("artifacts.plan", (item.get("artifacts") or {}).get("plan")),
+        ("artifact_path", item.get("artifact_path")),
     ):
         if isinstance(value, str) and value.strip():
             fields.append((key, value.strip()))
@@ -264,8 +270,10 @@ def checklist_runtime_problems(checklist: dict[str, Any]) -> list[str]:
 
     Coordinate-managed items must carry a single non-conflicting plan locator:
     safe item ids, string-or-null locator fields, no lexical '..', and no
-    dual-locator conflict. This is the Coordinate adapter of the U1 runtime
-    check; it lives here (the boundary), never in the schema validator.
+    dual-locator conflict. The optional legacy ``artifact_path`` alias, when
+    present, must be a non-empty string agreeing with the canonical locators.
+    This is the Coordinate adapter of the U1 runtime check; it lives here (the
+    boundary), never in the schema validator.
     """
     problems: list[str] = []
     for item in checklist.get("items", []):
@@ -279,6 +287,14 @@ def checklist_runtime_problems(checklist: dict[str, Any]) -> list[str]:
             problems.append(
                 f"item {item.get('id')!r} plan_path must be a string or null, "
                 f"got {type(plan_path).__name__}"
+            )
+        artifact_path = item.get("artifact_path")
+        if artifact_path is not None and (
+            not isinstance(artifact_path, str) or not artifact_path.strip()
+        ):
+            problems.append(
+                f"item {item.get('id')!r} artifact_path must be a non-empty string or null, "
+                f"got {artifact_path!r}"
             )
         artifacts = item.get("artifacts")
         if isinstance(artifacts, dict) and artifacts.get("plan") is not None:

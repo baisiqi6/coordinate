@@ -1,4 +1,7 @@
+import json
+import tempfile
 import unittest
+from pathlib import Path
 from unittest import mock
 
 from coordinate.db import (
@@ -10,11 +13,19 @@ from coordinate.db import (
     upsert_task_mirror,
     upsert_workspace,
 )
+from coordinate.onboarding import create_plan_task_record
 import coordinate.reconcile
 from coordinate.reconcile import (
     ReconcileConflictError,
     ReconcileTaskNotFoundError,
     reconcile_workspace,
+)
+from coordinate.split_operations import (
+    CONTRACT_VERSION,
+    OPERATION_KIND_TASK_CREATE,
+    apply_task_create_files,
+    apply_task_create_record,
+    build_task_create_envelope,
 )
 
 
@@ -682,6 +693,371 @@ class TargetedReconcileTests(unittest.TestCase):
                 "tasks",
             },
         )
+
+
+class SplitOperationProjectionTests(unittest.TestCase):
+    """G0: checklist split-operation envelope must be projected to the
+    six-key reduced mirror metadata, never copied verbatim; conflicts fail
+    closed with zero mutation."""
+
+    OPERATION_ID = "12345678-1234-1234-1234-123456789abc"
+
+    def _workspace(self, conn):
+        return upsert_workspace(
+            conn,
+            workspace_id="demo",
+            name="Demo",
+            path=".",
+            harness_root=".",
+        )
+
+    def _meta(self, **overrides):
+        meta = {
+            "contract_version": CONTRACT_VERSION,
+            "operation_id": self.OPERATION_ID,
+            "operation_kind": OPERATION_KIND_TASK_CREATE,
+            "input_fingerprint": "a" * 64,
+            "before_fingerprint": "b" * 64,
+            "after_fingerprint": "c" * 64,
+        }
+        meta.update(overrides)
+        return meta
+
+    def _envelope(self, **overrides):
+        envelope = build_task_create_envelope(
+            operation_id=self.OPERATION_ID,
+            workspace_id="demo",
+            task_id="mvp-001",
+            input_fingerprint="a" * 64,
+            before_fingerprint="b" * 64,
+            after_fingerprint="c" * 64,
+            files_applied_at="2026-07-13T12:00:00Z",
+        )
+        envelope.update(overrides)
+        return envelope
+
+    def _item(self, **overrides):
+        item = {
+            "id": "mvp-001",
+            "title": "Build core",
+            "status": "doing",
+            "workflow": {"status": "running"},
+        }
+        item["split_operation"] = self._envelope(**overrides)
+        return item
+
+    def _adapter(self, items):
+        return FakeHarnessAdapter(
+            state={"project": "demo", "generated_at": "2026-05-17T00:00:00Z"},
+            checklist={"project": "demo", "items": items},
+        )
+
+    def _payload(self, conn):
+        return row_to_dict(list_task_mirrors(conn, "demo")[0])["payload"]
+
+    def _raw(self, conn, task_id="mvp-001"):
+        return conn.execute(
+            "SELECT payload_json FROM tasks WHERE workspace_id = ? AND task_id = ?",
+            ("demo", task_id),
+        ).fetchone()["payload_json"]
+
+    def test_new_mirror_stores_only_six_field_projection(self):
+        """full reconcile：新 mirror 只存六字段投影，envelope 字段不入库。"""
+        conn = initialize(":memory:")
+        workspace = self._workspace(conn)
+
+        result = reconcile_workspace(conn, workspace, adapter=self._adapter([self._item()]))
+
+        self.assertEqual(result.created, 1)
+        meta = self._payload(conn)["split_operation"]
+        self.assertEqual(meta, self._meta())
+        self.assertEqual(set(meta), set(self._meta()))
+        for key in (
+            "workspace_id",
+            "target_kind",
+            "target_id",
+            "source_kind",
+            "source_id",
+            "files_applied_at",
+        ):
+            self.assertNotIn(key, meta, key)
+
+    def test_existing_reduced_metadata_preserved_idempotently(self):
+        """既有六字段 metadata：targeted reconcile 精确保留、重放幂等。"""
+        conn = initialize(":memory:")
+        workspace = self._workspace(conn)
+        item = self._item()
+        seeded = {k: v for k, v in item.items() if k != "split_operation"}
+        seeded["split_operation"] = self._meta()
+        upsert_task_mirror(
+            conn,
+            workspace_id="demo",
+            task_id="mvp-001",
+            phase="running",
+            owner=None,
+            branch=None,
+            pr=None,
+            payload=seeded,
+        )
+        raw_before = self._raw(conn)
+        adapter = self._adapter([item])
+
+        first = reconcile_workspace(
+            conn, workspace, adapter=adapter, refresh=False, task_id="mvp-001"
+        )
+        self.assertEqual(first.unchanged, 1)
+        second = reconcile_workspace(
+            conn, workspace, adapter=adapter, refresh=False, task_id="mvp-001"
+        )
+        self.assertEqual(second.unchanged, 1)
+        self.assertEqual(self._raw(conn), raw_before)
+        self.assertEqual(self._payload(conn)["split_operation"], self._meta())
+
+    def test_known_full_envelope_pollution_normalized(self):
+        """G0 已知污染形态：stored 是 checklist envelope 的完整拷贝 →
+        targeted reconcile 有界归一化为六字段。"""
+        conn = initialize(":memory:")
+        workspace = self._workspace(conn)
+        item = self._item()
+        # 模拟旧 bug：旧 targeted reconcile 曾把完整 envelope 原样复制进 mirror。
+        upsert_task_mirror(
+            conn,
+            workspace_id="demo",
+            task_id="mvp-001",
+            phase="running",
+            owner=None,
+            branch=None,
+            pr=None,
+            payload={
+                "id": "mvp-001",
+                "status": "doing",
+                "split_operation": item["split_operation"],
+            },
+        )
+
+        result = reconcile_workspace(
+            conn, workspace, adapter=self._adapter([item]), refresh=False, task_id="mvp-001"
+        )
+
+        self.assertEqual(result.updated, 1)
+        meta = self._payload(conn)["split_operation"]
+        self.assertEqual(meta, self._meta())
+        self.assertNotIn("files_applied_at", meta)
+
+    def test_stored_mismatch_or_unknown_extra_fails_closed(self):
+        """identity/fingerprint 不同、六字段+未知 extra、畸形 stored →
+        fail closed，mirror/events 字节级不变。"""
+        cases = (
+            # 六字段 identity 与 checklist 不同
+            self._meta(operation_id="11111111-1111-1111-1111-111111111111"),
+            # 六字段 + 未知 extra key：不得泛化接受
+            {**self._meta(), "files_applied_at": "2026-07-13T12:00:00Z"},
+            # 完整 envelope 但与 checklist 不完全相同
+            {**self._envelope(), "after_fingerprint": "d" * 64},
+            # 缺必要字段
+            {k: v for k, v in self._meta().items() if k != "before_fingerprint"},
+            # 类型非法
+            None,
+        )
+        for stored in cases:
+            with self.subTest(stored=stored):
+                conn = initialize(":memory:")
+                workspace = self._workspace(conn)
+                upsert_task_mirror(
+                    conn,
+                    workspace_id="demo",
+                    task_id="mvp-001",
+                    phase="running",
+                    owner=None,
+                    branch=None,
+                    pr=None,
+                    payload={
+                        "id": "mvp-001",
+                        "status": "doing",
+                        "split_operation": stored,
+                    },
+                )
+                raw_before = self._raw(conn)
+
+                with self.assertRaises(ReconcileConflictError):
+                    reconcile_workspace(
+                        conn,
+                        workspace,
+                        adapter=self._adapter([self._item()]),
+                        refresh=False,
+                        task_id="mvp-001",
+                    )
+
+                self.assertEqual(self._raw(conn), raw_before)
+                self.assertEqual(list(list_events(conn, "demo")), [])
+
+    def test_malformed_checklist_envelope_fails_closed(self):
+        """checklist envelope 畸形（null/缺字段/类型非法）→ fail closed，
+        零 mirror、零事件（full reconcile，新 mirror 场景）。"""
+        bad_envelopes = (
+            None,
+            {k: v for k, v in self._envelope().items() if k != "input_fingerprint"},
+            {**self._envelope(), "after_fingerprint": "x" * 64},
+            # unknown extra key：投影必须 fail closed，不得静默忽略
+            {**self._envelope(), "unknown_extra": 1},
+        )
+        for envelope in bad_envelopes:
+            with self.subTest(envelope=envelope):
+                conn = initialize(":memory:")
+                workspace = self._workspace(conn)
+                item = self._item()
+                item["split_operation"] = envelope
+
+                with self.assertRaises(ReconcileConflictError):
+                    reconcile_workspace(conn, workspace, adapter=self._adapter([item]))
+
+                self.assertEqual(list_task_mirrors(conn, "demo"), [])
+                self.assertEqual(list(list_events(conn, "demo")), [])
+
+    def test_legacy_item_without_envelope_preserves_stored_metadata(self):
+        """checklist 无 split_operation：legacy 行为，stored 六字段不被抹除。"""
+        conn = initialize(":memory:")
+        workspace = self._workspace(conn)
+        seeded = self._meta()
+        upsert_task_mirror(
+            conn,
+            workspace_id="demo",
+            task_id="mvp-001",
+            phase="todo",
+            owner=None,
+            branch=None,
+            pr=None,
+            payload={
+                "id": "mvp-001",
+                "title": "Build core",
+                "status": "todo",
+                "split_operation": seeded,
+            },
+        )
+        raw_before = self._raw(conn)
+        adapter = FakeHarnessAdapter(
+            state={"project": "demo"},
+            checklist={
+                "project": "demo",
+                "items": [
+                    {"id": "mvp-001", "title": "Build core", "status": "todo"},
+                ],
+            },
+        )
+
+        result = reconcile_workspace(conn, workspace, adapter=adapter, refresh=False)
+
+        self.assertEqual(result.unchanged, 1)
+        self.assertEqual(self._raw(conn), raw_before)
+        self.assertEqual(self._payload(conn)["split_operation"], seeded)
+
+    def test_task_create_reconcile_revision_chain_closes(self):
+        """G0 根因链：task create → targeted reconcile（含已知 12→6 归一化）
+        → plan revision 闭合，六字段值全程不漂移。"""
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        plan_path = Path(tmp.name) / "plan.md"
+        plan_path.write_text("# Plan v1\n", encoding="utf-8")
+        (Path(tmp.name) / "mvp-checklist.json").write_text(
+            json.dumps(
+                {
+                    "project": "demo",
+                    "harness_root": ".",
+                    "version": 1,
+                    "updated_at": "2026-07-13",
+                    "items": [],
+                },
+                ensure_ascii=False,
+                indent=2,
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+        conn = initialize(":memory:")
+        self.addCleanup(conn.close)
+        workspace = upsert_workspace(
+            conn,
+            workspace_id="demo",
+            name="Demo",
+            path=tmp.name,
+            harness_root=tmp.name,
+        )
+
+        files = apply_task_create_files(
+            workspace_path=tmp.name,
+            harness_root=tmp.name,
+            workspace_id="demo",
+            task_id="task-1",
+            plan_doc="plan.md",
+            title="Task 1",
+            phase="ready",
+            priority="p1",
+            operation_id=self.OPERATION_ID,
+        )
+        apply_task_create_record(
+            conn,
+            workspace_id="demo",
+            task_id="task-1",
+            plan_doc="plan.md",
+            title="Task 1",
+            phase="ready",
+            owner=None,
+            branch=None,
+            actor="operator",
+            target=None,
+            payload=None,
+            operation_id=self.OPERATION_ID,
+            input_fingerprint=files.input_fingerprint,
+            before_fingerprint=files.before_fingerprint,
+            after_fingerprint=files.after_fingerprint,
+        )
+        record_meta = json.loads(self._raw(conn, "task-1"))["split_operation"]
+        self.assertEqual(set(record_meta), set(self._meta()))
+        checklist = json.loads(
+            (Path(tmp.name) / "mvp-checklist.json").read_text(encoding="utf-8")
+        )
+        envelope = checklist["items"][0]["split_operation"]
+        self.assertEqual(set(envelope), set(self._envelope()))
+
+        # 已知旧 bug：旧 targeted reconcile 曾把完整 envelope 原样复制进 mirror。
+        polluted = json.loads(self._raw(conn, "task-1"))
+        polluted["split_operation"] = envelope
+        conn.execute(
+            "UPDATE tasks SET payload_json = ? WHERE workspace_id = ? AND task_id = ?",
+            (json.dumps(polluted), "demo", "task-1"),
+        )
+
+        result = reconcile_workspace(
+            conn,
+            workspace,
+            adapter=FakeHarnessAdapter(
+                state={"project": "demo", "generated_at": "2026-05-17T00:00:00Z"},
+                checklist=checklist,
+            ),
+            refresh=False,
+            task_id="task-1",
+        )
+        self.assertEqual(result.scope, {"kind": "task", "task_id": "task-1"})
+        self.assertEqual(result.updated, 1)
+        after_reconcile = json.loads(self._raw(conn, "task-1"))
+        self.assertEqual(after_reconcile["split_operation"], record_meta)
+        self.assertNotIn("files_applied_at", after_reconcile["split_operation"])
+
+        # plan revision：修复前 mirror 被 12 字段 envelope 污染时这里 fail closed。
+        plan_path.write_text("# Plan v1 revised\n", encoding="utf-8")
+        revised = create_plan_task_record(
+            conn,
+            workspace_id="demo",
+            task_id="task-1",
+            plan_doc="plan.md",
+            title="Task 1",
+            phase="ready",
+            actor="operator",
+        )
+        self.assertTrue(revised.event_created)
+        after_revise = json.loads(self._raw(conn, "task-1"))
+        self.assertEqual(after_revise["split_operation"], record_meta)
+        self.assertNotIn("files_applied_at", after_revise["split_operation"])
 
 
 if __name__ == "__main__":

@@ -131,6 +131,8 @@ from .planning_cli import (
     handle_task_create_files,
     handle_task_create_record,
     handle_task_handoff,
+    handle_task_update_dependencies,
+    handle_task_update_dependencies_files,
     register_operator_command,
     register_planning_commands,
 )
@@ -158,6 +160,8 @@ from .execution_cli import (
     register_runner_commands,
     register_runtime_commands,
 )
+from .mcp_cli import register_mcp_command
+from .runtime_http_cli import register_runtime_http_command
 from .delivery_cli import (
     handle_delivery_create,
     handle_delivery_list,
@@ -291,6 +295,10 @@ def build_parser() -> argparse.ArgumentParser:
     register_assignment_commands(subcommands)
 
     register_operator_command(subcommands)
+
+    register_mcp_command(subcommands)
+
+    register_runtime_http_command(subcommands)
 
     serve = subcommands.add_parser("serve", help="Run coordinator daemon with Discord bot")
     serve.add_argument("--pump-interval", type=int, default=30, help="Pump interval in seconds")

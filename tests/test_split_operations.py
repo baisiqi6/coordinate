@@ -12,7 +12,11 @@ import uuid
 from pathlib import Path
 from unittest.mock import patch
 
-from coordinate.checklist_io import ChecklistError, atomic_write_json
+from coordinate.checklist_io import (
+    ChecklistError,
+    atomic_write_json,
+    checklist_runtime_problems,
+)
 from coordinate.db import initialize, row_to_dict, upsert_workspace
 from coordinate.split_operations import (
     CONTRACT_VERSION,
@@ -172,6 +176,82 @@ class CanonicalFingerprintTests(unittest.TestCase):
         self.assertEqual(list(projected.keys()), ["a", "m", "z"])
         self.assertEqual(list(projected["m"].keys()), ["a", "b"])
 
+    def test_legacy_artifact_path_alias_does_not_affect_fingerprint(self) -> None:
+        # Items created before the legacy artifact_path alias existed must not
+        # drift: the alias duplicates plan_path and is excluded from the
+        # fingerprint projection.
+        base = {
+            "id": "task-1",
+            "title": "T",
+            "status": "todo",
+            "phase": "ready",
+            "priority": "p1",
+            "owner": None,
+            "human_gate_required": True,
+            "plan_path": "plans/foo.md",
+            "acceptance": "a",
+            "blocked_by": [],
+            "blocked_reason": "",
+            "dependencies": [],
+            "handoff": {"from": None, "to": None, "reason": None},
+            "selected_in_session": None,
+            "updated_at": "2026-07-13T12:00:00Z",
+            "workflow": {"status": "todo", "branch": None, "updated_at": "2026-07-13T12:00:00Z"},
+            "artifacts": {"plan": "plans/foo.md"},
+            "verification": "",
+            "review": {},
+            "split_operation": {"operation_id": "x"},
+        }
+        fp_without = compute_task_item_fingerprint(item=base, task_id="task-1")
+
+        with_alias = dict(base)
+        with_alias["artifact_path"] = "plans/foo.md"
+        fp_with = compute_task_item_fingerprint(item=with_alias, task_id="task-1")
+
+        self.assertEqual(fp_with, fp_without)
+
+    def test_tampered_artifact_path_keeps_fingerprint_but_fails_runtime_check(self) -> None:
+        # Historical compatibility: the legacy alias is excluded from the
+        # fingerprint projection, so a tampered value must not shift
+        # after-fingerprints (replay/doctor proofs on old items stay valid).
+        # Fail-closed boundary: the alias is not a second plan authority — the
+        # shared runtime validator must reject the three-locator conflict even
+        # though the raw fingerprint is unchanged.
+        base = {
+            "id": "task-1",
+            "title": "T",
+            "status": "todo",
+            "phase": "ready",
+            "priority": "p1",
+            "owner": None,
+            "human_gate_required": True,
+            "plan_path": "plans/foo.md",
+            "acceptance": "a",
+            "blocked_by": [],
+            "blocked_reason": "",
+            "dependencies": [],
+            "handoff": {"from": None, "to": None, "reason": None},
+            "selected_in_session": None,
+            "updated_at": "2026-07-13T12:00:00Z",
+            "workflow": {"status": "todo", "branch": None, "updated_at": "2026-07-13T12:00:00Z"},
+            "artifacts": {"plan": "plans/foo.md"},
+            "verification": "",
+            "review": {},
+            "split_operation": {"operation_id": "x"},
+        }
+        fp_base = compute_task_item_fingerprint(item=base, task_id="task-1")
+
+        tampered = dict(base)
+        tampered["artifact_path"] = "plans/tampered.md"
+        fp_tampered = compute_task_item_fingerprint(item=tampered, task_id="task-1")
+        self.assertEqual(fp_tampered, fp_base)
+
+        problems = checklist_runtime_problems({"items": [tampered]})
+        self.assertTrue(
+            any("conflicting plan locators" in p for p in problems),
+            problems,
+        )
+
 
 class EnvelopeTests(unittest.TestCase):
     def test_envelope_has_expected_shape(self) -> None:
@@ -321,6 +401,16 @@ class FileHalfTests(unittest.TestCase):
         self.assertEqual(len(checklist["items"]), 1)
         item = checklist["items"][0]
         self.assertEqual(item["id"], "task-1")
+        # Legacy artifact_path alias must mirror the canonical plan locators.
+        self.assertEqual(item["artifact_path"], "plans/foo.md")
+        self.assertEqual(
+            item["artifact_path"],
+            item["plan_path"],
+        )
+        self.assertEqual(
+            item["artifact_path"],
+            item["artifacts"]["plan"],
+        )
         envelope = item["split_operation"]
         self.assertEqual(envelope["operation_id"], self.operation_id)
         self.assertEqual(envelope["input_fingerprint"], result["input_fingerprint"])
@@ -1294,6 +1384,16 @@ class IssueMaterializeOperationTests(unittest.TestCase):
             (self.harness_root / "mvp-checklist.json").read_text(encoding="utf-8")
         )
         item = checklist["items"][0]
+        # Legacy artifact_path alias must mirror the canonical plan locators.
+        self.assertEqual(item["artifact_path"], "plans/foo.md")
+        self.assertEqual(
+            item["artifact_path"],
+            item["plan_path"],
+        )
+        self.assertEqual(
+            item["artifact_path"],
+            item["artifacts"]["plan"],
+        )
         envelope = item["split_operation"]
         self.assertEqual(envelope["operation_id"], self.operation_id)
         self.assertEqual(envelope["source_id"], self.source_event_id)

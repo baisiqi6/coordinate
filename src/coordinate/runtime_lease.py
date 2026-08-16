@@ -12,6 +12,7 @@ from dataclasses import dataclass
 from datetime import datetime
 from typing import Any
 
+from .agent_liveness import touch_agent_activity
 from .agent_report import AgentReport, parse_agent_report
 from .db import append_event, create_delivery, get_job, get_workspace, get_workspace_host_profile, row_to_dict, utc_now
 from .execution_context import (
@@ -1253,6 +1254,7 @@ def renew_managed_lease(
             agent_id=agent_id,
             ttl_seconds=ttl_seconds,
         )
+        touch_agent_activity(conn, agent_id=agent_id)
         # server_now is sampled after the primitive update so it can never be
         # earlier than renewed_at.
         server_now = utc_now()

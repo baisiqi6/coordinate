@@ -613,6 +613,118 @@ def _ensure_supported_platform(platform: str) -> None:
         raise PolicyError(f"unsupported policy platform: {platform}; supported: {supported}")
 
 
+def resolve_delivery_intent(
+    *,
+    platform: str | None,
+    destination: str | None,
+    default_bus: str | None = None,
+    default_destination: str | None = None,
+) -> tuple[str, str] | None:
+    """Resolve the effective delivery intent from explicit args + workspace defaults.
+
+    Precedence follows the existing rule: explicit platform/destination override
+    workspace defaults. If either effective value is missing, returns ``None``
+    (normal skip) and the other value is NOT validated. Only a complete pair is
+    validated against the policy-owned platform allowlist (PolicyError). This
+    keeps ``SUPPORTED_PLATFORMS`` the single platform authority.
+    """
+    effective_platform = platform or default_bus
+    effective_destination = destination or default_destination
+    if not effective_platform or not effective_destination:
+        return None
+    _ensure_supported_platform(effective_platform)
+    return effective_platform, effective_destination
+
+
+# Cap applies to the FULL delivery_error string including the prefix.
+_MAX_DELIVERY_ERROR_CHARS = 300
+
+
+@dataclass(frozen=True)
+class BoundedDeliveryResult:
+    """Outcome of a bounded delivery attempt for an already-committed authority.
+
+    ``delivery_error`` is a fixed-cap text with no traceback; ``None`` means the
+    delivery succeeded or was a normal skip.
+    """
+
+    delivery: dict[str, Any] | None
+    delivery_created: bool | None
+    delivery_error: str | None = None
+
+
+def attempt_delivery_for_event(
+    conn: sqlite3.Connection,
+    event_id: str,
+    *,
+    workspace: Any,
+    platform: str | None,
+    destination: str | None,
+) -> BoundedDeliveryResult:
+    """Shared bounded delivery-attempt helper for authority-committed paths.
+
+    Resolves the effective intent, then creates the delivery with
+    ``commit=False``: the helper commits on success and rolls back on
+    ``Exception``, so a secondary delivery failure (including a resolver
+    ``PolicyError`` on an already-committed authority) never reverts the
+    committed authority event nor poisons the connection. ``supported=False``
+    (skip) is a normal result, not an error; ``BaseException`` is never caught.
+    """
+    try:
+        intent = resolve_delivery_intent(
+            platform=platform,
+            destination=destination,
+            default_bus=workspace.default_bus if workspace is not None else None,
+            default_destination=(
+                workspace.default_destination if workspace is not None else None
+            ),
+        )
+        if intent is None:
+            return BoundedDeliveryResult(
+                delivery=None, delivery_created=None, delivery_error=None
+            )
+        result = create_delivery_for_event(
+            conn,
+            event_id,
+            platform=intent[0],
+            destination=intent[1],
+            commit=False,
+        )
+        if not result.supported:
+            return BoundedDeliveryResult(
+                delivery=None,
+                delivery_created=result.created,
+                delivery_error=None,
+            )
+        conn.commit()
+    except Exception as exc:
+        try:
+            conn.rollback()
+        except Exception as rollback_exc:
+            exc = RuntimeError(f"{exc}; rollback failed: {rollback_exc}")
+        return BoundedDeliveryResult(
+            delivery=None,
+            delivery_created=False,
+            delivery_error=_bounded_delivery_error_text(exc),
+        )
+    return BoundedDeliveryResult(
+        delivery=result.delivery,
+        delivery_created=result.created,
+        delivery_error=None,
+    )
+
+
+def _bounded_delivery_error_text(exc: Exception) -> str:
+    text = " ".join(str(exc).split())
+    if not text:
+        text = exc.__class__.__name__
+    prefix = "delivery failed: "
+    budget = _MAX_DELIVERY_ERROR_CHARS - len(prefix)
+    if len(text) > budget:
+        text = text[: budget - 3] + "..."
+    return prefix + text
+
+
 def message_key_for_event(event: sqlite3.Row, *, platform: str, destination: str) -> str:
     workspace_id = event["workspace_id"]
     if not workspace_id:
