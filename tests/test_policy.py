@@ -1,10 +1,13 @@
 import io
+import sqlite3
 import unittest
+import unittest.mock
 
 from coordinate.bus import StdoutBus, pump_deliveries
 from coordinate.db import (
     append_event,
     create_delivery,
+    get_workspace,
     initialize,
     list_deliveries,
     row_to_dict,
@@ -16,11 +19,13 @@ from coordinate.policy import (
     PolicyError,
     _EVENT_BASE_PAYLOAD_RENDERERS,
     _render_event_base_payload,
+    attempt_delivery_for_event,
     create_delivery_for_event,
     create_deliveries_for_event,
     pump_events,
     render_event,
     render_event_deliveries,
+    resolve_delivery_intent,
 )
 
 
@@ -4505,3 +4510,270 @@ class AgentHandoffV1RendererTests(unittest.TestCase):
             "action=review.begin\n"
         ))
         self.assertIn("context_version=1", text)
+
+
+class DeliveryIntentResolverTests(unittest.TestCase):
+    """Contract for the shared policy-owned delivery intent resolver (A)."""
+
+    def test_explicit_intent_resolves_without_defaults(self):
+        intent = resolve_delivery_intent(
+            platform="discord", destination="channel-1",
+        )
+        self.assertEqual(intent, ("discord", "channel-1"))
+
+    def test_defaults_used_when_explicit_missing(self):
+        intent = resolve_delivery_intent(
+            platform=None, destination=None,
+            default_bus="stdout", default_destination="local",
+        )
+        self.assertEqual(intent, ("stdout", "local"))
+
+    def test_explicit_platform_overrides_default_bus(self):
+        intent = resolve_delivery_intent(
+            platform="discord", destination="ch-1",
+            default_bus="stdout", default_destination="local",
+        )
+        self.assertEqual(intent, ("discord", "ch-1"))
+
+    def test_explicit_destination_overrides_default_destination(self):
+        intent = resolve_delivery_intent(
+            platform="stdout", destination="remote",
+            default_bus="stdout", default_destination="local",
+        )
+        self.assertEqual(intent, ("stdout", "remote"))
+
+    def test_missing_effective_platform_skips_without_validating_destination(self):
+        # Unsupported platform + missing destination must skip per existing
+        # ordering: the pair is incomplete, so the platform is never validated.
+        self.assertIsNone(
+            resolve_delivery_intent(platform="none", destination=None)
+        )
+
+    def test_missing_effective_destination_skips_without_validating_platform(self):
+        self.assertIsNone(
+            resolve_delivery_intent(
+                platform="none", destination=None,
+                default_bus="none", default_destination=None,
+            )
+        )
+
+    def test_unsupported_explicit_platform_raises_when_pair_complete(self):
+        with self.assertRaises(PolicyError):
+            resolve_delivery_intent(platform="none", destination="audit")
+
+    def test_unsupported_default_bus_raises_when_pair_complete(self):
+        with self.assertRaises(PolicyError):
+            resolve_delivery_intent(
+                platform=None, destination=None,
+                default_bus="slack", default_destination="ops",
+            )
+
+    def test_supported_platform_list_stays_policy_owned(self):
+        intent = resolve_delivery_intent(
+            platform="kook", destination="room-1",
+        )
+        self.assertEqual(intent, ("kook", "room-1"))
+
+
+class BoundedDeliveryHelperTests(unittest.TestCase):
+    """Contract for the shared bounded delivery-attempt helper (C)."""
+
+    def make_conn(self, *, default_bus=None, default_destination=None):
+        conn = initialize(":memory:")
+        self.addCleanup(conn.close)
+        upsert_workspace(
+            conn,
+            workspace_id="demo",
+            name="Demo",
+            path=".",
+            harness_root=".",
+            default_bus=default_bus,
+            default_destination=default_destination,
+        )
+        return conn
+
+    def _seed_event(self, conn):
+        return append_event(
+            conn,
+            workspace_id="demo",
+            event_type="assignment.requested",
+            actor="operator",
+            target="codex",
+            task_id="t-1",
+            payload={"task_id": "t-1", "owner": "codex", "session": "s1"},
+        ).row
+
+    def test_success_commits_delivery(self):
+        conn = self.make_conn(default_bus="stdout", default_destination="local")
+        event = self._seed_event(conn)
+
+        result = attempt_delivery_for_event(
+            conn, event["id"], workspace=get_workspace(conn, "demo"),
+            platform=None, destination=None,
+        )
+
+        self.assertIsNone(result.delivery_error)
+        self.assertTrue(result.delivery_created)
+        self.assertIsNotNone(result.delivery)
+        # Transaction is closed: the helper committed the delivery write.
+        self.assertFalse(conn.in_transaction)
+        # The delivery row is durable in the committed database state.
+        rows = conn.execute("SELECT * FROM deliveries").fetchall()
+        self.assertEqual(len(rows), 1)
+
+    def test_skip_is_normal_not_error(self):
+        conn = self.make_conn()
+        event = self._seed_event(conn)
+
+        result = attempt_delivery_for_event(
+            conn, event["id"], workspace=get_workspace(conn, "demo"),
+            platform=None, destination=None,
+        )
+
+        self.assertIsNone(result.delivery)
+        self.assertIsNone(result.delivery_created)
+        self.assertIsNone(result.delivery_error)
+
+    @unittest.mock.patch("coordinate.policy.create_delivery_for_event")
+    def test_exception_rolls_back_and_returns_bounded_error(self, mock_create):
+        conn = self.make_conn(default_bus="stdout", default_destination="local")
+        event = self._seed_event(conn)
+
+        def write_then_fail(
+            inner_conn, event_id, *, platform, destination, commit=True,
+        ):
+            self.assertFalse(commit)
+            create_delivery(
+                inner_conn,
+                event_id=event_id,
+                platform=platform,
+                destination=destination,
+                message_key="pending-before-error",
+                payload={"test": True},
+                commit=False,
+            )
+            self.assertTrue(inner_conn.in_transaction)
+            raise sqlite3.OperationalError(
+                "database is locked: line " + "x" * 500
+            )
+
+        mock_create.side_effect = write_then_fail
+
+        result = attempt_delivery_for_event(
+            conn, event["id"], workspace=get_workspace(conn, "demo"),
+            platform=None, destination=None,
+        )
+
+        self.assertIsNotNone(result.delivery_error)
+        self.assertLessEqual(len(result.delivery_error), 300)
+        self.assertNotIn("Traceback", result.delivery_error)
+        self.assertNotIn("\n", result.delivery_error)
+        # The helper rolled back a real uncommitted write and closed the transaction.
+        self.assertFalse(conn.in_transaction)
+        self.assertEqual(len(conn.execute("SELECT * FROM deliveries").fetchall()), 0)
+
+    def test_commit_failure_rolls_back_delivery_and_is_bounded(self):
+        conn = self.make_conn(default_bus="stdout", default_destination="local")
+        event = self._seed_event(conn)
+
+        class FailFirstCommit:
+            def __init__(self, inner):
+                self.inner = inner
+                self.failed = False
+
+            def __getattr__(self, name):
+                return getattr(self.inner, name)
+
+            def commit(self):
+                if not self.failed:
+                    self.failed = True
+                    raise sqlite3.OperationalError("commit disk I/O error")
+                return self.inner.commit()
+
+        wrapped = FailFirstCommit(conn)
+        result = attempt_delivery_for_event(
+            wrapped, event["id"], workspace=get_workspace(conn, "demo"),
+            platform=None, destination=None,
+        )
+
+        self.assertIsNotNone(result.delivery_error)
+        self.assertIn("commit disk I/O error", result.delivery_error)
+        self.assertFalse(conn.in_transaction)
+        self.assertEqual(len(conn.execute("SELECT * FROM deliveries").fetchall()), 0)
+
+    @unittest.mock.patch("coordinate.policy.create_delivery_for_event")
+    def test_success_after_failure_uses_same_connection(self, mock_create):
+        conn = self.make_conn(default_bus="stdout", default_destination="local")
+        event = self._seed_event(conn)
+        mock_create.side_effect = [sqlite3.OperationalError("boom"), None]
+
+        first = attempt_delivery_for_event(
+            conn, event["id"], workspace=get_workspace(conn, "demo"),
+            platform=None, destination=None,
+        )
+        self.assertIsNotNone(first.delivery_error)
+
+        # Second attempt with a healthy policy layer must succeed on the same conn.
+        real = create_delivery_for_event
+        mock_create.side_effect = None
+        mock_create.side_effect = real
+        second = attempt_delivery_for_event(
+            conn, event["id"], workspace=get_workspace(conn, "demo"),
+            platform=None, destination=None,
+        )
+        self.assertIsNone(second.delivery_error)
+        self.assertTrue(second.delivery_created)
+
+    @unittest.mock.patch("coordinate.policy.create_delivery_for_event")
+    def test_base_exception_is_not_caught(self, mock_create):
+        conn = self.make_conn(default_bus="stdout", default_destination="local")
+        event = self._seed_event(conn)
+        mock_create.side_effect = KeyboardInterrupt("ctrl-c")
+
+        with self.assertRaises(KeyboardInterrupt):
+            attempt_delivery_for_event(
+            conn, event["id"], workspace=get_workspace(conn, "demo"),
+            platform=None, destination=None,
+        )
+
+    @unittest.mock.patch("coordinate.policy.create_delivery_for_event")
+    def test_policy_error_from_post_authority_delivery_is_bounded(self, mock_create):
+        conn = self.make_conn(default_bus="stdout", default_destination="local")
+        event = self._seed_event(conn)
+        mock_create.side_effect = PolicyError(
+            "unsupported policy platform: none; supported: discord, discord_webhook, kook, stdout"
+        )
+
+        result = attempt_delivery_for_event(
+            conn, event["id"], workspace=get_workspace(conn, "demo"),
+            platform=None, destination=None,
+        )
+
+        self.assertIsNotNone(result.delivery_error)
+        self.assertIn("unsupported policy platform", result.delivery_error)
+        self.assertNotIn("Traceback", result.delivery_error)
+
+    def test_renderer_unsupported_skip_is_normal_not_error(self):
+        # Real PolicyDeliveryResult.supported=False (renderer skip for an
+        # unsupported event type) must surface as a normal skip, never as a
+        # delivery_error.
+        conn = self.make_conn(default_bus="stdout", default_destination="local")
+        event = append_event(
+            conn,
+            workspace_id="demo",
+            event_type="custom.unsupported",
+            actor="operator",
+            target="codex",
+            task_id="t-1",
+            payload={"task_id": "t-1"},
+        ).row
+
+        result = attempt_delivery_for_event(
+            conn, event["id"], workspace=get_workspace(conn, "demo"),
+            platform=None, destination=None,
+        )
+
+        self.assertIsNone(result.delivery_error)
+        self.assertIsNone(result.delivery)
+        self.assertFalse(conn.in_transaction)
+        self.assertEqual(len(conn.execute("SELECT * FROM deliveries").fetchall()), 0)

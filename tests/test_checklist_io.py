@@ -364,6 +364,85 @@ class RuntimeProblemsTests(unittest.TestCase):
         self.assertEqual(len(problems), 1)
         self.assertIn("path separator", problems[0])
 
+    def test_alias_matching_canonical_locators_clean(self) -> None:
+        checklist = {
+            "items": [
+                {
+                    "id": "task-1",
+                    "plan_path": "docs/plan.md",
+                    "artifact_path": "docs/plan.md",
+                    "artifacts": {"plan": "docs/plan.md"},
+                }
+            ]
+        }
+        self.assertEqual(checklist_runtime_problems(checklist), [])
+
+    def test_legacy_item_without_alias_clean(self) -> None:
+        # Items created before the alias existed stay valid.
+        checklist = {
+            "items": [
+                {
+                    "id": "task-1",
+                    "plan_path": "docs/plan.md",
+                    "artifacts": {"plan": "docs/plan.md"},
+                }
+            ]
+        }
+        self.assertEqual(checklist_runtime_problems(checklist), [])
+
+    def test_alias_non_string_type_detected(self) -> None:
+        checklist = {
+            "items": [{"id": "task-1", "plan_path": "docs/plan.md", "artifact_path": 42}]
+        }
+        problems = checklist_runtime_problems(checklist)
+        self.assertEqual(len(problems), 1)
+        self.assertIn("artifact_path must be a non-empty string or null", problems[0])
+
+    def test_alias_empty_string_detected(self) -> None:
+        checklist = {
+            "items": [{"id": "task-1", "plan_path": "docs/plan.md", "artifact_path": ""}]
+        }
+        problems = checklist_runtime_problems(checklist)
+        self.assertEqual(len(problems), 1)
+        self.assertIn("artifact_path must be a non-empty string or null", problems[0])
+
+    def test_alias_null_is_compatible(self) -> None:
+        checklist = {
+            "items": [{"id": "task-1", "plan_path": "docs/plan.md", "artifact_path": None}]
+        }
+        self.assertEqual(checklist_runtime_problems(checklist), [])
+
+    def test_alias_lexical_dotdot_detected(self) -> None:
+        checklist = {
+            "items": [
+                {
+                    "id": "task-1",
+                    "plan_path": "docs/plan.md",
+                    "artifact_path": "docs/../escape.md",
+                    "artifacts": {"plan": "docs/plan.md"},
+                }
+            ]
+        }
+        problems = checklist_runtime_problems(checklist)
+        self.assertEqual(len(problems), 1)
+        self.assertIn("'..'", problems[0])
+
+    def test_three_locator_conflict_detected(self) -> None:
+        checklist = {
+            "items": [
+                {
+                    "id": "task-1",
+                    "plan_path": "docs/plan.md",
+                    "artifact_path": "docs/other.md",
+                    "artifacts": {"plan": "docs/plan.md"},
+                }
+            ]
+        }
+        problems = checklist_runtime_problems(checklist)
+        self.assertEqual(len(problems), 1)
+        self.assertIn("conflicting plan locators", problems[0])
+        self.assertIn("artifact_path='docs/other.md'", problems[0])
+
 
 class ValidatorDistributionParityTests(unittest.TestCase):
     def test_distribution_copy_is_byte_identical_to_source(self) -> None:

@@ -11,7 +11,9 @@ event -> render_event_payload -> delivery 行 -> worker delivery -> bus
 - `stdout`：本地 dry-run bus。
 - `discord`：通过 `DISCORD_BOT_TOKEN` 的真实 Discord 发送。
 - `kook`：通过 `KOOK_BOT_TOKEN` 的真实 KOOK 发送。
-- `discord_webhook`：通过 `DISCORD_WEBHOOK_URL` 的真实 Discord webhook 发送。
+- `discord_webhook`：兼容名称；daemon 模式由持有 `COORDINATOR_BOT_TOKEN` 的 `BotBus` 发送到
+  delivery row 的 Discord destination。历史或非 daemon 工具若仍使用 webhook，必须按该工具的实际
+  transport contract 配置，不能仅凭 platform 名称推断 token 类型。
 - `none`：不是 transport。当前 runtime 在 bridge 已负责可见回复时不创建 delivery；数据库中若有
   `platform=none`，它是旧版本遗留的审计行，没有 bus adapter。
 

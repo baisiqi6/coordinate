@@ -8,6 +8,13 @@ from typing import Any
 
 from .db import Workspace, append_event, upsert_task_mirror
 from .harness import HarnessAdapter
+from .split_operations import (
+    SPLIT_OPERATION_ENVELOPE_KEYS,
+    SplitOperationError,
+    TASK_MIRROR_SPLIT_OPERATION_KEYS,
+    project_task_mirror_split_operation,
+    validate_task_mirror_split_operation,
+)
 
 
 @dataclass(frozen=True)
@@ -179,6 +186,9 @@ def _reconcile_item(
     conflict-merged form also recorded in the result summary.
     """
     mirror = task_mirror_from_item(item)
+    # Project the checklist envelope (if any) to the reduced mirror shape
+    # before any read-modify-write; a malformed envelope fails closed here.
+    projected_operation = _project_split_operation_metadata(item)
     existing = conn.execute(
         "SELECT * FROM tasks WHERE workspace_id = ? AND task_id = ?",
         (workspace.id, mirror["task_id"]),
@@ -215,11 +225,38 @@ def _reconcile_item(
                     f"task {mirror['task_id']} harness publish_metadata "
                     "conflicts with coordinator value"
                 )
+            # split_operation is coordinator-reserved metadata: the stored
+            # reduced value is preserved exactly, and any mismatch with the
+            # checklist projection fails closed before mutation.
+            stored_operation = _stored_split_operation_metadata(
+                existing_payload, item, projected_operation
+            )
+            if (
+                stored_operation is not None
+                and projected_operation is not None
+                and stored_operation != projected_operation
+            ):
+                raise ReconcileConflictError(
+                    f"task {mirror['task_id']} split_operation metadata in the "
+                    "stored task mirror conflicts with the checklist item; "
+                    "refusing to overwrite registered operation identity"
+                )
             existing_payload.update(mirror["payload"])
+            if stored_operation is not None:
+                existing_payload["split_operation"] = stored_operation
+            elif projected_operation is not None:
+                existing_payload["split_operation"] = projected_operation
             if isinstance(trusted_publish, dict) and trusted_publish:
                 existing_payload["publish_metadata"] = trusted_publish
             mirror["payload"] = existing_payload
         last_event_id = existing["last_event_id"]
+    elif projected_operation is not None:
+        # New mirror from an enveloped checklist item: store only the reduced
+        # projection, never the full checklist envelope.
+        mirror["payload"] = {
+            **mirror["payload"],
+            "split_operation": projected_operation,
+        }
     _, action = upsert_task_mirror(
         conn,
         workspace_id=workspace.id,
@@ -264,6 +301,69 @@ def task_mirror_from_item(item: dict[str, Any]) -> dict[str, Any]:
         "pr": artifacts.get("pr") or artifacts.get("pull_request"),
         "payload": item,
     }
+
+
+# The task-mirror split-operation contract (six-key reduced metadata and
+# the full envelope key set) lives in split_operations; reconcile only wraps
+# the shared helpers to surface conflicts as ReconcileConflictError.
+
+def _project_split_operation_metadata(item: dict[str, Any]) -> dict[str, Any] | None:
+    """Project the checklist item's envelope (if any) to the reduced
+    task-mirror metadata; None for legacy items without the key.
+
+    Key presence (even a null value) marks the checklist as carrying an
+    envelope: absent is legacy, present-but-malformed fails closed, the
+    same key-presence rule the stored-mirror side enforces.
+    """
+    if "split_operation" not in item:
+        return None
+    try:
+        return project_task_mirror_split_operation(
+            item["split_operation"], source="checklist item"
+        )
+    except SplitOperationError as exc:
+        raise ReconcileConflictError(f"task {item.get('id')!r} {exc}") from exc
+
+
+def _stored_split_operation_metadata(
+    payload: dict[str, Any],
+    item: dict[str, Any],
+    projected: dict[str, Any] | None,
+) -> dict[str, Any] | None:
+    """Resolve the stored mirror split_operation against the checklist.
+
+    - key absent -> None
+    - exact six-key metadata -> validated as-is; the caller compares it with
+      the checklist projection
+    - a complete envelope byte-equal to the current checklist envelope -> the
+      known G0 pollution shape (old targeted reconcile copied the envelope
+      verbatim); bounded normalization to the projection
+    - anything else (unknown extra keys, missing fields, wrong types, or an
+      envelope differing from the checklist) -> fail closed before mutation
+    """
+    if "split_operation" not in payload:
+        return None
+    stored = payload["split_operation"]
+    task_id = item.get("id")
+    if isinstance(stored, dict) and set(stored) == TASK_MIRROR_SPLIT_OPERATION_KEYS:
+        try:
+            return validate_task_mirror_split_operation(
+                stored, source="stored task mirror"
+            )
+        except SplitOperationError as exc:
+            raise ReconcileConflictError(f"task {task_id!r} {exc}") from exc
+    if (
+        projected is not None
+        and isinstance(stored, dict)
+        and set(stored) == SPLIT_OPERATION_ENVELOPE_KEYS
+        and stored == item.get("split_operation")
+    ):
+        return projected
+    raise ReconcileConflictError(
+        f"task {task_id!r} stored task mirror split_operation is neither the "
+        "exact six-key metadata nor a complete envelope matching the "
+        "checklist item; refusing to overwrite registered operation identity"
+    )
 
 
 def _state_fingerprint(value: Any) -> str:

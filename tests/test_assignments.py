@@ -1,3 +1,4 @@
+import sqlite3
 import tempfile
 import unittest
 import unittest.mock
@@ -14,6 +15,7 @@ from coordinate.db import (
     upsert_workspace,
 )
 from coordinate.harness import HarnessMutationResult
+from coordinate.policy import PolicyError
 
 
 class _FakeAdapter:
@@ -439,6 +441,7 @@ class PostMutationReconcileTests(unittest.TestCase):
         call_args = mock_reconcile.call_args
         self.assertEqual(call_args[0][1].id, "demo")
         self.assertTrue(call_args[1]["refresh"])
+        self.assertEqual(call_args[1]["task_id"], "mvp-001")
 
     @unittest.mock.patch("coordinate.assignments.reconcile_workspace")
     def test_request_assignment_skips_reconcile_on_idempotent_retry(self, mock_reconcile):
@@ -472,6 +475,209 @@ class PostMutationReconcileTests(unittest.TestCase):
         self.assertTrue(any("reconcile failed" in msg for msg in cm.output))
         self.assertTrue(any("demo" in msg for msg in cm.output))
 
+
+
+class AssignmentDeliveryPrevalidationTests(unittest.TestCase):
+    """Plan §3.A/§3.B/§3.C contracts for assignment request delivery intent."""
+
+    def _make_conn(self, **ws_kwargs):
+        conn = initialize(":memory:")
+        self.addCleanup(conn.close)
+        upsert_workspace(
+            conn,
+            workspace_id="demo",
+            name="Demo",
+            path=".",
+            harness_root=".",
+            **ws_kwargs,
+        )
+        return conn
+
+    def _make_adapter(self, conn, **kwargs):
+        workspace = get_workspace(conn, "demo")
+        return _FakeAdapter(workspace, **kwargs)
+
+    def _counts(self, conn):
+        events = len(list(list_events(conn, "demo")))
+        deliveries = len(list(list_deliveries(conn)))
+        return events, deliveries
+
+    def test_fresh_unsupported_explicit_platform_rejected_before_mutation(self):
+        conn = self._make_conn()
+        adapter = self._make_adapter(conn)
+        before = self._counts(conn)
+
+        with self.assertRaises(PolicyError):
+            request_assignment(
+                conn, "demo", "mvp-001", "codex", "sess-1",
+                platform="none", destination="audit", adapter=adapter,
+            )
+
+        # Zero new mutations, events, deliveries.
+        self.assertEqual(len(adapter.calls), 0)
+        self.assertEqual(self._counts(conn), before)
+
+    def test_fresh_another_unsupported_platform_rejected_before_mutation(self):
+        conn = self._make_conn()
+        adapter = self._make_adapter(conn)
+        before = self._counts(conn)
+
+        with self.assertRaises(PolicyError):
+            request_assignment(
+                conn, "demo", "mvp-001", "codex", "sess-1",
+                platform="slack", destination="ops", adapter=adapter,
+            )
+
+        self.assertEqual(len(adapter.calls), 0)
+        self.assertEqual(self._counts(conn), before)
+
+    def test_fresh_unsupported_default_bus_rejected_before_mutation(self):
+        conn = self._make_conn(default_bus="slack", default_destination="ops")
+        adapter = self._make_adapter(conn)
+        before = self._counts(conn)
+
+        with self.assertRaises(PolicyError):
+            request_assignment(
+                conn, "demo", "mvp-001", "codex", "sess-1", adapter=adapter,
+            )
+
+        self.assertEqual(len(adapter.calls), 0)
+        self.assertEqual(self._counts(conn), before)
+
+    def test_unsupported_platform_with_missing_destination_skips_delivery(self):
+        # Existing skip ordering: pair incomplete -> no validation of platform.
+        conn = self._make_conn()
+        adapter = self._make_adapter(conn)
+
+        result = request_assignment(
+            conn, "demo", "mvp-001", "codex", "sess-1",
+            platform="none", destination=None, adapter=adapter,
+        )
+
+        self.assertTrue(result.event_created)
+        self.assertEqual(result.event["event_type"], "assignment.requested")
+        self.assertEqual(len(adapter.calls), 1)
+        self.assertIsNone(result.delivery)
+        self.assertIsNone(result.delivery_created)
+        self.assertIsNone(result.delivery_error)
+
+    @unittest.mock.patch("coordinate.policy.create_delivery_for_event")
+    def test_post_authority_delivery_failure_returns_bounded_error(self, mock_create):
+        conn = self._make_conn(default_bus="stdout", default_destination="local")
+        adapter = self._make_adapter(conn)
+        mock_create.side_effect = sqlite3.OperationalError("database is locked")
+
+        result = request_assignment(
+            conn, "demo", "mvp-001", "codex", "sess-1", adapter=adapter,
+        )
+
+        # Authority outcome intact: mutation ran once, event committed once.
+        self.assertEqual(len(adapter.calls), 1)
+        self.assertTrue(result.event_created)
+        self.assertEqual(result.event["event_type"], "assignment.requested")
+        self.assertIsNotNone(result.mutation)
+        self.assertTrue(result.mutation.success)
+        # Bounded secondary failure.
+        self.assertIsNotNone(result.delivery_error)
+        self.assertIn("database is locked", result.delivery_error)
+        self.assertNotIn("Traceback", result.delivery_error)
+        self.assertIsNone(result.delivery)
+        # No delivery row survived the rollback.
+        self.assertEqual(len(list(list_deliveries(conn))), 0)
+        # Event is durable.
+        self.assertIsNotNone(conn.execute(
+            "SELECT * FROM events WHERE id = ?", (result.event["id"],)
+        ).fetchone())
+
+    @unittest.mock.patch("coordinate.policy.create_delivery_for_event")
+    def test_post_authority_non_policy_error_is_bounded(self, mock_create):
+        conn = self._make_conn(default_bus="stdout", default_destination="local")
+        adapter = self._make_adapter(conn)
+        mock_create.side_effect = sqlite3.IntegrityError("UNIQUE constraint failed")
+
+        result = request_assignment(
+            conn, "demo", "mvp-001", "codex", "sess-1", adapter=adapter,
+        )
+
+        self.assertTrue(result.event_created)
+        self.assertIsNotNone(result.delivery_error)
+        self.assertIn("UNIQUE constraint", result.delivery_error)
+        self.assertIsNone(result.delivery)
+
+    def test_idempotent_replay_with_unsupported_platform_returns_bounded_error(self):
+        conn = self._make_conn()
+        adapter = self._make_adapter(conn)
+
+        first = request_assignment(
+            conn, "demo", "mvp-001", "codex", "sess-1", adapter=adapter,
+        )
+        self.assertTrue(first.event_created)
+
+        # Replay with an unsupported platform: authority already exists, so the
+        # resolver PolicyError must be bounded, not a crash.
+        second = request_assignment(
+            conn, "demo", "mvp-001", "codex", "sess-1",
+            platform="none", destination="audit", adapter=adapter,
+        )
+
+        self.assertFalse(second.event_created)
+        self.assertIsNone(second.mutation)
+        self.assertEqual(len(adapter.calls), 1)
+        self.assertIsNotNone(second.delivery_error)
+        self.assertIn("unsupported policy platform", second.delivery_error)
+        self.assertNotIn("Traceback", second.delivery_error)
+        self.assertEqual(first.event["id"], second.event["id"])
+
+    @unittest.mock.patch("coordinate.policy.create_delivery_for_event")
+    def test_mutation_failure_with_delivery_failure_preserves_outcome(self, mock_create):
+        conn = self._make_conn(default_bus="stdout", default_destination="local")
+        adapter = self._make_adapter(conn, success=False, stderr="item not found")
+        mock_create.side_effect = sqlite3.OperationalError("boom")
+
+        result = request_assignment(
+            conn, "demo", "mvp-999", "codex", "sess-1", adapter=adapter,
+        )
+
+        self.assertFalse(result.mutation.success)
+        self.assertTrue(result.event_created)
+        self.assertEqual(result.event["event_type"], "harness.mutation_failed")
+        self.assertEqual(result.event["payload"]["stderr"], "item not found")
+        self.assertIsNotNone(result.delivery_error)
+        self.assertIsNone(result.delivery)
+        # Mutation outcome stays structured in the event payload.
+        self.assertIn("mutation", result.event["payload"])
+        self.assertEqual(result.event["payload"]["exit_code"], 1)
+
+    @unittest.mock.patch("coordinate.policy.create_delivery_for_event")
+    def test_connection_reusable_after_delivery_failure(self, mock_create):
+        conn = self._make_conn(default_bus="stdout", default_destination="local")
+        adapter = self._make_adapter(conn)
+        mock_create.side_effect = sqlite3.OperationalError("boom")
+
+        result = request_assignment(
+            conn, "demo", "mvp-001", "codex", "sess-1", adapter=adapter,
+        )
+        self.assertIsNotNone(result.delivery_error)
+
+        # Same connection remains usable: a second request succeeds.
+        result2 = request_assignment(
+            conn, "demo", "mvp-002", "codex", "sess-1", adapter=adapter,
+        )
+        self.assertTrue(result2.event_created)
+        self.assertEqual(result2.event["event_type"], "assignment.requested")
+
+    def test_legitimate_defaults_still_create_delivery(self):
+        conn = self._make_conn(default_bus="stdout", default_destination="local")
+        adapter = self._make_adapter(conn)
+
+        result = request_assignment(
+            conn, "demo", "mvp-001", "codex", "sess-1", adapter=adapter,
+        )
+
+        self.assertTrue(result.event_created)
+        self.assertIsNotNone(result.delivery)
+        self.assertTrue(result.delivery_created)
+        self.assertIsNone(result.delivery_error)
 
 if __name__ == "__main__":
     unittest.main()

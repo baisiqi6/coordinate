@@ -312,6 +312,8 @@ class ExecutionCLIRegistrationTests(unittest.TestCase):
                 "runtime",
                 "assignment",
                 "operator",
+                "mcp",
+                "runtime-http",
                 "serve",
             ],
         )

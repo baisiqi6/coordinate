@@ -8,7 +8,7 @@ from typing import Any
 
 from .db import append_event, get_workspace, row_to_dict
 from .harness import HarnessAdapter, HarnessError, HarnessMutationResult
-from .policy import create_delivery_for_event
+from .policy import attempt_delivery_for_event, resolve_delivery_intent
 from .reconcile import reconcile_workspace
 
 
@@ -16,12 +16,12 @@ logger = logging.getLogger(__name__)
 logger.addHandler(logging.NullHandler())
 
 
-def _post_mutation_reconcile(conn, workspace_id):
+def _post_mutation_reconcile(conn, workspace_id, task_id):
     workspace = get_workspace(conn, workspace_id)
     if workspace is None:
         return
     try:
-        reconcile_workspace(conn, workspace, refresh=True)
+        reconcile_workspace(conn, workspace, refresh=True, task_id=task_id)
     except Exception as exc:
         logger.warning("post-mutation reconcile failed for workspace %s: %s", workspace_id, exc)
 
@@ -33,6 +33,7 @@ class AssignmentRequestResult:
     event_created: bool
     delivery: dict[str, Any] | None
     delivery_created: bool | None
+    delivery_error: str | None = None
 
 
 def request_assignment(
@@ -58,15 +59,17 @@ def request_assignment(
     if existing is not None:
         workspace = get_workspace(conn, workspace_id)
         event_dict = row_to_dict(existing)
-        delivery_dict, delivery_created = _try_create_delivery(
-            conn, existing["id"], workspace, platform, destination
+        delivery = attempt_delivery_for_event(
+            conn, existing["id"], workspace=workspace,
+            platform=platform, destination=destination,
         )
         return AssignmentRequestResult(
             mutation=None,
             event=event_dict,
             event_created=False,
-            delivery=delivery_dict,
-            delivery_created=delivery_created,
+            delivery=delivery.delivery,
+            delivery_created=delivery.delivery_created,
+            delivery_error=delivery.delivery_error,
         )
 
     existing_failed = conn.execute(
@@ -74,15 +77,17 @@ def request_assignment(
     ).fetchone()
     if existing_failed is not None:
         workspace = get_workspace(conn, workspace_id)
-        delivery_dict, delivery_created = _try_create_delivery(
-            conn, existing_failed["id"], workspace, platform, destination
+        delivery = attempt_delivery_for_event(
+            conn, existing_failed["id"], workspace=workspace,
+            platform=platform, destination=destination,
         )
         return AssignmentRequestResult(
             mutation=None,
             event=row_to_dict(existing_failed),
             event_created=False,
-            delivery=delivery_dict,
-            delivery_created=delivery_created,
+            delivery=delivery.delivery,
+            delivery_created=delivery.delivery_created,
+            delivery_error=delivery.delivery_error,
         )
 
     if adapter is None:
@@ -92,6 +97,17 @@ def request_assignment(
         adapter = HarnessAdapter(workspace)
 
     workspace = adapter.workspace
+
+    # Prevalidate the delivery intent BEFORE the first authority mutation:
+    # a policy-known unsupported platform must fail closed with zero
+    # adapter/mutation/event/delivery writes. A missing effective value is a
+    # normal skip and does not validate the other value.
+    resolve_delivery_intent(
+        platform=platform,
+        destination=destination,
+        default_bus=workspace.default_bus,
+        default_destination=workspace.default_destination,
+    )
 
     args = [owner, session, "--actor", actor]
     if branch:
@@ -120,7 +136,7 @@ def request_assignment(
             actor, mutation, success_key, workspace, platform, destination,
         )
         if result.event_created:
-            _post_mutation_reconcile(conn, workspace_id)
+            _post_mutation_reconcile(conn, workspace_id, task_id)
         return result
 
     return _handle_failure(
@@ -151,15 +167,17 @@ def _handle_success(
         payload=payload,
     )
     event_dict = row_to_dict(event_result.row)
-    delivery_dict, delivery_created = _try_create_delivery(
-        conn, event_result.row["id"], workspace, platform, destination
+    delivery = attempt_delivery_for_event(
+        conn, event_result.row["id"], workspace=workspace,
+        platform=platform, destination=destination,
     )
     return AssignmentRequestResult(
         mutation=mutation,
         event=event_dict,
         event_created=event_result.created,
-        delivery=delivery_dict,
-        delivery_created=delivery_created,
+        delivery=delivery.delivery,
+        delivery_created=delivery.delivery_created,
+        delivery_error=delivery.delivery_error,
     )
 
 
@@ -187,33 +205,18 @@ def _handle_failure(
         idempotency_key=failed_key,
         payload=payload,
     )
-    delivery_dict, delivery_created = _try_create_delivery(
-        conn, event_result.row["id"], workspace, platform, destination
+    delivery = attempt_delivery_for_event(
+        conn, event_result.row["id"], workspace=workspace,
+        platform=platform, destination=destination,
     )
     return AssignmentRequestResult(
         mutation=mutation,
         event=row_to_dict(event_result.row),
         event_created=event_result.created,
-        delivery=delivery_dict,
-        delivery_created=delivery_created,
+        delivery=delivery.delivery,
+        delivery_created=delivery.delivery_created,
+        delivery_error=delivery.delivery_error,
     )
-
-
-def _try_create_delivery(
-    conn: sqlite3.Connection,
-    event_id: str,
-    workspace: Any,
-    platform: str | None,
-    destination: str | None,
-) -> tuple[dict[str, Any] | None, bool | None]:
-    effective_platform = platform or (workspace.default_bus if workspace else None)
-    effective_destination = destination or (workspace.default_destination if workspace else None)
-    if not effective_platform or not effective_destination:
-        return None, None
-    result = create_delivery_for_event(
-        conn, event_id, platform=effective_platform, destination=effective_destination
-    )
-    return result.delivery, result.created
 
 
 def _failed_mutation_result(

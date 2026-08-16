@@ -18,6 +18,12 @@ from .onboarding import (
 from .operator import list_pending_actions, pending_snapshot_metadata
 from .plan_gate import approve_plan, reject_plan, review_request_plan
 from .split_operations import SplitOperationError
+from .task_dependencies import (
+    DependencyUpdateError,
+    TaskDependenciesRecoveryError,
+    apply_dependency_mutation,
+    update_task_dependencies,
+)
 
 
 # Compatibility aliases so handlers read like the originals.
@@ -155,6 +161,63 @@ def handle_task_create_record(args: argparse.Namespace) -> int:
             )
     except ValueError as exc:
         _print_json({"error": {"message": str(exc)}})
+        return 1
+    _print_json({"result": result.to_dict()})
+    return 0
+
+
+def handle_task_update_dependencies(args: argparse.Namespace) -> int:
+    try:
+        with _conn(args) as conn:
+            result = update_task_dependencies(
+                conn,
+                workspace_id=args.workspace_id,
+                task_id=args.task_id,
+                add=args.add,
+                remove=args.remove,
+                allow_runtime_copy=args.allow_runtime_copy,
+            )
+    except TaskDependenciesRecoveryError as exc:
+        # File half committed; DB half failed. Emit the structured recovery:
+        # checklist-committed marker plus same-command retry and targeted
+        # reconcile commands.
+        _print_json({"error": {"message": str(exc), **exc.recovery.to_dict()}})
+        return 1
+    except (DependencyUpdateError, ValueError) as exc:
+        _print_json({
+            "error": {
+                "message": str(exc),
+                "reason": getattr(exc, "reason", None),
+            }
+        })
+        return 1
+    _print_json({"result": result})
+    return 0
+
+
+def handle_task_update_dependencies_files(args: argparse.Namespace) -> int:
+    """Coding-host file-only half: canonical checklist only, no DB, and
+    deliberately no harnessctl preflight (the coding host does not need a
+    harness runtime; the caller owns the commit/deploy/refresh/reconcile
+    boundary). Service-boundary guards (absolute paths, /opt runtime copy)
+    run inside ``apply_dependency_mutation`` before any mutation."""
+    try:
+        result = apply_dependency_mutation(
+            workspace_path=args.workspace_path,
+            harness_root=args.harness_root,
+            workspace_id=args.workspace_id,
+            task_id=args.task_id,
+            add=args.add,
+            remove=args.remove,
+            allow_runtime_copy=args.allow_runtime_copy,
+        )
+    except (DependencyUpdateError, ValueError) as exc:
+        _print_json({
+            "error": {
+                "message": str(exc),
+                "reason": getattr(exc, "reason", None),
+            }
+        })
         return 1
     _print_json({"result": result.to_dict()})
     return 0
@@ -373,6 +436,66 @@ def register_planning_commands(subcommands) -> None:
     task_create_record.add_argument("--payload-json", default="{}")
     task_create_record.add_argument("--idempotency-key")
     task_create_record.set_defaults(handler=handle_task_create_record)
+
+    task_update_dependencies = task_subcommands.add_parser(
+        "update-dependencies",
+        help="Combined managed dependency update: checklist file mutation first, state refresh + targeted reconcile second (idempotent)",
+    )
+    task_update_dependencies.add_argument("workspace_id")
+    task_update_dependencies.add_argument("--task-id", required=True)
+    task_update_dependencies.add_argument(
+        "--add",
+        action="append",
+        default=[],
+        help="Existing dependency id to add (repeatable; order preserved, duplicates deduped)",
+    )
+    task_update_dependencies.add_argument(
+        "--remove",
+        action="append",
+        default=[],
+        help="Dependency id to remove (repeatable; order preserved, duplicates deduped)",
+    )
+    task_update_dependencies.add_argument(
+        "--allow-runtime-copy",
+        action="store_true",
+        help="Override the /opt runtime-copy guard",
+    )
+    task_update_dependencies.set_defaults(handler=handle_task_update_dependencies)
+
+    task_update_dependencies_files = task_subcommands.add_parser(
+        "update-dependencies-files",
+        help="Coding-host half of dependency update: canonical checklist file only (no DB write, no harnessctl preflight)",
+    )
+    task_update_dependencies_files.add_argument(
+        "--workspace-path",
+        required=True,
+        help="Absolute path to the coding-host checkout (relative paths rejected)",
+    )
+    task_update_dependencies_files.add_argument(
+        "--harness-root",
+        required=True,
+        help="Absolute harness root path (relative paths rejected; external roots supported)",
+    )
+    task_update_dependencies_files.add_argument("--workspace-id", required=True)
+    task_update_dependencies_files.add_argument("--task-id", required=True)
+    task_update_dependencies_files.add_argument(
+        "--add",
+        action="append",
+        default=[],
+        help="Existing dependency id to add (repeatable; order preserved, duplicates deduped)",
+    )
+    task_update_dependencies_files.add_argument(
+        "--remove",
+        action="append",
+        default=[],
+        help="Dependency id to remove (repeatable; order preserved, duplicates deduped)",
+    )
+    task_update_dependencies_files.add_argument(
+        "--allow-runtime-copy",
+        action="store_true",
+        help="Override the /opt runtime-copy guard",
+    )
+    task_update_dependencies_files.set_defaults(handler=handle_task_update_dependencies_files)
 
     task_handoff = task_subcommands.add_parser("handoff", help="Generate a structured worker handoff")
     task_handoff.add_argument("workspace_id")

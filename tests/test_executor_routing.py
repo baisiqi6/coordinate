@@ -324,11 +324,10 @@ class RoutingCandidateTests(unittest.TestCase):
         req = build_routing_request(required_capabilities=["coding"])
         self.assertEqual(len(resolve_routing_candidates(self.conn, "demo", req)), 0)
 
-    def test_last_seen_recorded_not_filter(self):
+    def test_stale_last_seen_not_eligible(self):
         self._register("mac-omp", "mac")
         self._authorize("mac-omp")
         self._sync_catalog(["mac-omp"])
-        # Set last_seen_at to a distant past value; P9-2B must not invent a cutoff.
         self.conn.execute(
             "UPDATE agents SET last_seen_at = '2020-01-01T00:00:00Z' WHERE id = ?",
             ("mac-omp",),
@@ -336,8 +335,21 @@ class RoutingCandidateTests(unittest.TestCase):
         self.conn.commit()
         req = build_routing_request(required_capabilities=["coding"])
         candidates = resolve_routing_candidates(self.conn, "demo", req)
-        self.assertEqual(len(candidates), 1)
-        self.assertEqual(candidates[0].last_seen_at, "2020-01-01T00:00:00Z")
+        self.assertEqual(candidates, ())
+
+    def test_missing_or_invalid_last_seen_not_eligible(self):
+        self._register("mac-omp", "mac")
+        self._authorize("mac-omp")
+        self._sync_catalog(["mac-omp"])
+        req = build_routing_request(required_capabilities=["coding"])
+        for value in (None, "not-a-timestamp", "2030-01-01 00:00:00"):
+            with self.subTest(value=value):
+                self.conn.execute(
+                    "UPDATE agents SET last_seen_at = ? WHERE id = ?",
+                    (value, "mac-omp"),
+                )
+                self.conn.commit()
+                self.assertEqual(resolve_routing_candidates(self.conn, "demo", req), ())
 
     def test_routing_load_counts(self):
         self._register("mac-omp", "mac")

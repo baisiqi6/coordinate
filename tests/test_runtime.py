@@ -35,11 +35,13 @@ from coordinate.executor_routing import (
     _compute_routing_decision_id,
     build_routing_request,
 )
+from coordinate.agent_liveness import touch_agent_activity
 from coordinate.runtime import (
     RuntimeError,
     claim_job,
     deactivate_agent,
     heartbeat_agent,
+    list_agents,
     register_agent,
     record_job_progress,
     report_job_result,
@@ -119,6 +121,68 @@ class RuntimeServiceTests(unittest.TestCase):
         self.assertTrue(result.agent["last_seen_at"])
         with self.assertRaisesRegex(RuntimeError, "registered on host mac"):
             heartbeat_agent(self.conn, agent_id="mac-codex", host_id="windows")
+
+    def test_idle_claim_refreshes_liveness_without_heartbeat_event(self):
+        self.register_codex()
+        self.conn.execute(
+            "UPDATE agents SET last_seen_at = ?, updated_at = ? WHERE id = ?",
+            ("2020-01-01T00:00:00Z", "2020-01-01T00:00:00Z", "mac-codex"),
+        )
+        self.conn.commit()
+
+        result = claim_job(self.conn, agent_id="mac-codex")
+
+        self.assertFalse(result.claimed)
+        row = self.conn.execute(
+            "SELECT last_seen_at FROM agents WHERE id = ?", ("mac-codex",)
+        ).fetchone()
+        self.assertNotEqual(row["last_seen_at"], "2020-01-01T00:00:00Z")
+        heartbeat_events = self.conn.execute(
+            "SELECT COUNT(*) FROM events WHERE event_type = 'agent.heartbeat'"
+        ).fetchone()[0]
+        self.assertEqual(heartbeat_events, 0)
+        projected = list_agents(self.conn)[0]
+        self.assertEqual(projected["liveness_state"], "online")
+        self.assertLessEqual(projected["last_seen_age_seconds"], 1)
+
+    def test_activity_touch_is_rate_limited_and_never_reactivates_offline(self):
+        self.register_codex()
+        self.conn.execute(
+            "UPDATE agents SET last_seen_at = ?, updated_at = ? WHERE id = ?",
+            ("2030-01-01T00:00:00Z", "2030-01-01T00:00:00Z", "mac-codex"),
+        )
+        self.conn.commit()
+
+        self.assertFalse(
+            touch_agent_activity(
+                self.conn,
+                agent_id="mac-codex",
+                now="2030-01-01T00:00:29Z",
+            )
+        )
+        self.assertTrue(
+            touch_agent_activity(
+                self.conn,
+                agent_id="mac-codex",
+                now="2030-01-01T00:00:30Z",
+            )
+        )
+        self.conn.commit()
+        self.conn.execute(
+            "UPDATE agents SET online_state = 'offline' WHERE id = ?", ("mac-codex",)
+        )
+        self.conn.commit()
+        self.assertFalse(
+            touch_agent_activity(
+                self.conn,
+                agent_id="mac-codex",
+                now="2030-01-01T00:02:00Z",
+            )
+        )
+        state = self.conn.execute(
+            "SELECT online_state FROM agents WHERE id = ?", ("mac-codex",)
+        ).fetchone()[0]
+        self.assertEqual(state, "offline")
 
     def test_submit_request_creates_idempotent_event_and_job(self):
         self.register_codex()
@@ -296,6 +360,194 @@ class RuntimeServiceTests(unittest.TestCase):
         self.assertEqual(replay.event["event_type"], "job.result_replayed")
         self.assertEqual(replay.event["payload"]["submitted_result"]["response_text"], "duplicate final")
         self.assertIn("job.result_replayed", [event["event_type"] for event in events])
+
+    def test_timed_out_exact_replay_is_immutable_and_idempotent(self):
+        """R2B P1: a timed_out report for an already timed_out job replays
+        immutably (result_replayed, applied=False, no state change, no new
+        terminal event, no delivery). Same-body retry is idempotent through
+        the replay idempotency key; a different body still replays.
+        """
+        self.register_codex()
+        request = submit_request(
+            self.conn,
+            workspace_id="demo",
+            target_agent="mac-codex",
+            prompt="long job",
+            origin={
+                "platform": "discord",
+                "destination": "channel-1",
+                "message_id": "m1",
+                "session_scope_id": "discord:test",
+            },
+            reply={"platform": "discord", "destination": "channel-1"},
+        )
+        claim_job(self.conn, agent_id="mac-codex")
+        first = report_job_result(
+            self.conn,
+            job_id=request.job["id"],
+            agent_id="mac-codex",
+            status="timed_out",
+            result={"response_text": "timeout one"},
+        )
+        self.assertEqual(first.job["status"], "timed_out")
+        self.assertEqual(first.event["event_type"], "job.timed_out")
+
+        replay = report_job_result(
+            self.conn,
+            job_id=request.job["id"],
+            agent_id="mac-codex",
+            status="timed_out",
+            result={"response_text": "timeout one"},
+        )
+        self.assertEqual(replay.job["status"], "timed_out")
+        self.assertEqual(replay.event["event_type"], "job.result_replayed")
+        self.assertFalse(replay.event["payload"]["applied"])
+        self.assertEqual(replay.event["payload"]["submitted_status"], "timed_out")
+        self.assertIsNone(replay.delivery)
+        self.assertFalse(replay.delivery_created)
+
+        # Same body again: idempotent replay event (created=False), still no
+        # state change and no new terminal event.
+        replay_again = report_job_result(
+            self.conn,
+            job_id=request.job["id"],
+            agent_id="mac-codex",
+            status="timed_out",
+            result={"response_text": "timeout one"},
+        )
+        self.assertEqual(replay_again.event["event_type"], "job.result_replayed")
+        self.assertFalse(replay_again.event_created)
+        self.assertFalse(replay_again.event["payload"]["applied"])
+
+        # Different body: still a replay, never a state change.
+        replay_other = report_job_result(
+            self.conn,
+            job_id=request.job["id"],
+            agent_id="mac-codex",
+            status="timed_out",
+            result={"response_text": "timeout two"},
+        )
+        self.assertEqual(replay_other.event["event_type"], "job.result_replayed")
+        self.assertFalse(replay_other.event["payload"]["applied"])
+
+        events = [row_to_dict(row) for row in list_events(self.conn, "demo")]
+        terminal = [e for e in events if e["event_type"] == "job.timed_out"]
+        self.assertEqual(len(terminal), 1)
+        replayed = [e for e in events if e["event_type"] == "job.result_replayed"]
+        self.assertEqual(len(replayed), 2)
+        # The first timed_out terminal report created the audit delivery;
+        # replay must never add another one.
+        self.assertEqual(len(list_deliveries(self.conn)), 1)
+        job = get_job(self.conn, request.job["id"])
+        self.assertEqual(job["status"], "timed_out")
+        self.assertTrue(job["recoverable"])
+
+    def test_timed_out_exact_replay_does_not_swallow_reclaim_conflict(self):
+        """R2B P1: after the timed_out job is reclaimed (attempt 2 running),
+        the stale attempt's timed_out report is a real conflict, never a
+        replay. The exact-replay branch must not treat it as success.
+        """
+        self.register_codex()
+        request = submit_request(
+            self.conn,
+            workspace_id="demo",
+            target_agent="mac-codex",
+            prompt="long job",
+            origin={
+                "platform": "discord",
+                "destination": "channel-1",
+                "message_id": "m1",
+                "session_scope_id": "discord:test",
+            },
+            reply={"platform": "discord", "destination": "channel-1"},
+        )
+        claim_job(self.conn, agent_id="mac-codex")
+        report_job_result(
+            self.conn,
+            job_id=request.job["id"],
+            agent_id="mac-codex",
+            status="timed_out",
+            result={"response_text": "recoverable timeout"},
+        )
+        second = claim_job(self.conn, agent_id="mac-codex", recoverable=True)
+        self.assertTrue(second.claimed)
+        self.assertEqual(second.attempt_token, 2)
+
+        with self.assertRaisesRegex(RuntimeError, "attempt"):
+            report_job_result(
+                self.conn,
+                job_id=request.job["id"],
+                agent_id="mac-codex",
+                status="timed_out",
+                result={"response_text": "recoverable timeout"},
+                attempt_token=1,
+            )
+        events = [row_to_dict(row) for row in list_events(self.conn, "demo")]
+        self.assertFalse(
+            any(e["event_type"] == "job.result_replayed" for e in events)
+        )
+        job = get_job(self.conn, request.job["id"])
+        self.assertEqual(job["status"], "running")
+        self.assertEqual(job["attempt_count"], 2)
+
+    def test_timed_out_exact_replay_keeps_late_done_accepted(self):
+        """R2B P1: the new timed_out replay branch sits AFTER the late
+        done/failed branch, so a late done for a recoverable timed_out job is
+        still accepted exactly once and never becomes a replay.
+        """
+        self.register_codex()
+        request = submit_request(
+            self.conn,
+            workspace_id="demo",
+            target_agent="mac-codex",
+            prompt="long job",
+            origin={
+                "platform": "discord",
+                "destination": "channel-1",
+                "message_id": "m1",
+                "session_scope_id": "discord:test",
+            },
+            reply={"platform": "discord", "destination": "channel-1"},
+        )
+        claim_job(self.conn, agent_id="mac-codex")
+        report_job_result(
+            self.conn,
+            job_id=request.job["id"],
+            agent_id="mac-codex",
+            status="timed_out",
+            result={"response_text": "recoverable timeout"},
+        )
+        # A timed_out replay in between must not change authority.
+        replay = report_job_result(
+            self.conn,
+            job_id=request.job["id"],
+            agent_id="mac-codex",
+            status="timed_out",
+            result={"response_text": "recoverable timeout"},
+        )
+        self.assertEqual(replay.event["event_type"], "job.result_replayed")
+
+        accepted = report_job_result(
+            self.conn,
+            job_id=request.job["id"],
+            agent_id="mac-codex",
+            status="done",
+            result={"response_text": "final answer", "session_id": "sess-late"},
+        )
+        self.assertEqual(accepted.job["status"], "done")
+        self.assertEqual(accepted.event["event_type"], "job.late_result_accepted")
+        self.assertTrue(accepted.delivery_created)
+
+        # After done, a timed_out report is the ordinary immutable replay.
+        after = report_job_result(
+            self.conn,
+            job_id=request.job["id"],
+            agent_id="mac-codex",
+            status="timed_out",
+            result={"response_text": "recoverable timeout"},
+        )
+        self.assertEqual(after.event["event_type"], "job.result_replayed")
+        self.assertEqual(after.job["status"], "done")
 
     def test_claim_rejects_offline_agent(self):
         self.register_codex()

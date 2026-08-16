@@ -5,6 +5,7 @@ import sqlite3
 from dataclasses import dataclass
 from typing import Any
 
+from .agent_liveness import agent_liveness_projection, touch_agent_activity
 from .agent_report import AgentReport, parse_agent_report
 from .db_support import _absolute_path
 from .db import (
@@ -1336,6 +1337,8 @@ def claim_job(
     except RuntimeLeaseError as exc:
         raise RuntimeError(str(exc)) from exc
     _require_online_agent(conn, agent_id)
+    if touch_agent_activity(conn, agent_id=agent_id):
+        conn.commit()
     host_id = _agent_host_id(conn, agent_id)
     if not host_id:
         raise RuntimeError(f"agent {agent_id} has no host_id")
@@ -1568,6 +1571,17 @@ def report_job_result(
         return _accept_late_result(
             conn, job=job, agent_id=agent_id, status=status, result=result,
             actor=actor, attempt_token=attempt_token, lease_id=lease_id,
+        )
+    # R2B P1: an exact timed_out terminal report for an already timed_out job
+    # is an immutable replay — the same-body retry after a lost response must
+    # succeed without changing state, without appending a second terminal
+    # event and without creating a delivery. This branch sits AFTER the late
+    # done/failed branch so a late terminal result keeps its own semantics;
+    # stale attempts on a reclaimed (running) job never reach it.
+    if job["status"] == "timed_out" and status == "timed_out":
+        return _replay_terminal_result(
+            conn, job=job, job_id=job_id, agent_id=agent_id, status=status,
+            result=result, actor=actor,
         )
     if job["status"] != "running":
         raise RuntimeError(f"job {job_id} is {job['status']}; only running jobs can report result")
@@ -2248,6 +2262,17 @@ def _agent(conn: sqlite3.Connection, agent_id: str) -> dict[str, Any]:
     if row is None:
         raise RuntimeError(f"unknown agent: {agent_id}")
     return row_to_dict(row)
+
+
+def list_agents(conn: sqlite3.Connection) -> list[dict[str, Any]]:
+    """Return all registered runtime clients (unfiltered read helper).
+
+    R1 needs exactly this one unfiltered projection; filters can be added when a
+    tool actually requires them.
+    """
+    rows = conn.execute("SELECT * FROM agents ORDER BY id").fetchall()
+    now = utc_now()
+    return [agent_liveness_projection(row_to_dict(row), now=now) for row in rows]
 
 
 def _job_payload(job: sqlite3.Row) -> dict[str, Any]:

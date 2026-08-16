@@ -2558,6 +2558,57 @@ class AdditionalRequiredChecksTest(ProjectionDoctorTestBase):
             self.assertIsNotNone(f)
             self.assertEqual(f.severity, SEVERITY_ERROR)
 
+    def test_tampered_artifact_path_is_drift_error(self):
+        conn = self._make_conn()
+        with tempfile.TemporaryDirectory() as tmp:
+            ws = self._make_workspace(conn, tmp)
+            operation_id = "12345678-1234-1234-1234-123456789abc"
+            self._apply_split_create(conn, ws, tmp, operation_id)
+            checklist_path = Path(ws.harness_root) / "mvp-checklist.json"
+            checklist = json.loads(checklist_path.read_text())
+            checklist["items"][0]["artifact_path"] = "plans/other.md"
+            checklist_path.write_text(
+                json.dumps(checklist, ensure_ascii=False, indent=2) + "\n",
+                encoding="utf-8",
+            )
+            report = diagnose_projections(conn, ws)
+            f = self._find(report, "operation_envelope_drift")
+            self.assertIsNotNone(f)
+            self.assertEqual(f.severity, SEVERITY_ERROR)
+            ev = self._evidence_dict(f)
+            self.assertIn("identity_errors", ev)
+            self.assertTrue(
+                any(
+                    "artifact_path: deployed='plans/other.md' recorded='plans/plan.md'" in e
+                    for e in ev["identity_errors"]
+                ),
+                ev["identity_errors"],
+            )
+
+    def test_malformed_artifact_path_is_drift_error(self):
+        conn = self._make_conn()
+        with tempfile.TemporaryDirectory() as tmp:
+            ws = self._make_workspace(conn, tmp)
+            operation_id = "12345678-1234-1234-1234-123456789abc"
+            self._apply_split_create(conn, ws, tmp, operation_id)
+            checklist_path = Path(ws.harness_root) / "mvp-checklist.json"
+            checklist = json.loads(checklist_path.read_text())
+            checklist["items"][0]["artifact_path"] = 42
+            checklist_path.write_text(
+                json.dumps(checklist, ensure_ascii=False, indent=2) + "\n",
+                encoding="utf-8",
+            )
+            report = diagnose_projections(conn, ws)
+            f = self._find(report, "operation_envelope_drift")
+            self.assertIsNotNone(f)
+            self.assertEqual(f.severity, SEVERITY_ERROR)
+            ev = self._evidence_dict(f)
+            self.assertIn("identity_errors", ev)
+            self.assertTrue(
+                any("artifact_path: malformed" in e for e in ev["identity_errors"]),
+                ev["identity_errors"],
+            )
+
     def test_non_split_record_event_includes_full_plan_sha256_and_supersedes(self):
         from coordinate.db import upsert_task_mirror
         from coordinate.onboarding import create_plan_task_record

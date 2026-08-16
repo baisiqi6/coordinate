@@ -1,8 +1,10 @@
 import io
 import json
+import sqlite3
 import subprocess
 import tempfile
 import unittest
+import unittest.mock
 import uuid
 from contextlib import redirect_stdout
 from pathlib import Path
@@ -20,7 +22,7 @@ from coordinate.issues import (
     scan_github_issues_via_event_cli,
     triage_issue,
 )
-from coordinate.policy import render_event
+from coordinate.policy import PolicyError, render_event
 
 
 def completed(stdout: object, returncode: int = 0, stderr: str = ""):
@@ -1205,3 +1207,321 @@ class IssueMaterializeHostAwareTests(unittest.TestCase):
         with self.assertRaises(IssueTriageError) as ctx:
             self._record(conn, "22345678-1234-1234-1234-123456789abc", plan_doc, files_result)
         self.assertEqual(ctx.exception.reason, "operation_conflict")
+
+
+class IssueDeliveryPrevalidationTests(unittest.TestCase):
+    """Plan §3.A/§3.B/§3.C contracts for issue triage/materialize delivery intent."""
+
+    def make_conn(self, *, with_bus: bool = False, default_bus=None, default_destination=None):
+        conn = initialize(":memory:")
+        self.addCleanup(conn.close)
+        kwargs = {"workspace_id": "demo", "name": "Demo", "path": ".", "harness_root": "."}
+        if with_bus:
+            kwargs["default_bus"] = default_bus or "stdout"
+            kwargs["default_destination"] = default_destination or "local"
+        upsert_workspace(conn, **kwargs)
+        return conn
+
+    def seed_issue_spotted(self, conn, *, number=1, title="Bug", body="fix the bug"):
+        result = append_event(
+            conn,
+            workspace_id="demo",
+            event_type="issue.spotted",
+            actor="github",
+            target="acme/repo",
+            idempotency_key=f"demo:github_issue:acme/repo:{number}:t",
+            payload={
+                "repo": "acme/repo",
+                "number": number,
+                "url": f"https://github.com/acme/repo/issues/{number}",
+                "title": title,
+                "body_excerpt": body,
+                "content_trust": "untrusted",
+                "labels": [],
+                "author": "alice",
+                "state": "open",
+                "updated_at": "2026-06-17T01:02:03Z",
+            },
+        )
+        return result.row["id"]
+
+    def _counts(self, conn):
+        events = len(list(list_events(conn, "demo")))
+        tasks = len(conn.execute("SELECT * FROM tasks").fetchall())
+        return events, tasks
+
+    def _materialize_fixture(self, conn, *, default_bus=None, default_destination=None):
+        """Shared materialize fixture: workspace + checklist + plan + triaged event."""
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        ws_path = Path(tmp.name)
+        harness_root = ws_path / "docs" / "project-harness"
+        harness_root.mkdir(parents=True)
+        (harness_root / "mvp-checklist.json").write_text(
+            json.dumps({"project": "demo", "harness_root": ".", "updated_at": "2026-07-13", "items": []}),
+            encoding="utf-8",
+        )
+        plan_abs = ws_path / "docs" / "plan.md"
+        plan_abs.parent.mkdir(parents=True, exist_ok=True)
+        plan_abs.write_text("# Plan\nacceptance: ...\n", encoding="utf-8")
+        kwargs = {
+            "workspace_id": "demo", "name": "Demo",
+            "path": str(ws_path), "harness_root": str(harness_root),
+            "base_branch": "main",
+        }
+        if default_bus is not None:
+            kwargs["default_bus"] = default_bus
+            kwargs["default_destination"] = default_destination
+        upsert_workspace(conn, **kwargs)
+        spotted_id = self.seed_issue_spotted(conn)
+        triage = triage_issue(
+            conn, workspace_id="demo", event_id=spotted_id,
+            decision="accept", task_id="bug-1",
+        )
+        return harness_root, triage.event["id"]
+
+    # --- triage: prevalidation before first authority write ---
+
+    def test_triage_unsupported_explicit_platform_rejected_before_mutation(self):
+        conn = self.make_conn()
+        event_id = self.seed_issue_spotted(conn)
+        before = self._counts(conn)
+
+        with self.assertRaises(PolicyError):
+            triage_issue(
+                conn, workspace_id="demo", event_id=event_id, decision="accept",
+                task_id="bug-1", platform="none", destination="audit",
+            )
+
+        # No task mirror, no issue.triaged event, no delivery.
+        self.assertEqual(self._counts(conn), before)
+        self.assertEqual(len(conn.execute("SELECT * FROM deliveries").fetchall()), 0)
+
+    def test_triage_unsupported_default_bus_rejected_before_mutation(self):
+        conn = self.make_conn(with_bus=True, default_bus="slack", default_destination="ops")
+        event_id = self.seed_issue_spotted(conn)
+        before = self._counts(conn)
+
+        with self.assertRaises(PolicyError):
+            triage_issue(
+                conn, workspace_id="demo", event_id=event_id, decision="reject",
+            )
+
+        self.assertEqual(self._counts(conn), before)
+
+    def test_triage_unsupported_platform_with_missing_destination_skips(self):
+        # Pair incomplete -> platform not validated; triage proceeds without delivery.
+        conn = self.make_conn()
+        event_id = self.seed_issue_spotted(conn)
+
+        result = triage_issue(
+            conn, workspace_id="demo", event_id=event_id, decision="reject",
+            platform="none", destination=None,
+        )
+
+        self.assertTrue(result.event_created)
+        self.assertEqual(result.event["event_type"], "issue.triaged")
+        self.assertIsNone(result.delivery)
+        self.assertIsNone(result.delivery_error)
+
+    # --- triage: post-authority bounded failure ---
+
+    @unittest.mock.patch("coordinate.policy.create_delivery_for_event")
+    def test_triage_post_authority_delivery_failure_is_bounded(self, mock_create):
+        conn = self.make_conn(with_bus=True)
+        event_id = self.seed_issue_spotted(conn)
+        mock_create.side_effect = sqlite3.OperationalError("database is locked")
+
+        result = triage_issue(
+            conn, workspace_id="demo", event_id=event_id, decision="accept",
+            task_id="bug-1",
+        )
+
+        # Authority outcome intact.
+        self.assertTrue(result.event_created)
+        self.assertEqual(result.event["event_type"], "issue.triaged")
+        self.assertIsNotNone(result.task)
+        self.assertIsNotNone(result.delivery_error)
+        self.assertIn("database is locked", result.delivery_error)
+        self.assertNotIn("Traceback", result.delivery_error)
+        self.assertIsNone(result.delivery)
+        result_dict = result.to_dict()
+        self.assertTrue(result_dict["authority_committed"])
+        self.assertTrue(result_dict["partial"])
+        self.assertEqual(result_dict["delivery_error"], result.delivery_error)
+        # Rollback removed the delivery attempt; event stays committed.
+        self.assertEqual(len(conn.execute("SELECT * FROM deliveries").fetchall()), 0)
+        self.assertIsNotNone(conn.execute(
+            "SELECT * FROM events WHERE id = ?", (result.event["id"],)
+        ).fetchone())
+
+    def test_triage_idempotent_replay_with_unsupported_platform_is_bounded(self):
+        conn = self.make_conn()
+        event_id = self.seed_issue_spotted(conn)
+
+        first = triage_issue(
+            conn, workspace_id="demo", event_id=event_id, decision="accept",
+            task_id="bug-1",
+        )
+        self.assertTrue(first.event_created)
+
+        second = triage_issue(
+            conn, workspace_id="demo", event_id=event_id, decision="accept",
+            task_id="bug-1", platform="none", destination="audit",
+        )
+
+        self.assertFalse(second.event_created)
+        self.assertIsNotNone(second.delivery_error)
+        self.assertIn("unsupported policy platform", second.delivery_error)
+        self.assertNotIn("Traceback", second.delivery_error)
+        self.assertEqual(first.event["id"], second.event["id"])
+
+    # --- materialize: prevalidation before first authority write ---
+
+    def test_materialize_unsupported_platform_rejected_before_mutation(self):
+        conn = initialize(":memory:")
+        self.addCleanup(conn.close)
+        harness_root, triage_event_id = self._materialize_fixture(conn)
+        events_before = len(list(list_events(conn, "demo")))
+        checklist_before = json.loads(
+            (harness_root / "mvp-checklist.json").read_text(encoding="utf-8")
+        )["items"]
+
+        with self.assertRaises(PolicyError):
+            materialize_issue(
+                conn, workspace_id="demo", event_id=triage_event_id,
+                plan_doc="docs/plan.md", platform="none", destination="audit",
+            )
+
+        events_after = len(list(list_events(conn, "demo")))
+        checklist_after = json.loads(
+            (harness_root / "mvp-checklist.json").read_text(encoding="utf-8")
+        )["items"]
+        self.assertEqual(events_after, events_before)
+        self.assertEqual(checklist_after, checklist_before)
+
+    # --- materialize: post-authority bounded failure ---
+
+    @unittest.mock.patch("coordinate.policy.create_delivery_for_event")
+    def test_materialize_post_authority_delivery_failure_is_bounded(self, mock_create):
+        conn = initialize(":memory:")
+        self.addCleanup(conn.close)
+        harness_root, triage_event_id = self._materialize_fixture(
+            conn, default_bus="stdout", default_destination="local",
+        )
+        mock_create.side_effect = sqlite3.OperationalError("boom")
+
+        result = materialize_issue(
+            conn, workspace_id="demo", event_id=triage_event_id, plan_doc="docs/plan.md",
+        )
+
+        self.assertTrue(result.event_created)
+        self.assertEqual(result.event["event_type"], "issue.materialized")
+        self.assertEqual(result.plan_ready_event["event_type"], "plan.ready")
+        self.assertIsNotNone(result.delivery_error)
+        self.assertIn("boom", result.delivery_error)
+        self.assertIsNone(result.delivery)
+        result_dict = result.to_dict()
+        self.assertTrue(result_dict["authority_committed"])
+        self.assertTrue(result_dict["partial"])
+        self.assertEqual(result_dict["delivery_error"], result.delivery_error)
+        self.assertEqual(len(conn.execute("SELECT * FROM deliveries").fetchall()), 0)
+        # Authority events remain committed.
+        self.assertIsNotNone(conn.execute(
+            "SELECT * FROM events WHERE id = ?", (result.event["id"],)
+        ).fetchone())
+        # Checklist item landed (plan.ready path wrote the task).
+        checklist = json.loads(
+            (harness_root / "mvp-checklist.json").read_text(encoding="utf-8")
+        )["items"]
+        self.assertTrue(any(item.get("id") == "bug-1" for item in checklist))
+
+    # --- real CLI integration: bounded JSON envelope ---
+
+    def test_triage_cli_delivery_failure_exits_zero_with_partial_json(self):
+        import io as _io
+        import tempfile
+        from contextlib import redirect_stdout as _redirect_stdout
+
+        with tempfile.NamedTemporaryFile() as tmp:
+            conn = initialize(tmp.name)
+            upsert_workspace(
+                conn, workspace_id="demo", name="Demo", path=".", harness_root=".",
+                default_bus="stdout", default_destination="local",
+            )
+            seeded = append_event(
+                conn,
+                workspace_id="demo",
+                event_type="issue.spotted",
+                actor="github",
+                target="acme/repo",
+                idempotency_key="demo:github_issue:acme/repo:1:t",
+                payload={
+                    "repo": "acme/repo", "number": 1,
+                    "url": "https://github.com/acme/repo/issues/1",
+                    "title": "Bug", "content_trust": "untrusted",
+                },
+            )
+            event_id = seeded.row["id"]
+            conn.close()
+
+            out = _io.StringIO()
+            with unittest.mock.patch(
+                "coordinate.policy.create_delivery_for_event",
+                side_effect=sqlite3.OperationalError("database is locked"),
+            ):
+                with _redirect_stdout(out):
+                    code = main([
+                        "--db", tmp.name, "issue", "triage", "demo",
+                        "--event-id", event_id, "--decision", "accept", "--task-id", "bug-1",
+                    ])
+            self.assertEqual(code, 0)
+            payload = json.loads(out.getvalue())["result"]
+            self.assertTrue(payload["authority_committed"])
+            self.assertTrue(payload["partial"])
+            self.assertIn("database is locked", payload["delivery_error"])
+            self.assertNotIn("Traceback", payload["delivery_error"])
+            self.assertIsNone(payload["delivery"])
+
+    def test_triage_cli_unsupported_platform_exits_one_with_error_stderr(self):
+        import io as _io
+        import tempfile
+        from contextlib import redirect_stderr as _redirect_stderr
+
+        with tempfile.NamedTemporaryFile() as tmp:
+            conn = initialize(tmp.name)
+            upsert_workspace(conn, workspace_id="demo", name="Demo", path=".", harness_root=".")
+            seeded = append_event(
+                conn,
+                workspace_id="demo",
+                event_type="issue.spotted",
+                actor="github",
+                target="acme/repo",
+                idempotency_key="demo:github_issue:acme/repo:1:t",
+                payload={
+                    "repo": "acme/repo", "number": 1,
+                    "url": "https://github.com/acme/repo/issues/1",
+                    "title": "Bug", "content_trust": "untrusted",
+                },
+            )
+            event_id = seeded.row["id"]
+            conn.close()
+
+            err = _io.StringIO()
+            with _redirect_stderr(err):
+                code = main([
+                    "--db", tmp.name, "issue", "triage", "demo",
+                    "--event-id", event_id, "--decision", "accept", "--task-id", "bug-1",
+                    "--platform", "none", "--destination", "audit",
+                ])
+            self.assertEqual(code, 1)
+            self.assertIn("error: unsupported policy platform", err.getvalue())
+            # Zero authority mutation: no issue.triaged event.
+            conn = initialize(tmp.name)
+            self.addCleanup(conn.close)
+            triaged = [
+                e for e in list_events(conn, "demo")
+                if row_to_dict(e)["event_type"] == "issue.triaged"
+            ]
+            self.assertEqual(len(triaged), 0)
+            conn.close()

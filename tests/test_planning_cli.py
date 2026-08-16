@@ -42,6 +42,8 @@ MOVED_HANDLER_NAMES = frozenset(
         "handle_task_create",
         "handle_task_create_files",
         "handle_task_create_record",
+        "handle_task_update_dependencies",
+        "handle_task_update_dependencies_files",
         "handle_task_handoff",
         "handle_plan_review_request",
         "handle_plan_revise",
@@ -57,6 +59,8 @@ PLANNING_LEAF_PATHS = {
     "task create",
     "task create-files",
     "task create-record",
+    "task update-dependencies",
+    "task update-dependencies-files",
     "task handoff",
     "plan review-request",
     "plan revise",
@@ -216,6 +220,8 @@ class PlanningRegistrationTests(unittest.TestCase):
             "runtime",
             "assignment",
             "operator",
+            "mcp",
+            "runtime-http",
             "serve",
         ]
         self.assertEqual(commands, expected)
@@ -233,7 +239,7 @@ class PlanningRegistrationTests(unittest.TestCase):
         parser = build_parser()
         handlers = self._leaf_handlers(parser)
         planning_handlers = {p: h for p, h in handlers.items() if p in PLANNING_LEAF_PATHS}
-        self.assertEqual(len(planning_handlers), 11)
+        self.assertEqual(len(planning_handlers), 13)
         for path, handler in planning_handlers.items():
             with self.subTest(path=path):
                 self.assertEqual(handler.__module__, "coordinate.planning_cli")

@@ -257,6 +257,8 @@ class DeliveryCLIRegistrationTests(unittest.TestCase):
                 "runtime",
                 "assignment",
                 "operator",
+                "mcp",
+                "runtime-http",
                 "serve",
             ],
         )

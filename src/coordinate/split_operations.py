@@ -186,6 +186,105 @@ def validate_workspace_relative_path(value: str) -> str:
     return value
 
 
+# ---------------------------------------------------------------------------
+# Task-mirror split-operation metadata (single shared contract)
+# ---------------------------------------------------------------------------
+# The task mirror stores a reduced record derived from the split-operation
+# envelope (build_task_create_envelope / build_issue_materialize_envelope):
+# only the six identity/fingerprint fields below. The full checklist envelope
+# carries exactly SPLIT_OPERATION_ENVELOPE_KEYS. onboarding (plan-revision
+# gate) and reconcile (mirror projection) both consume these helpers so the
+# key set and value shapes exist in exactly one place.
+
+TASK_MIRROR_SPLIT_OPERATION_KEYS = frozenset({
+    "contract_version",
+    "operation_id",
+    "operation_kind",
+    "input_fingerprint",
+    "before_fingerprint",
+    "after_fingerprint",
+})
+
+SPLIT_OPERATION_ENVELOPE_KEYS = frozenset({
+    "contract_version",
+    "operation_id",
+    "operation_kind",
+    "workspace_id",
+    "target_kind",
+    "target_id",
+    "source_kind",
+    "source_id",
+    "input_fingerprint",
+    "before_fingerprint",
+    "after_fingerprint",
+    "files_applied_at",
+})
+
+_KNOWN_OPERATION_KINDS = frozenset({
+    OPERATION_KIND_TASK_CREATE,
+    OPERATION_KIND_ISSUE_MATERIALIZE,
+})
+
+
+def validate_task_mirror_split_operation(value: Any, *, source: str) -> dict[str, Any]:
+    """Fail closed unless *value* is exactly the six-key task-mirror metadata.
+
+    Validates the exact key set plus the contract version, operation kind,
+    operation-id UUID, and fingerprint SHA-256 shapes. Raises
+    ``SplitOperationError`` (a ``ValueError``); callers that need a distinct
+    error type wrap it.
+    """
+    if not isinstance(value, dict):
+        raise SplitOperationError(
+            f"{source} split_operation must be a dict, got {type(value).__name__}",
+            REASON_VALIDATION_ERROR,
+        )
+    if set(value.keys()) != TASK_MIRROR_SPLIT_OPERATION_KEYS:
+        raise SplitOperationError(
+            f"{source} split_operation must have exactly keys "
+            f"{sorted(TASK_MIRROR_SPLIT_OPERATION_KEYS)}, got {sorted(value.keys())}",
+            REASON_VALIDATION_ERROR,
+        )
+    if value["contract_version"] != CONTRACT_VERSION:
+        raise SplitOperationError(
+            f"{source} split_operation contract_version must be {CONTRACT_VERSION}, "
+            f"got {value['contract_version']!r}",
+            REASON_VALIDATION_ERROR,
+        )
+    if value["operation_kind"] not in _KNOWN_OPERATION_KINDS:
+        raise SplitOperationError(
+            f"{source} split_operation operation_kind must be one of "
+            f"{sorted(_KNOWN_OPERATION_KINDS)}, got {value['operation_kind']!r}",
+            REASON_VALIDATION_ERROR,
+        )
+    validate_uuid(value["operation_id"])
+    for key in ("input_fingerprint", "before_fingerprint", "after_fingerprint"):
+        validate_sha256(value[key])
+    return value
+
+
+def project_task_mirror_split_operation(value: Any, *, source: str) -> dict[str, Any]:
+    """Project a checklist split-operation envelope to the six-key metadata.
+
+    Requires the exact full envelope key set first: unknown extra keys and
+    missing fields both fail closed rather than being silently dropped, so
+    the projection can never ignore envelope drift.
+    """
+    if not isinstance(value, dict):
+        raise SplitOperationError(
+            f"{source} split_operation must be a dict, got {type(value).__name__}",
+            REASON_VALIDATION_ERROR,
+        )
+    if set(value.keys()) != SPLIT_OPERATION_ENVELOPE_KEYS:
+        raise SplitOperationError(
+            f"{source} split_operation envelope must have exactly keys "
+            f"{sorted(SPLIT_OPERATION_ENVELOPE_KEYS)}, got {sorted(value.keys())}",
+            REASON_VALIDATION_ERROR,
+        )
+    metadata = {key: value[key] for key in TASK_MIRROR_SPLIT_OPERATION_KEYS}
+    return validate_task_mirror_split_operation(metadata, source=source)
+
+
 def compute_plan_sha256(path: Path) -> str:
     """Return the lowercase SHA-256 of the file bytes at *path*."""
     h = hashlib.sha256()
@@ -233,6 +332,9 @@ _FINGERPRINT_EXCLUDED_KEYS = frozenset({
     "split_operation",
     "completion_receipt",
     "verification",
+    # Legacy presentation alias; duplicates plan_path and must never shift
+    # after-fingerprints of items created before the alias existed.
+    "artifact_path",
 })
 
 
@@ -415,6 +517,11 @@ def _build_checklist_item(
         "owner": None,
         "human_gate_required": True,
         "plan_path": plan_doc,
+        # Legacy file-harness alias: repository-relative plan locator expected by
+        # legacy checklist validators. Kept strictly equal to plan_path /
+        # artifacts.plan; excluded from fingerprints so historical items built
+        # without the alias do not drift.
+        "artifact_path": plan_doc,
         "acceptance": f"Use the plan acceptance criteria as source of truth: {plan_doc}",
         "blocked_by": [],
         "blocked_reason": "",
@@ -695,26 +802,12 @@ def apply_task_create_files(
                 and existing_envelope.get("operation_id") == operation_id
             ):
                 # Same operation id: verify the whole envelope and projected item.
-                expected_keys = {
-                    "contract_version",
-                    "operation_id",
-                    "operation_kind",
-                    "workspace_id",
-                    "target_kind",
-                    "target_id",
-                    "source_kind",
-                    "source_id",
-                    "input_fingerprint",
-                    "before_fingerprint",
-                    "after_fingerprint",
-                    "files_applied_at",
-                }
-                if set(existing_envelope.keys()) != expected_keys:
+                if set(existing_envelope.keys()) != SPLIT_OPERATION_ENVELOPE_KEYS:
                     raise SplitOperationError(
                         f"task {task_id} already has a malformed envelope for operation {operation_id}",
                         REASON_OPERATION_CONFLICT,
                     )
-                for key in expected_keys:
+                for key in SPLIT_OPERATION_ENVELOPE_KEYS:
                     if key == "files_applied_at":
                         # Exact retry is intentionally allowed across different
                         # apply timestamps; the original envelope time is returned.
@@ -1174,22 +1267,6 @@ def _load_deployed_envelope(
     return item
 
 
-_ENVELOPE_REQUIRED_KEYS = frozenset({
-    "contract_version",
-    "operation_id",
-    "operation_kind",
-    "workspace_id",
-    "target_kind",
-    "target_id",
-    "source_kind",
-    "source_id",
-    "input_fingerprint",
-    "before_fingerprint",
-    "after_fingerprint",
-    "files_applied_at",
-})
-
-
 def _verify_envelope_shape(
     *,
     envelope: dict[str, Any],
@@ -1201,7 +1278,7 @@ def _verify_envelope_shape(
     after_fingerprint: str,
 ) -> None:
     """Fail closed if the deployed envelope is not the exact expected shape."""
-    if set(envelope.keys()) != _ENVELOPE_REQUIRED_KEYS:
+    if set(envelope.keys()) != SPLIT_OPERATION_ENVELOPE_KEYS:
         raise SplitOperationError(
             "deployed envelope has unexpected keys",
             REASON_FINGERPRINT_DRIFT,
@@ -1333,7 +1410,7 @@ def _verify_issue_materialize_envelope_shape(
     after_fingerprint: str,
 ) -> None:
     """Fail closed if the deployed C2 envelope is not the exact expected shape."""
-    if set(envelope.keys()) != _ENVELOPE_REQUIRED_KEYS:
+    if set(envelope.keys()) != SPLIT_OPERATION_ENVELOPE_KEYS:
         raise SplitOperationError(
             "deployed envelope has unexpected keys",
             REASON_FINGERPRINT_DRIFT,

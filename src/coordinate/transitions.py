@@ -12,6 +12,8 @@ from .completion import (
     ReceiptEvidence,
     check_mark_done_gate,
     compute_item_fingerprint,
+    release_terminal_ownership,
+    terminal_ownership_problem,
 )
 from .checklist_io import ChecklistError, mutate_checklist
 from .db import append_event, get_workspace, row_to_dict
@@ -23,12 +25,12 @@ logger = logging.getLogger(__name__)
 logger.addHandler(logging.NullHandler())
 
 
-def _post_mutation_reconcile(conn, workspace_id):
+def _post_mutation_reconcile(conn, workspace_id, task_id):
     workspace = get_workspace(conn, workspace_id)
     if workspace is None:
         return
     try:
-        reconcile_workspace(conn, workspace, refresh=True)
+        reconcile_workspace(conn, workspace, refresh=True, task_id=task_id)
     except Exception as exc:
         logger.warning("post-mutation reconcile failed for workspace %s: %s", workspace_id, exc)
 
@@ -109,7 +111,7 @@ def accept_task(
             effective_actor, mutation, success_key,
         )
         if result.event_created:
-            _post_mutation_reconcile(conn, workspace_id)
+            _post_mutation_reconcile(conn, workspace_id, task_id)
         return result
 
     return _handle_failure(
@@ -251,7 +253,7 @@ def handoff_task(
             actor, mutation, success_key,
         )
         if result.event_created:
-            _post_mutation_reconcile(conn, workspace_id)
+            _post_mutation_reconcile(conn, workspace_id, task_id)
         return result
 
     return _handle_handoff_failure(
@@ -390,7 +392,7 @@ def blocker_task(
             actor, mutation, success_key,
         )
         if result.event_created:
-            _post_mutation_reconcile(conn, workspace_id)
+            _post_mutation_reconcile(conn, workspace_id, task_id)
         return result
 
     return _handle_blocker_failure(
@@ -531,7 +533,7 @@ def unblock_task(
             actor, mutation, success_key,
         )
         if result.event_created:
-            _post_mutation_reconcile(conn, workspace_id)
+            _post_mutation_reconcile(conn, workspace_id, task_id)
         return result
 
     return _handle_unblock_failure(
@@ -674,7 +676,7 @@ def closeout_task(
             self_test_evidence=self_test_evidence,
         )
         if result.event_created:
-            _post_mutation_reconcile(conn, workspace_id)
+            _post_mutation_reconcile(conn, workspace_id, task_id)
         return result
 
     return _handle_closeout_failure(
@@ -815,7 +817,7 @@ def review_result_task(
             actor, mutation, success_key,
         )
         if result.event_created:
-            _post_mutation_reconcile(conn, workspace_id)
+            _post_mutation_reconcile(conn, workspace_id, task_id)
         return result
 
     return _handle_review_result_failure(
@@ -1058,7 +1060,7 @@ def mark_done_task(
             verification=effective_verification,
         )
         if result.event_created:
-            _post_mutation_reconcile(conn, workspace_id)
+            _post_mutation_reconcile(conn, workspace_id, task_id)
         return result
 
     return _handle_mark_done_failure(
@@ -1319,10 +1321,17 @@ def mark_done_files(
                 state["receipt_id"] = receipt.receipt_id
                 return True
 
-            # Repair path.
+            # Repair path. An already-done/closed item is repaired only when it
+            # still carries terminal ownership (owner/selected_in_session or an
+            # unreleased lease); a correctly released retry remains a no-op.
             if already_done:
+                ownership_problem = terminal_ownership_problem(item)
+                if ownership_problem is not None:
+                    repair_now = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+                    item["updated_at"] = repair_now
+                    release_terminal_ownership(item, repair_now)
                 state["after_fingerprint"] = compute_item_fingerprint(item)
-                return False
+                return ownership_problem is not None
             _mutate_item_done(item, effective_verification)
             after_fingerprint = compute_item_fingerprint(item)
             state["after_fingerprint"] = after_fingerprint
@@ -1360,6 +1369,9 @@ def _mutate_item_done(item, verification) -> None:
         item["workflow"]["updated_at"] = now
     else:
         item["workflow"] = {"status": "closed", "branch": None, "updated_at": now}
+    # Terminal ownership release (U2): a done task has no executing owner, and
+    # a present lease is stamped released_at exactly once with history intact.
+    release_terminal_ownership(item, now)
 
 
 def mark_done_record(

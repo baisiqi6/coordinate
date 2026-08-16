@@ -20,8 +20,9 @@ from typing import Any
 from types import SimpleNamespace
 from unittest.mock import Mock, patch
 
-from coordinate.db import get_job, initialize, list_deliveries, list_events, row_to_dict, set_workspace_agent, upsert_workspace, upsert_workspace_host_profile
+from coordinate.db import append_event, get_job, initialize, list_deliveries, list_events, mark_job_cancelled, row_to_dict, set_workspace_agent, upsert_workspace, upsert_workspace_host_profile
 from coordinate.execution_leases import LEASE_DEFAULT_TTL_SECONDS, get_attempt_lease
+from coordinate.lease_envelope import validate_execution_lease
 from coordinate.executor_capacity import (
     CapacityCatalog,
     CapacityPolicy,
@@ -42,6 +43,7 @@ from coordinate.execution_cli import (
     handle_runtime_job_report,
 )
 from coordinate.executor_routing import build_routing_request
+from coordinate.jobs import cancel_job
 from coordinate.runtime import (
     RuntimeError as CoordinateRuntimeError,
     claim_job,
@@ -178,6 +180,93 @@ class RuntimeLeaseClaimTests(unittest.TestCase):
         self.assertIn("renew_interval_seconds", lease)
         self.assertTrue(lease["resource_key"].startswith("sha256:"))
         self.assertTrue(lease["capacity_policy_id"].startswith("sha256:"))
+
+    def test_windows_mixed_case_profile_claim_returns_canonical_lease(self):
+        upsert_workspace_host_profile(
+            self.conn,
+            workspace_id="demo",
+            host_id="mac",
+            workspace_path="C:\\Users\\ADMIN\\projects\\multinexus",
+            harness_root="C:\\Users\\ADMIN\\projects\\multinexus\\docs\\project-harness",
+        )
+
+        request = self._submit_exact()
+        context = request.job["payload"]["execution_context"]
+        result = claim_job(self.conn, agent_id="mac-omp")
+
+        self.assertTrue(result.claimed)
+        self.assertEqual(
+            context["worktree_path"],
+            "c:\\users\\admin\\projects\\multinexus",
+        )
+        self.assertEqual(
+            result.execution_lease["normalized_path"],
+            context["worktree_path"],
+        )
+        validate_execution_lease(
+            result.execution_lease,
+            expected_agent_id="mac-omp",
+            expected_job_id=request.job["id"],
+            expected_attempt_token=result.attempt_token,
+            execution_context=context,
+        )
+
+    def test_cancel_repairs_active_lease_for_already_cancelled_managed_job(self):
+        request = self._submit_exact()
+        claimed = claim_job(self.conn, agent_id="mac-omp")
+        lease_id = claimed.execution_lease["lease_id"]
+
+        # Reproduce the pre-fix production state: job cancellation committed,
+        # but its managed attempt lease remained active.
+        mark_job_cancelled(
+            self.conn,
+            job_id=request.job["id"],
+            reason="pre-fix cancellation",
+        )
+        append_event(
+            self.conn,
+            workspace_id="demo",
+            event_type="job.cancelled",
+            actor="operator",
+            idempotency_key=f"job:{request.job['id']}:cancelled",
+            payload={"job_id": request.job["id"], "status": "cancelled"},
+        )
+        self.assertEqual(get_attempt_lease(self.conn, lease_id)["status"], "active")
+
+        repaired = cancel_job(
+            self.conn,
+            request.job["id"],
+            reason="idempotent repair",
+            actor="operator",
+        )
+
+        lease = get_attempt_lease(self.conn, lease_id)
+        self.assertEqual(lease["status"], "released")
+        self.assertEqual(lease["release_reason"], "job_cancelled")
+        self.assertFalse(repaired.event_created)
+        self.assertEqual(repaired.job["status"], "cancelled")
+        self.assertEqual(
+            repaired.job["result"]["cancel_reason"], "pre-fix cancellation"
+        )
+
+    def test_cancel_running_managed_job_releases_lease_atomically(self):
+        request = self._submit_exact()
+        claimed = claim_job(self.conn, agent_id="mac-omp")
+        lease_id = claimed.execution_lease["lease_id"]
+
+        cancelled = cancel_job(
+            self.conn,
+            request.job["id"],
+            reason="operator stop",
+            actor="operator",
+        )
+
+        lease = get_attempt_lease(self.conn, lease_id)
+        self.assertEqual(lease["status"], "released")
+        self.assertEqual(lease["release_reason"], "job_cancelled")
+        self.assertTrue(cancelled.event_created)
+        self.assertEqual(cancelled.job["status"], "cancelled")
+        self.assertEqual(cancelled.job["result"]["cancel_reason"], "operator stop")
 
     def test_legacy_untyped_claim_has_no_lease(self):
         _request = self._submit_exact(target_agent="mac-codex")
@@ -773,6 +862,47 @@ class RuntimeLeaseRenewalTests(unittest.TestCase):
         self.assertGreater(result["expires_at"], old["expires_at"])
         self.assertIn("server_now", result)
         self.assertEqual(result["server_now"], result["renewed_at"])
+
+    def test_renew_refreshes_agent_liveness_without_heartbeat_event(self):
+        self.conn.execute(
+            """
+            UPDATE execution_attempt_leases
+            SET acquired_at = ?, renewed_at = ?, expires_at = ?
+            WHERE lease_id = ?
+            """,
+            (
+                "2030-01-01T00:00:00Z",
+                "2030-01-01T00:00:00Z",
+                "2030-01-01T00:01:00Z",
+                self.lease_id,
+            ),
+        )
+        self.conn.execute(
+            "UPDATE agents SET last_seen_at = ?, updated_at = ? WHERE id = ?",
+            ("2020-01-01T00:00:00Z", "2020-01-01T00:00:00Z", "mac-omp"),
+        )
+        self.conn.commit()
+
+        with patch(
+            "coordinate.execution_leases._utc_now",
+            return_value="2030-01-01T00:00:30Z",
+        ):
+            renew_managed_lease(
+                self.conn,
+                lease_id=self.lease_id,
+                job_id=self.job_id,
+                attempt_token=self.attempt_token,
+                agent_id="mac-omp",
+            )
+
+        last_seen = self.conn.execute(
+            "SELECT last_seen_at FROM agents WHERE id = ?", ("mac-omp",)
+        ).fetchone()[0]
+        self.assertNotEqual(last_seen, "2020-01-01T00:00:00Z")
+        heartbeat_events = self.conn.execute(
+            "SELECT COUNT(*) FROM events WHERE event_type = 'agent.heartbeat'"
+        ).fetchone()[0]
+        self.assertEqual(heartbeat_events, 0)
 
     def test_renew_rejects_when_job_not_running(self):
         report_job_result(

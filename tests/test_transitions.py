@@ -1,3 +1,4 @@
+import ast
 import json
 import tempfile
 import unittest
@@ -10,7 +11,9 @@ from coordinate.db import (
     get_workspace,
     initialize,
     list_events,
+    list_task_mirrors,
     row_to_dict,
+    upsert_task_mirror,
     upsert_workspace,
 )
 from coordinate.harness import HarnessError, HarnessMutationResult
@@ -2234,6 +2237,7 @@ class PostMutationReconcileTests(unittest.TestCase):
         call_args = mock_reconcile.call_args
         self.assertEqual(call_args[0][1].id, "demo")
         self.assertTrue(call_args[1]["refresh"])
+        self.assertEqual(call_args[1]["task_id"], "mvp-001")
 
     @unittest.mock.patch("coordinate.transitions.reconcile_workspace")
     def test_closeout_task_calls_reconcile_on_fresh_success(self, mock_reconcile):
@@ -2249,6 +2253,101 @@ class PostMutationReconcileTests(unittest.TestCase):
         call_args = mock_reconcile.call_args
         self.assertEqual(call_args[0][1].id, "demo")
         self.assertTrue(call_args[1]["refresh"])
+        self.assertEqual(call_args[1]["task_id"], "mvp-001")
+
+    # --- static contract: all post-mutation calls pass the target task ---
+
+    def test_all_post_mutation_reconcile_call_sites_pass_target_task(self):
+        # AST contract（不复制实现）：transitions.py 中所有
+        # _post_mutation_reconcile 调用精确传 (conn, workspace_id, task_id)。
+        src = Path(__file__).resolve().parents[1] / "src" / "coordinate" / "transitions.py"
+        sites = [
+            n for n in ast.walk(ast.parse(src.read_text(encoding="utf-8")))
+            if isinstance(n, ast.Call) and isinstance(n.func, ast.Name)
+            and n.func.id == "_post_mutation_reconcile"
+        ]
+        self.assertEqual(len(sites), 7)
+        for call in sites:
+            self.assertEqual(
+                [getattr(arg, "id", None) for arg in call.args],
+                ["conn", "workspace_id", "task_id"],
+                f"call at line {call.lineno}",
+            )
+            self.assertEqual(call.keywords, [], f"call at line {call.lineno}")
+
+    # --- regression: unrelated conflict cannot block the target mirror ---
+
+    def test_unrelated_conflict_does_not_block_target_mirror_reconcile(self):
+        # 复用 tests/test_reconcile.py 的 unrelated-conflict fixture 形状，走真实
+        # mutation → targeted reconcile：patch 内部 HarnessAdapter 构造，而非复刻 reconciler。
+        conn = self._make_conn()
+        workspace = get_workspace(conn, "demo")
+        upsert_task_mirror(
+            conn,
+            workspace_id="demo",
+            task_id="mvp-001",
+            phase="todo",
+            owner="codex",
+            branch=None,
+            pr=None,
+            payload={},
+        )
+        upsert_task_mirror(
+            conn,
+            workspace_id="demo",
+            task_id="mvp-002",
+            phase="doing",
+            owner="codex",
+            branch="agents/keep",
+            pr=None,
+            payload={},
+        )
+        adapter = _GateFakeAdapter(
+            workspace,
+            refresh_state_result={
+                "project": "demo",
+                "generated_at": "2026-05-17T00:00:00Z",
+            },
+            checklist_result={
+                "project": "demo",
+                "items": [
+                    {
+                        "id": "mvp-001",
+                        "title": "Build core",
+                        "status": "doing",
+                        "owner": "codex",
+                        "workflow": {"status": "blocked"},
+                    },
+                    {
+                        "id": "mvp-002",
+                        "title": "Review core",
+                        "status": "doing",
+                        "owner": "codex",
+                        "workflow": {
+                            "status": "running",
+                            "branch": "agents/other",
+                        },
+                    },
+                ],
+            },
+        )
+
+        with unittest.mock.patch(
+            "coordinate.reconcile.HarnessAdapter",
+            side_effect=lambda _workspace: adapter,
+        ):
+            result = blocker_task(conn, "demo", "mvp-001", adapter=adapter)
+
+        self.assertTrue(result.event_created)
+        self.assertEqual(result.event["event_type"], "blocker.raised")
+        mirrors = {
+            m["task_id"]: m
+            for m in (row_to_dict(r) for r in list_task_mirrors(conn, "demo"))
+        }
+        # target mirror 收束为 blocked；无关 mirror 保持字节不变。
+        self.assertEqual(mirrors["mvp-001"]["phase"], "blocked")
+        self.assertEqual(mirrors["mvp-002"]["branch"], "agents/keep")
+        self.assertEqual(mirrors["mvp-002"]["phase"], "doing")
 
     # --- reconcile NOT called on idempotent retry ---
 
@@ -2307,6 +2406,26 @@ class MarkDoneFilesTests(unittest.TestCase):
         )
         return tmp
 
+    def _active_item(self, task_id="mvp-001", status="doing",
+                     workflow_status="review_approved", verification="",
+                     **overrides):
+        """An item carrying an executing owner/session and an active lease."""
+        item = self._make_item(
+            task_id=task_id, status=status,
+            workflow_status=workflow_status, verification=verification,
+        )
+        item["owner"] = "codex"
+        item["selected_in_session"] = "session-7"
+        item["lease"] = {
+            "owner": "codex",
+            "session": "session-7",
+            "acquired_at": "2026-01-01T00:00:00Z",
+            "expires_at": "2026-01-02T00:00:00Z",
+            "ttl_minutes": 90,
+        }
+        item.update(overrides)
+        return item
+
     def _make_item(self, task_id="mvp-001", status="todo", workflow_status="todo",
                    verification=""):
         return {
@@ -2350,6 +2469,95 @@ class MarkDoneFilesTests(unittest.TestCase):
 
     # --- Normal path writes structured metadata (P1-6) ---
 
+    # --- Terminal ownership release (U2) ---
+
+    def test_repair_path_fresh_done_releases_terminal_ownership(self):
+        """A fresh done/closed write must clear owner/selected_in_session and
+        stamp an active lease with released_at, preserving lease history and
+        unknown compatible fields."""
+        item = self._active_item()
+        item["vendor_note"] = "keep-me"
+        tmp = self._make_checklist_dir(items=[item])
+        result = mark_done_files(
+            workspace_path=tmp, harness_root=tmp, task_id="mvp-001",
+            verification="evidence", repair_reason="drift fix",
+        )
+        self.assertTrue(result.checklist_changed)
+        item = json.loads(Path(tmp, "mvp-checklist.json").read_text())["items"][0]
+        self.assertEqual(item["status"], "done")
+        self.assertEqual(item["workflow"]["status"], "closed")
+        self.assertIsNone(item["owner"])
+        self.assertIsNone(item["selected_in_session"])
+        lease = item["lease"]
+        self.assertTrue(lease["released_at"])
+        self.assertEqual(lease["owner"], "codex")
+        self.assertEqual(lease["session"], "session-7")
+        self.assertEqual(lease["acquired_at"], "2026-01-01T00:00:00Z")
+        self.assertEqual(lease["expires_at"], "2026-01-02T00:00:00Z")
+        self.assertEqual(lease["ttl_minutes"], 90)
+        self.assertEqual(item["verification"], "evidence")
+        self.assertEqual(item["vendor_note"], "keep-me")
+
+    def test_repair_path_releases_terminal_ownership_on_already_done(self):
+        """The explicit repair path converges an already-done/closed item that
+        still carries an owner/session and an unreleased lease to the same
+        terminal state; receipt/branch/review/verification survive."""
+        item = self._active_item(status="done", workflow_status="closed",
+                                 verification="already reconciled")
+        item["completion_receipt"] = {
+            "receipt_id": "rec-historical",
+            "before_fingerprint": "before",
+            "after_fingerprint": "after",
+            "applied_at": "2026-01-01T00:00:00Z",
+        }
+        tmp = self._make_checklist_dir(items=[item])
+        result = mark_done_files(
+            workspace_path=tmp, harness_root=tmp, task_id="mvp-001",
+            repair_reason="reconcile drift",
+        )
+        self.assertTrue(result.checklist_changed)
+        item = json.loads(Path(tmp, "mvp-checklist.json").read_text())["items"][0]
+        self.assertIsNone(item["owner"])
+        self.assertIsNone(item["selected_in_session"])
+        self.assertTrue(item["lease"]["released_at"])
+        self.assertEqual(item["lease"]["owner"], "codex")
+        self.assertEqual(item["lease"]["session"], "session-7")
+        self.assertEqual(item["verification"], "already reconciled")
+        self.assertEqual(item["completion_receipt"]["receipt_id"], "rec-historical")
+
+    def test_repair_retry_correctly_released_terminal_state_noop(self):
+        """A repair retry on an already-released terminal item is a no-op."""
+        item = self._active_item(status="done", workflow_status="closed",
+                                 verification="already reconciled")
+        item["owner"] = None
+        item["selected_in_session"] = None
+        item["lease"]["released_at"] = "2026-01-01T01:00:00Z"
+        tmp = self._make_checklist_dir(items=[item])
+        result = mark_done_files(
+            workspace_path=tmp, harness_root=tmp, task_id="mvp-001",
+            repair_reason="drift",
+        )
+        self.assertFalse(result.checklist_changed)
+
+    def test_repair_path_releases_empty_string_owner_on_already_done(self):
+        """owner=""/selected_in_session="" are not JSON null: the repair
+        path must still converge them to null, not treat them as released."""
+        item = self._active_item(
+            status="done", workflow_status="closed",
+            verification="already reconciled",
+            owner="", selected_in_session="",
+        )
+        item["lease"]["released_at"] = "2026-01-01T01:00:00Z"
+        tmp = self._make_checklist_dir(items=[item])
+        result = mark_done_files(
+            workspace_path=tmp, harness_root=tmp, task_id="mvp-001",
+            repair_reason="drift",
+        )
+        self.assertTrue(result.checklist_changed)
+        item = json.loads(Path(tmp, "mvp-checklist.json").read_text())["items"][0]
+        self.assertIsNone(item["owner"])
+        self.assertIsNone(item["selected_in_session"])
+
     def test_normal_path_writes_completion_receipt_metadata(self):
         from coordinate.completion import ReceiptEvidence, compute_mark_done_fingerprints
         tmp = self._make_checklist_dir(items=[self._make_item()])
@@ -2366,6 +2574,26 @@ class MarkDoneFilesTests(unittest.TestCase):
         self.assertEqual(item["completion_receipt"]["after_fingerprint"],
                          fps.after_fingerprint)
         self.assertIn("applied_at", item["completion_receipt"])
+
+    def test_normal_path_fresh_done_releases_terminal_ownership(self):
+        """The receipt path shares the same terminal release semantics: a fresh
+        done/closed write clears owner/session and releases the lease while
+        recording the receipt metadata."""
+        from coordinate.completion import ReceiptEvidence, compute_mark_done_fingerprints
+        tmp = self._make_checklist_dir(items=[self._active_item()])
+        fps = compute_mark_done_fingerprints(harness_root=tmp, task_id="mvp-001")
+        evidence = ReceiptEvidence("rec-1", fps.before_fingerprint, fps.after_fingerprint)
+        result = mark_done_files(
+            workspace_path=tmp, harness_root=tmp, task_id="mvp-001",
+            verification="evidence", receipt=evidence,
+        )
+        self.assertTrue(result.checklist_changed)
+        item = json.loads(Path(tmp, "mvp-checklist.json").read_text())["items"][0]
+        self.assertIsNone(item["owner"])
+        self.assertIsNone(item["selected_in_session"])
+        self.assertTrue(item["lease"]["released_at"])
+        self.assertEqual(item["lease"]["owner"], "codex")
+        self.assertEqual(item["completion_receipt"]["receipt_id"], "rec-1")
 
     def test_normal_path_idempotent_retry_validates_metadata(self):
         from coordinate.completion import ReceiptEvidence, compute_mark_done_fingerprints

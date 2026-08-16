@@ -8,7 +8,10 @@ Coordinator 或唯一权威。当前 Operator 负责判断；Coordinate 通过�
 ## 拓扑
 
 - **Local development**：repo worktree + 显式本地 DB；只代表本地测试状态。
-- **Production control plane**：运行 Coordinate 服务并持有生产 DB 的主机；典型部署使用 `/var/lib/coordinate/coord.sqlite3`，通过严格 SSH wrapper `coord-ssh` 调用远端 CLI（如 `/usr/local/bin/coord-local`）。具体路径由部署配置决定，不得在 server 上直接编辑 DB。
+- **Production control plane**：运行 Coordinate 服务并持有生产 DB 的主机；典型部署使用
+  `/var/lib/coordinate/coord.sqlite3`。日常、已授权的 Agent lifecycle 优先使用 exact-scoped Remote MCP；
+  尚未 MCP 化的 mutation、deployment、rotation 与 recovery 使用严格 SSH wrapper `coord-ssh`。具体路径
+  由部署配置决定，不得在 server 上直接编辑 DB。
 - **Coding host**：保存 canonical repo/harness 文件、运行 provider/agentd、执行
   `*-files` 文件半边和 Git/GitHub 副作用。
 - **Deployed runtime copy**：`/opt/coordinate` 与 `/opt/multinexus`，只由受审部署/

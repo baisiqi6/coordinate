@@ -1,0 +1,33 @@
+# Coordinate runtime HTTP core (R2A) — loopback-only systemd unit.
+#
+# Fail-safe contract:
+#  - The unit only starts when the server-local auth policy exists
+#    (/etc/coordinate/runtime-http-clients.json). An ordinary Coordinate
+#    deploy without the policy never activates this unit.
+#  - A broken policy makes the server exit non-zero with a diagnostic journal;
+#    Restart=on-failure with a bounded StartLimit prevents an infinite crash
+#    loop while keeping the failure visible.
+#  - The process binds loopback only (127.0.0.1) and never exposes the
+#    runtime data plane beyond the host.
+[Unit]
+Description=Coordinate Runtime HTTP Core (loopback data plane, R2A)
+ConditionPathExists=/etc/coordinate/runtime-http-clients.json
+StartLimitIntervalSec=60
+StartLimitBurst=3
+After=network.target
+
+[Service]
+Type=simple
+User=coord
+Group=coord
+ExecStart=/opt/coordinate/.venv/bin/coordinate --db /var/lib/coordinate/coord.sqlite3 runtime-http serve --host 127.0.0.1 --port 8765 --auth-file /etc/coordinate/runtime-http-clients.json
+Restart=on-failure
+RestartSec=5
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/var/lib/coordinate
+
+[Install]
+WantedBy=multi-user.target

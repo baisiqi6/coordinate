@@ -13,6 +13,7 @@ from types import MappingProxyType
 from typing import Any, Mapping
 
 from coordinate.db import Workspace, WorkspaceHostProfile
+from coordinate.execution_resources import ResourceIdentityError, normalize_worktree_path
 
 CONTRACT_VERSION = 1
 MAX_SCOPE_LEN = 256
@@ -304,6 +305,10 @@ def resolve_execution_context_v1(
     if not worktree_path:
         worktree_path = workspace_path
     worktree_path = _validate_path(worktree_path, "worktree_path")
+    try:
+        worktree_path = normalize_worktree_path(worktree_path)
+    except ResourceIdentityError as exc:
+        raise ContextError(f"worktree_path is invalid: {exc}") from exc
 
     if profile.harness_root:
         harness_root = _validate_path(profile.harness_root, "harness_root")

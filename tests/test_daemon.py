@@ -1,4 +1,5 @@
 import asyncio
+import concurrent.futures
 import json
 import os
 import sys
@@ -7,7 +8,7 @@ import types
 import unittest
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from unittest.mock import patch
+from unittest.mock import AsyncMock, patch
 
 
 def _install_fake_discord() -> None:
@@ -67,12 +68,29 @@ def _install_fake_discord() -> None:
 _install_fake_discord()
 
 from coordinate.agent_report import AgentReport, parse_agent_report  # noqa: E402
-from coordinate.daemon import CoordinatorDaemon, _task_status_event_line  # noqa: E402
+from coordinate.channel_provisioning import (  # noqa: E402
+    ensure_discord_delivery_route,
+    finish_discord_channel_request,
+    inspect_discord_provisioning,
+    list_pending_discord_channel_requests,
+    normalize_discord_channel_name,
+    request_discord_channel_provision,
+    workspace_topic_marker,
+)
+from coordinate.daemon import (  # noqa: E402
+    BotBus,
+    CoordinatorDaemon,
+    _discord_snowflake,
+    _task_status_event_line,
+)
 from coordinate.db import (  # noqa: E402
     append_event,
+    bind_channel_workspace,
+    get_workspace,
     initialize,
     list_deliveries,
     list_events,
+    resolve_channel_workspace,
     set_workspace_agent as _set_workspace_agent,
     sync_workspace_agents,
     upsert_workspace,
@@ -520,7 +538,9 @@ class DaemonRoutingTests(unittest.TestCase):
         async def fake_dispatch(message, text):
             calls.append("dispatch")
 
-        async def fake_ingest(message):
+        daemon._resolve_message_workspace = lambda channel: "demo"
+
+        async def fake_ingest(message, *, workspace_id=None):
             calls.append("ingest")
 
         daemon._dispatch = fake_dispatch
@@ -700,6 +720,20 @@ class DaemonRefreshTests(unittest.TestCase):
         return str(Path(tmp.name) / "coordinator.sqlite3")
 
     def _make_daemon(self, db_path: str) -> CoordinatorDaemon:
+        conn = initialize(db_path)
+        try:
+            if get_workspace(conn, "demo") is not None:
+                bind_channel_workspace(
+                    conn,
+                    platform="discord",
+                    channel_id="100",
+                    workspace_id="demo",
+                    actor="test-fixture",
+                    reason="daemon routing fixture",
+                    idempotency_key="test:daemon-routing:demo:100",
+                )
+        finally:
+            conn.close()
         return CoordinatorDaemon(
             db_path=db_path,
             bot_token="token",
@@ -731,7 +765,7 @@ class DaemonRefreshTests(unittest.TestCase):
         daemon = self._make_daemon(db_path)
         calls: list[tuple[str, str, str]] = []
 
-        async def fake_ingest(message):
+        async def fake_ingest(message, *, workspace_id=None):
             calls.append((message.author.id, message.channel.id, message.content))
 
         daemon._ingest_agent_message = fake_ingest
@@ -761,7 +795,7 @@ class DaemonRefreshTests(unittest.TestCase):
         daemon = self._make_daemon(db_path)
         calls: list[tuple[str, str, str]] = []
 
-        async def fake_ingest(m):
+        async def fake_ingest(m, *, workspace_id=None):
             calls.append((m.author.id, m.channel.id, m.content))
         daemon._ingest_agent_message = fake_ingest
 
@@ -812,7 +846,7 @@ class DaemonRefreshTests(unittest.TestCase):
         daemon = self._make_daemon(db_path)
         calls: list[tuple[str, str, str]] = []
 
-        async def fake_ingest(m):
+        async def fake_ingest(m, *, workspace_id=None):
             calls.append((m.author.id, m.channel.id, m.content))
         daemon._ingest_agent_message = fake_ingest
 
@@ -897,6 +931,554 @@ class ResolveProxyUrlTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class ChannelProvisioningTests(unittest.TestCase):
+    def _db_path(self) -> str:
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        return str(Path(tmp.name) / "coordinator.sqlite3")
+
+    def _seed_workspace(self, db_path: str):
+        conn = initialize(db_path)
+        workspace = upsert_workspace(
+            conn,
+            workspace_id="demo",
+            name="Demo",
+            path="/tmp/demo",
+            harness_root="/tmp/demo/harness",
+            harnessctl_path="/tmp/demo/harnessctl",
+            base_branch="main",
+            branch_namespace="agents",
+        )
+        conn.close()
+        return workspace
+
+    def test_channel_name_validation_is_bounded_and_non_normalizing(self):
+        self.assertEqual(normalize_discord_channel_name("demo-project"), "demo-project")
+        self.assertEqual(normalize_discord_channel_name("demo project"), "demo project")
+        for invalid in ("", " demo", "demo ", "demo\nproject", "x" * 101):
+            with self.subTest(invalid=repr(invalid)):
+                with self.assertRaises(ValueError):
+                    normalize_discord_channel_name(invalid)
+
+    def test_durable_request_exact_replay_and_conflict(self):
+        db_path = self._db_path()
+        self._seed_workspace(db_path)
+        conn = initialize(db_path)
+        try:
+            first = request_discord_channel_provision(
+                conn,
+                workspace_id="demo",
+                channel_name="demo-project",
+                actor="operator-a",
+                idempotency_key="request-1",
+            )
+            replay = request_discord_channel_provision(
+                conn,
+                workspace_id="demo",
+                channel_name="demo-project",
+                actor="operator-a",
+                idempotency_key="request-1",
+            )
+            self.assertEqual(first, replay)
+            self.assertEqual(first["status"], "pending")
+            self.assertEqual(len(list_pending_discord_channel_requests(conn)), 1)
+            with self.assertRaisesRegex(ValueError, "request replay"):
+                request_discord_channel_provision(
+                    conn,
+                    workspace_id="demo",
+                    channel_name="different",
+                    actor="operator-a",
+                    idempotency_key="request-1",
+                )
+            with self.assertRaisesRegex(ValueError, "already pending"):
+                request_discord_channel_provision(
+                    conn,
+                    workspace_id="demo",
+                    channel_name="demo-project",
+                    actor="operator-a",
+                    idempotency_key="request-2",
+                )
+        finally:
+            conn.close()
+
+    def test_request_projection_survives_reopen_and_has_one_terminal(self):
+        db_path = self._db_path()
+        self._seed_workspace(db_path)
+        conn = initialize(db_path)
+        request = request_discord_channel_provision(
+            conn,
+            workspace_id="demo",
+            channel_name="demo-project",
+            actor="operator-a",
+            idempotency_key="request-1",
+        )
+        conn.close()
+
+        reopened = initialize(db_path)
+        try:
+            pending = list_pending_discord_channel_requests(reopened)
+            self.assertEqual([row["id"] for row in pending], [request["request_event_id"]])
+            done = finish_discord_channel_request(
+                reopened,
+                request_event_id=request["request_event_id"],
+                channel_id="456",
+            )
+            replay = finish_discord_channel_request(
+                reopened,
+                request_event_id=request["request_event_id"],
+                channel_id="456",
+            )
+            self.assertEqual(done, replay)
+            self.assertEqual(done["status"], "provisioned")
+            self.assertEqual(done["channel_id"], "456")
+            self.assertEqual(list_pending_discord_channel_requests(reopened), [])
+        finally:
+            reopened.close()
+
+    def test_concurrent_different_keys_leave_one_pending_request(self):
+        db_path = self._db_path()
+        self._seed_workspace(db_path)
+
+        def submit(key: str):
+            conn = initialize(db_path)
+            try:
+                return request_discord_channel_provision(
+                    conn,
+                    workspace_id="demo",
+                    channel_name="demo-project",
+                    actor="operator-a",
+                    idempotency_key=key,
+                )
+            except ValueError as exc:
+                return str(exc)
+            finally:
+                conn.close()
+
+        with concurrent.futures.ThreadPoolExecutor(max_workers=2) as pool:
+            outcomes = list(pool.map(submit, ("request-1", "request-2")))
+        self.assertEqual(sum(isinstance(item, dict) for item in outcomes), 1)
+        self.assertEqual(
+            sum("already pending" in item for item in outcomes if isinstance(item, str)),
+            1,
+        )
+        verify = initialize(db_path)
+        try:
+            self.assertEqual(len(list_pending_discord_channel_requests(verify)), 1)
+        finally:
+            verify.close()
+
+    def test_daemon_consumes_recovered_pending_request(self):
+        db_path = self._db_path()
+        self._seed_workspace(db_path)
+        conn = initialize(db_path)
+        request = request_discord_channel_provision(
+            conn,
+            workspace_id="demo",
+            channel_name="demo-project",
+            actor="operator-a",
+            idempotency_key="request-1",
+        )
+        conn.close()
+
+        daemon = CoordinatorDaemon(
+            db_path=db_path,
+            bot_token="token",
+            channel_id=100,
+            allowed_user_ids={1},
+        )
+
+        async def fake_provision(workspace_id, channel_name):
+            conn2 = initialize(db_path)
+            state = inspect_discord_provisioning(conn2, workspace_id=workspace_id)
+            bind_channel_workspace(
+                conn2,
+                platform="discord",
+                channel_id="456",
+                workspace_id=workspace_id,
+                actor="test",
+                reason="test",
+                idempotency_key="test-bind-456",
+            )
+            ensure_discord_delivery_route(conn2, workspace=state.workspace, channel_id="456")
+            conn2.close()
+
+        daemon._provision_discord_channel = fake_provision
+        asyncio.run(daemon._consume_pending_channel_provision_requests())
+
+        verify = initialize(db_path)
+        try:
+            self.assertEqual(list_pending_discord_channel_requests(verify), [])
+            terminal = [
+                row for row in list_events(verify, "demo")
+                if row["causation_id"] == request["request_event_id"]
+            ]
+            self.assertEqual(len(terminal), 1)
+            self.assertEqual(terminal[0]["event_type"], "channel.provisioned")
+        finally:
+            verify.close()
+
+    def test_multiple_workspace_discord_bindings_fail_closed(self):
+        db_path = self._db_path()
+        self._seed_workspace(db_path)
+        conn = initialize(db_path)
+        try:
+            for index, channel_id in enumerate(("101", "102"), start=1):
+                bind_channel_workspace(
+                    conn,
+                    platform="discord",
+                    channel_id=channel_id,
+                    workspace_id="demo",
+                    actor="test",
+                    reason="fixture",
+                    idempotency_key=f"bind-{index}",
+                )
+            with self.assertRaisesRegex(ValueError, "multiple Discord"):
+                inspect_discord_provisioning(conn, workspace_id="demo")
+        finally:
+            conn.close()
+
+    def test_delivery_route_update_preserves_workspace_contract(self):
+        db_path = self._db_path()
+        original = self._seed_workspace(db_path)
+        conn = initialize(db_path)
+        try:
+            updated = ensure_discord_delivery_route(
+                conn,
+                workspace=original,
+                channel_id="456",
+            )
+            self.assertEqual(updated.default_bus, "discord_webhook")
+            self.assertEqual(updated.default_destination, "456")
+            self.assertEqual(updated.harnessctl_path, original.harnessctl_path)
+            self.assertEqual(updated.base_branch, "main")
+            self.assertEqual(updated.branch_namespace, "agents")
+        finally:
+            conn.close()
+
+    def test_agent_report_must_match_bound_channel_workspace(self):
+        daemon = CoordinatorDaemon(
+            db_path=":memory:",
+            bot_token="token",
+            channel_id=100,
+            allowed_user_ids={1},
+        )
+        daemon._agent_discord_ids = {123: {"workspace-a": "agent-a", "workspace-b": "agent-b"}}
+        calls = []
+        daemon._do_ingest = lambda *args, **kwargs: calls.append((args, kwargs))
+        message = FakeMessage(
+            author_id=123,
+            channel_id=200,
+            content="[agent-report] action=done workspace_id=workspace-b task_id=t1",
+            bot=True,
+        )
+        with self.assertLogs("coordinator.daemon", level="WARNING"):
+            asyncio.run(daemon._ingest_agent_message(message, workspace_id="workspace-a"))
+        self.assertEqual(calls, [])
+
+    def test_allowed_agent_bot_can_request_only_its_workspace(self):
+        daemon = CoordinatorDaemon(
+            db_path=":memory:",
+            bot_token="token",
+            channel_id=100,
+            allowed_user_ids={123},
+        )
+        daemon._refresh_agent_registry = lambda: {123: {"demo": "operator"}}
+        calls = []
+
+        async def fake_provision(workspace_id, channel_name):
+            calls.append((workspace_id, channel_name))
+            return "ok"
+
+        daemon._provision_discord_channel = fake_provision
+        message = FakeMessage(
+            author_id=123,
+            channel_id=100,
+            content="<@999> channel create demo demo-project",
+            bot=True,
+        )
+        message.channel.send = lambda text: None
+
+        async def fake_reply(message, text):
+            calls.append(("reply", text))
+
+        daemon._reply = fake_reply
+        asyncio.run(daemon.on_message(message))
+        self.assertEqual(calls[0], ("demo", "demo-project"))
+
+        message.content = "<@999> channel create other other-project"
+        asyncio.run(daemon.on_message(message))
+        self.assertEqual(len([call for call in calls if call[0] != "reply"]), 1)
+
+    def test_creation_binding_route_and_marker_recovery_are_idempotent(self):
+        db_path = self._db_path()
+        self._seed_workspace(db_path)
+
+        class CreatedChannel:
+            def __init__(self, channel_id, topic):
+                self.id = channel_id
+                self.topic = topic
+
+        class Guild:
+            def __init__(self):
+                self.channels = []
+                self.create_calls = []
+
+            async def create_text_channel(self, name, **kwargs):
+                self.create_calls.append((name, kwargs))
+                channel = CreatedChannel(456, kwargs["topic"])
+                self.channels.append(channel)
+                return channel
+
+        guild = Guild()
+        control = FakeChannel(100)
+        control.guild = guild
+        control.category = object()
+
+        daemon = CoordinatorDaemon(
+            db_path=db_path,
+            bot_token="token",
+            channel_id=100,
+            allowed_user_ids={1},
+        )
+        daemon.client.get_channel = lambda channel_id: control if channel_id == 100 else None
+
+        first = asyncio.run(daemon._provision_discord_channel("demo", "demo-project"))
+        second = asyncio.run(daemon._provision_discord_channel("demo", "ignored-name"))
+
+        self.assertIn("456", first)
+        self.assertIn("456", second)
+        self.assertEqual(len(guild.create_calls), 1)
+        self.assertEqual(
+            guild.create_calls[0][1]["topic"],
+            workspace_topic_marker("demo"),
+        )
+        self.assertIs(guild.create_calls[0][1]["category"], control.category)
+
+        conn = initialize(db_path)
+        try:
+            binding = resolve_channel_workspace(conn, platform="discord", channel_id="456")
+            workspace = get_workspace(conn, "demo")
+            self.assertEqual(binding.workspace_id, "demo")
+            self.assertEqual(workspace.default_destination, "456")
+            self.assertEqual(workspace.default_bus, "discord_webhook")
+            provisioned = [
+                event for event in list_events(conn, "demo")
+                if event["event_type"] == "channel.provisioned"
+            ]
+            self.assertEqual(len(provisioned), 1)
+        finally:
+            conn.close()
+
+    def test_concurrent_same_workspace_requests_create_only_one_channel(self):
+        db_path = self._db_path()
+        self._seed_workspace(db_path)
+
+        class Guild:
+            def __init__(self):
+                self.channels = []
+                self.calls = 0
+
+            async def create_text_channel(self, name, **kwargs):
+                self.calls += 1
+                await asyncio.sleep(0)
+                channel = types.SimpleNamespace(id=654, topic=kwargs["topic"])
+                self.channels.append(channel)
+                return channel
+
+        guild = Guild()
+        control = FakeChannel(100)
+        control.guild = guild
+        control.category = object()
+        daemon = CoordinatorDaemon(
+            db_path=db_path,
+            bot_token="token",
+            channel_id=100,
+            allowed_user_ids={1},
+        )
+        daemon.client.get_channel = lambda channel_id: control
+
+        async def run_both():
+            return await asyncio.gather(
+                daemon._provision_discord_channel("demo", "demo-project"),
+                daemon._provision_discord_channel("demo", "demo-project"),
+            )
+
+        results = asyncio.run(run_both())
+        self.assertEqual(guild.calls, 1)
+        self.assertTrue(all("654" in result for result in results))
+
+    def test_created_marker_channel_is_reused_after_bind_failure(self):
+        db_path = self._db_path()
+        self._seed_workspace(db_path)
+
+        class Channel:
+            def __init__(self, channel_id, topic):
+                self.id = channel_id
+                self.topic = topic
+
+        class Guild:
+            def __init__(self):
+                self.channels = []
+                self.calls = 0
+
+            async def create_text_channel(self, name, **kwargs):
+                self.calls += 1
+                channel = Channel(789, kwargs["topic"])
+                self.channels.append(channel)
+                return channel
+
+        guild = Guild()
+        control = FakeChannel(100)
+        control.guild = guild
+        control.category = object()
+        daemon = CoordinatorDaemon(
+            db_path=db_path,
+            bot_token="token",
+            channel_id=100,
+            allowed_user_ids={1},
+        )
+        daemon.client.get_channel = lambda channel_id: control
+
+        original = daemon._finalize_discord_provisioning
+        calls = 0
+
+        def fail_once(*args, **kwargs):
+            nonlocal calls
+            calls += 1
+            if calls == 1:
+                raise RuntimeError("simulated DB failure")
+            return original(*args, **kwargs)
+
+        daemon._finalize_discord_provisioning = fail_once
+        with self.assertRaisesRegex(RuntimeError, "simulated DB failure"):
+            asyncio.run(daemon._provision_discord_channel("demo", "demo-project"))
+        asyncio.run(daemon._provision_discord_channel("demo", "demo-project"))
+
+        self.assertEqual(guild.calls, 1)
+        conn = initialize(db_path)
+        try:
+            self.assertEqual(
+                resolve_channel_workspace(conn, platform="discord", channel_id="789").workspace_id,
+                "demo",
+            )
+        finally:
+            conn.close()
+
+    def test_duplicate_recovery_markers_fail_before_binding(self):
+        db_path = self._db_path()
+        self._seed_workspace(db_path)
+        marker = workspace_topic_marker("demo")
+        guild = types.SimpleNamespace(
+            channels=[
+                types.SimpleNamespace(id=201, topic=marker),
+                types.SimpleNamespace(id=202, topic=marker),
+            ]
+        )
+        control = FakeChannel(100)
+        control.guild = guild
+        control.category = object()
+        daemon = CoordinatorDaemon(
+            db_path=db_path,
+            bot_token="token",
+            channel_id=100,
+            allowed_user_ids={1},
+        )
+        daemon.client.get_channel = lambda channel_id: control
+
+        with self.assertRaisesRegex(ValueError, "multiple Discord channels"):
+            asyncio.run(daemon._provision_discord_channel("demo", "demo-project"))
+
+        conn = initialize(db_path)
+        try:
+            self.assertEqual(
+                inspect_discord_provisioning(conn, workspace_id="demo").channel_id,
+                None,
+            )
+        finally:
+            conn.close()
+
+    def test_create_failure_leaves_database_unmodified(self):
+        db_path = self._db_path()
+        original = self._seed_workspace(db_path)
+
+        class Guild:
+            channels = []
+
+            async def create_text_channel(self, name, **kwargs):
+                raise PermissionError("missing Manage Channels")
+
+        control = FakeChannel(100)
+        control.guild = Guild()
+        control.category = object()
+        daemon = CoordinatorDaemon(
+            db_path=db_path,
+            bot_token="token",
+            channel_id=100,
+            allowed_user_ids={1},
+        )
+        daemon.client.get_channel = lambda channel_id: control
+
+        with self.assertRaisesRegex(PermissionError, "Manage Channels"):
+            asyncio.run(daemon._provision_discord_channel("demo", "demo-project"))
+
+        conn = initialize(db_path)
+        try:
+            state = inspect_discord_provisioning(conn, workspace_id="demo")
+            current = get_workspace(conn, "demo")
+            self.assertIsNone(state.channel_id)
+            self.assertEqual(current.default_bus, original.default_bus)
+            self.assertEqual(current.default_destination, original.default_destination)
+        finally:
+            conn.close()
+
+    def test_missing_control_category_fails_before_create(self):
+        db_path = self._db_path()
+        self._seed_workspace(db_path)
+        guild = types.SimpleNamespace(channels=[], create_text_channel=AsyncMock())
+        control = FakeChannel(100)
+        control.guild = guild
+        control.category = None
+        daemon = CoordinatorDaemon(
+            db_path=db_path,
+            bot_token="token",
+            channel_id=100,
+            allowed_user_ids={1},
+        )
+        daemon.client.get_channel = lambda channel_id: control
+
+        with self.assertRaisesRegex(ValueError, "must belong to a Discord category"):
+            asyncio.run(daemon._provision_discord_channel("demo", "demo-project"))
+        guild.create_text_channel.assert_not_awaited()
+
+
+class BotBusDestinationTests(unittest.TestCase):
+    def test_destination_must_be_a_positive_decimal_snowflake(self):
+        self.assertEqual(_discord_snowflake("456"), 456)
+        for invalid in ("", "0", "-1", " 456", "456 ", "abc", "１２３"):
+            with self.subTest(invalid=invalid):
+                with self.assertRaises(ValueError):
+                    _discord_snowflake(invalid)
+
+    def test_async_send_uses_delivery_destination(self):
+        sent_to = []
+
+        class Channel:
+            def __init__(self, channel_id):
+                self.id = channel_id
+
+            async def send(self, **kwargs):
+                sent_to.append((self.id, kwargs["content"]))
+                return types.SimpleNamespace(id=999)
+
+        class Client:
+            def get_channel(self, channel_id):
+                return Channel(channel_id)
+
+        receipt = asyncio.run(BotBus(Client())._async_send(456, {"text": "hello"}))
+        self.assertEqual(sent_to[0][0], 456)
+        self.assertEqual(receipt, "discord_bot:999")
 
 
 # ---------------------------------------------------------------------------

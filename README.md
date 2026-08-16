@@ -78,9 +78,21 @@ Coordinate 区分四个操作环境：
 - Attempt token、lease、timeout、retry 和 crash/restart 恢复保护。
 - Event policy、delivery outbox 以及 Discord/KOOK/stdout 可见消息。
 - GitHub branch、PR、CI、review 与 merge gate 证据。
-- Operator pending、projection drift 和恢复诊断。
+  - Operator pending、projection drift 和恢复诊断。
+- 面向 agent 的 MCP stdio / private Remote MCP 接口（共用 12 个 tool schema；包括窄的
+  `coordinate.channel_create` provisioning request）。
+- 面向 daemon/bridge/agentd 的 loopback runtime HTTP data plane（R2A：
+  `coordinate runtime-http serve`，受认证的 7 个 use case，仅监听 loopback）。
 
 精确 CLI 以当前程序帮助为准，不在 README 复制完整命令手册：
+
+```bash
+.venv/bin/coordinate --help
+.venv/bin/coordinate runtime --help
+.venv/bin/coordinate assignment --help
+```
+
+或使用源码模式（开发时）：
 
 ```bash
 PYTHONPATH=src python3 -m coordinate --help
@@ -106,6 +118,39 @@ source .venv/bin/activate
 pip install .
 ```
 
+需要 MCP agent 接口（stdio 或 private Remote MCP）时安装 optional extra：
+
+```bash
+pip install 'coordinate[mcp]'   # mcp>=2,<3
+```
+
+未安装该 extra 时，`import coordinate`、`coordinate --help` 与其余 CLI 不受影响；
+只有启动 MCP 会返回安装提示。安装后启动：
+
+```bash
+coordinate --db <path> mcp serve   # MCP stdio，DB 与 actor 由启动配置决定
+```
+
+需要 loopback runtime HTTP data plane（R2A，`coordinate runtime-http serve`）时
+安装 optional extra：
+
+```bash
+pip install 'coordinate[runtime-http]'   # aiohttp>=3.9
+```
+
+R2A 只接受 `127.0.0.1` / `::1` / `localhost` 绑定；启动前必须提供 server-local
+auth policy（`--auth-file`，digest-only JSON，不得 group/world writable）：
+
+```bash
+coordinate --db <path> runtime-http serve \
+  --host 127.0.0.1 --port 8765 \
+  --auth-file /etc/coordinate/runtime-http-clients.json
+```
+
+未安装该 extra 时其它 CLI 不受影响，只有启动 runtime-http 返回安装提示。
+HTTP 只是 adapter：状态、校验、幂等与 transaction 边界全部来自现有
+domain 核心与同一 DB；不创建第二份 job/lease/client 状态。
+
 安装完成后，console script `coordinate` 会被写入虚拟环境：
 
 - macOS / Linux：`.venv/bin/coordinate`
@@ -115,13 +160,13 @@ pip install .
 
 ```toml
 agentd_mode = true
-coordinator_cli_path = "/absolute/path/to/coordinate/.venv/bin/coordinate"
-coordinator_db_path = "/absolute/path/to/coordinate/data/coordinator.sqlite3"
+coordinator_cli_path = "/Users/<you>/projects/coordinate/.venv/bin/coordinate"
+coordinator_db_path = "/Users/<you>/projects/coordinate/data/coordinator.sqlite3"
 ```
 
 - `coordinator_db_path` 必须是**绝对路径**，并且只能由当前这台宿主机上的进程访问；
 - 不要把本地 SQLite 文件挂载给多台宿主机共享，也不要使用相对路径依赖运行时当前目录；
-- 多宿主机部署通常通过受控 wrapper 调用 Coordinate；本地 console script 路径仅用于同一宿主机的直接运行。
+- 生产部署通常使用 `coord-ssh` / `coord-local` 这类 wrapper 做远程或受控调用，本地 console script 路径仅用于单台 coding host 的直接运行。
 
 ## 本地开发
 

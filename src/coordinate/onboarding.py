@@ -46,8 +46,8 @@ from .split_operations import (
     apply_task_create_record,
     build_task_create_input_fingerprint,
     compute_plan_sha256,
-    validate_sha256,
     validate_task_create_contract,
+    validate_task_mirror_split_operation,
     validate_uuid,
     validate_workspace_relative_path,
 )
@@ -150,51 +150,6 @@ def _plan_content_hash(path) -> str | None:
         return None
 
 
-_SPLIT_OPERATION_META_KEYS = frozenset({
-    "contract_version",
-    "operation_id",
-    "operation_kind",
-    "input_fingerprint",
-    "before_fingerprint",
-    "after_fingerprint",
-})
-
-_KNOWN_OPERATION_KINDS = frozenset({
-    OPERATION_KIND_TASK_CREATE,
-    OPERATION_KIND_ISSUE_MATERIALIZE,
-})
-
-
-def _validate_split_operation_metadata(value: Any, *, source: str) -> dict[str, Any]:
-    """Fail closed if *value* is not the exact task-mirror operation metadata shape.
-
-    The task mirror stores a reduced, six-key record derived from the split-operation
-    envelope.  This helper validates the exact keys and the contract-version,
-    operation-kind, UUID, and SHA-256 shapes enforced by the split-operation code.
-    """
-    if not isinstance(value, dict):
-        raise ValueError(f"{source} split_operation must be a dict, got {type(value).__name__}")
-    if set(value.keys()) != _SPLIT_OPERATION_META_KEYS:
-        raise ValueError(
-            f"{source} split_operation must have exactly keys "
-            f"{sorted(_SPLIT_OPERATION_META_KEYS)}, got {sorted(value.keys())}"
-        )
-    if value["contract_version"] != CONTRACT_VERSION:
-        raise ValueError(
-            f"{source} split_operation contract_version must be {CONTRACT_VERSION}, "
-            f"got {value['contract_version']!r}"
-        )
-    if value["operation_kind"] not in _KNOWN_OPERATION_KINDS:
-        raise ValueError(
-            f"{source} split_operation operation_kind must be one of "
-            f"{sorted(_KNOWN_OPERATION_KINDS)}, got {value['operation_kind']!r}"
-        )
-    validate_uuid(value["operation_id"])
-    for key in ("input_fingerprint", "before_fingerprint", "after_fingerprint"):
-        validate_sha256(value[key])
-    return value
-
-
 def _load_existing_task_mirror_payload(
     conn: sqlite3.Connection, workspace_id: str, task_id: str
 ) -> dict[str, Any] | None:
@@ -225,7 +180,7 @@ def _load_existing_split_operation_metadata(
         return None
     # Key present (even if null) must be validated; a null or malformed
     # stored value fails closed rather than being silently dropped.
-    return _validate_split_operation_metadata(
+    return validate_task_mirror_split_operation(
         payload["split_operation"], source="stored task mirror"
     )
 
@@ -251,7 +206,7 @@ def _carry_split_operation_metadata(
                 "split_operation is reserved metadata and cannot be supplied "
                 "for a task without existing operation metadata"
             )
-        _validate_split_operation_metadata(caller, source="caller-supplied payload")
+        validate_task_mirror_split_operation(caller, source="caller-supplied payload")
         if caller != stored:
             raise ValueError(
                 "caller-supplied split_operation does not match the stored task mirror metadata"

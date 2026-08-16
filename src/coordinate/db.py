@@ -57,10 +57,28 @@ class CoordinatorConnection(sqlite3.Connection):
 atexit.register(_close_open_connections)
 
 
-def connect(db_path: str | Path) -> sqlite3.Connection:
+def connect(db_path: str | Path, *, must_exist: bool = False) -> sqlite3.Connection:
+    """Open a SQLite connection with the Coordinate runtime pragmas.
+
+    ``must_exist=True`` performs an atomic existing-only open via the SQLite
+    URI ``mode=rw``: a missing file raises ``sqlite3.OperationalError`` instead
+    of creating an empty database, with no check-then-open TOCTOU window.
+    Relative paths are resolved to an absolute file URI before opening.
+    Ordinary callers keep the legacy create-if-absent semantics.
+    """
     if str(db_path) != ":memory:":
-        Path(db_path).expanduser().parent.mkdir(parents=True, exist_ok=True)
-    conn = sqlite3.connect(str(db_path), factory=CoordinatorConnection)
+        path = Path(db_path).expanduser()
+        if must_exist:
+            conn = sqlite3.connect(
+                path.resolve().as_uri() + "?mode=rw",
+                factory=CoordinatorConnection,
+                uri=True,
+            )
+        else:
+            path.parent.mkdir(parents=True, exist_ok=True)
+            conn = sqlite3.connect(str(path), factory=CoordinatorConnection)
+    else:
+        conn = sqlite3.connect(str(db_path), factory=CoordinatorConnection)
     conn.row_factory = sqlite3.Row
     conn.execute("PRAGMA foreign_keys = ON")
     # P9-3B: explicit 30-second busy timeout for production DB connections.

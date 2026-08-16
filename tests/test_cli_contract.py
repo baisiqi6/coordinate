@@ -400,6 +400,351 @@ _PRE_TARGETED_BASELINE_FIXTURE_SHA256 = (
 )
 
 
+def _restore_pre_r1_root_help(help_text: str) -> str:
+    """Rebuild the pre-R1 root help without the ``mcp`` subcommand.
+
+    The root choices line drops ``mcp`` and the subcommand description line is
+    removed; all other lines keep their exact text (``mcp`` is short enough
+    that no column alignment changes).
+    """
+    result: list[str] = []
+    for line in help_text.splitlines():
+        if ",mcp" in line:
+            result.append(line.replace(",mcp", ""))
+            continue
+        if line.startswith("    mcp ") and "MCP agent interface" in line:
+            continue
+        result.append(line)
+    return "\n".join(result) + "\n"
+
+
+# Pre-update-dependencies ``task`` parent help, extracted from the committed
+# fixture that predates the two dependency-update leaves.  Restoring it keeps
+# historical rewind SHA proofs free of the later CLI addition.
+_PRE_UPDATE_DEPENDENCIES_TASK_HELP = (
+    "usage: coordinate task [-h] {create,create-files,create-record,handoff} ...\n\n"
+    "positional arguments:\n"
+    "  {create,create-files,create-record,handoff}\n"
+    "    create              Combined managed create: checklist file half first, DB record half second\n"
+    "                        (idempotent; --operation-id to pin)\n"
+    "    create-files        Coding-host half of host-aware task create: checklist file half only (no\n"
+    "                        DB write)\n"
+    "    create-record       Server half of host-aware task create: write DB task mirror + plan.ready\n"
+    "                        only (no checklist write)\n"
+    "    handoff             Generate a structured worker handoff\n\n"
+    "options:\n"
+    "  -h, --help            show this help message and exit\n"
+)
+
+
+def _restore_pre_r2a_root_help(help_text: str) -> str:
+    """Rebuild the pre-R2A root help without the ``runtime-http`` subcommand.
+
+    The root choices line drops ``runtime-http`` and the subcommand description
+    line is removed. ``runtime-http`` is the longest subcommand name, so the
+    description column of every remaining subcommand must also be re-aligned
+    to the next-longest name (``assignment``).
+    """
+    longest = len("assignment")
+    result: list[str] = []
+    for line in help_text.splitlines():
+        if ",runtime-http," in line or ",runtime-http}" in line:
+            result.append(line.replace(",runtime-http,", ",").replace(",runtime-http}", "}"))
+            continue
+        if line.startswith("    runtime-http ") and "runtime HTTP" in line:
+            continue
+        result.append(line)
+    return "\n".join(result) + "\n"
+
+
+def _remove_runtime_http_delta(contract: dict[str, object]) -> dict[str, object]:
+    """Return a copy of *contract* with the R2A ``runtime-http`` delta removed.
+
+    R2A adds exactly one top-level command (``runtime-http``), one leaf
+    (``runtime-http serve``) and two nodes. Rewinding restores the pre-R2A
+    tree (22 commands / 93 leaves / 122 nodes). No-op when already absent.
+    """
+    return _strip_runtime_http_nodes(copy.deepcopy(contract))
+
+
+def _strip_runtime_http_nodes(historical: dict[str, object]) -> dict[str, object]:
+    """Strip the two ``runtime-http`` nodes from a copy of *historical*."""
+    has_rt = any(node["path"] == ["runtime-http"] for node in historical["nodes"])
+    if not has_rt:
+        return historical
+
+    historical["nodes"] = [
+        node
+        for node in historical["nodes"]
+        if node["path"] not in (["runtime-http"], ["runtime-http", "serve"])
+    ]
+    historical["leaf_paths"] = [
+        path for path in historical["leaf_paths"] if path != "runtime-http serve"
+    ]
+    historical["metadata"]["leaf_count"] = int(
+        historical["metadata"]["leaf_count"]
+    ) - 1
+    historical["metadata"]["node_count"] = int(
+        historical["metadata"]["node_count"]
+    ) - 2
+    historical["metadata"]["top_level_commands"] = [
+        name
+        for name in historical["metadata"]["top_level_commands"]
+        if name != "runtime-http"
+    ]
+
+    found = set()
+    for node in historical["nodes"]:
+        if not node["path"]:
+            subparsers = [
+                action
+                for action in node["actions"]
+                if action["action_class"] == "_SubParsersAction"
+            ]
+            if len(subparsers) != 1 or "runtime-http" not in subparsers[0]["choices"]:
+                raise AssertionError("unexpected root subparser delta")
+            subparsers[0]["choices"] = [
+                choice for choice in subparsers[0]["choices"] if choice != "runtime-http"
+            ]
+            node["help"] = _restore_pre_r2a_root_help(node["help"])
+            found.add("root")
+    if found != {"root"}:
+        raise AssertionError(f"incomplete runtime-http CLI delta: {sorted(found)}")
+    return historical
+
+
+def _remove_update_dependencies_delta(contract: dict[str, object]) -> dict[str, object]:
+    """Return a copy of *contract* with the dependency-update parser delta removed.
+
+    Restores the pre-delta ``task`` subparser choices/help and the leaf/node
+    counts so historical baseline rewinds are not polluted by the two new
+    leaves (``task update-dependencies`` / ``task update-dependencies-files``).
+    No-op when the delta is already absent.
+    """
+    historical = copy.deepcopy(contract)
+    delta_paths = {
+        ("task", "update-dependencies"): "task update-dependencies",
+        ("task", "update-dependencies-files"): "task update-dependencies-files",
+    }
+    has_delta = any(tuple(node["path"]) in delta_paths for node in historical["nodes"])
+    if not has_delta:
+        return historical
+
+    historical["nodes"] = [
+        node for node in historical["nodes"] if tuple(node["path"]) not in delta_paths
+    ]
+    historical["leaf_paths"] = [
+        path for path in historical["leaf_paths"] if path not in delta_paths.values()
+    ]
+    historical["metadata"]["leaf_count"] = int(
+        historical["metadata"]["leaf_count"]
+    ) - 2
+    historical["metadata"]["node_count"] = int(
+        historical["metadata"]["node_count"]
+    ) - 2
+
+    found = set()
+    for node in historical["nodes"]:
+        if node["path"] == ["task"]:
+            subparsers = [
+                action
+                for action in node["actions"]
+                if action["action_class"] == "_SubParsersAction"
+            ]
+            if len(subparsers) != 1:
+                raise AssertionError("unexpected task subparser delta")
+            choices = subparsers[0]["choices"]
+            new_choices = [path.split(" ", 1)[1] for path in delta_paths.values()]
+            if not set(new_choices).issubset(choices):
+                raise AssertionError("missing update-dependencies subparser choices")
+            subparsers[0]["choices"] = [
+                choice for choice in choices if choice not in new_choices
+            ]
+            node["help"] = _PRE_UPDATE_DEPENDENCIES_TASK_HELP
+            found.add("task")
+    if found != {"task"}:
+        raise AssertionError(f"incomplete update-dependencies CLI delta: {sorted(found)}")
+    return historical
+
+
+# Pre-R3 ``mcp`` help texts (extracted from the pre-R3 committed fixture).
+_PRE_R3_ROOT_HELP = "usage: coordinate [-h] [--db DB] [--version]\n                  {workspace,state,event,task,plan,runner,reconcile,branch,pr,ci,review,merge,issue,job,delivery,policy,worker,runtime,assignment,operator,mcp,runtime-http,serve}\n                  ...\n\npositional arguments:\n  {workspace,state,event,task,plan,runner,reconcile,branch,pr,ci,review,merge,issue,job,delivery,policy,worker,runtime,assignment,operator,mcp,runtime-http,serve}\n    workspace           Manage harness workspaces\n    state               Refresh and print harness state for a workspace\n    event               Append or inspect normalized events\n    task                Create and inspect coordinator task mirrors\n    plan                Plan review and approval gate\n    runner              Manage runner profiles\n    reconcile           Sync coordinator task mirror from harness state\n    branch              Manage branch allocations\n    pr                  Manage PR links\n    ci                  Check CI status\n    review              Check PR review status\n    merge               Check merge readiness\n    issue               Scan and triage GitHub issues\n    job                 Create, run, and list jobs\n    delivery            Create, send, and list bus deliveries\n    policy              Render workflow events into visible deliveries\n    worker              Run coordinator worker loops\n    runtime             Bridge and agentd runtime operations\n    assignment          Manage task assignments\n    operator            Operator-facing pending-action queries\n    mcp                 MCP agent interface (stdio)\n    runtime-http        Loopback runtime HTTP data plane (R2A)\n    serve               Run coordinator daemon with Discord bot\n\noptions:\n  -h, --help            show this help message and exit\n  --db DB               SQLite database path\n  --version             show program's version number and exit\n"
+_PRE_R3_MCP_HELP = "usage: coordinate mcp [-h] {serve} ...\n\npositional arguments:\n  {serve}\n    serve     Serve the MCP agent interface over stdio (R1)\n\noptions:\n  -h, --help  show this help message and exit\n"
+_PRE_R3_MCP_SERVE_HELP = "usage: coordinate mcp serve [-h] [--transport {stdio}] [--actor ACTOR]\n\noptions:\n  -h, --help           show this help message and exit\n  --transport {stdio}  Transport to serve (R1: stdio only)\n  --actor ACTOR        Fixed actor identity recorded for tool mutations; callers cannot override\n"
+_PRE_R3_MCP_SERVE_TRANSPORT_HELP = "Transport to serve (R1: stdio only)"
+_PRE_R3_MCP_SERVE_ACTOR_HELP = "Fixed actor identity recorded for tool mutations; callers cannot override"
+
+# Pre-R5B ``mark-done-files`` help/action texts (extracted from the committed
+# fixture before the Remote MCP transport options landed).
+_PRE_R5B_ASSIGNMENT_HELP = "usage: coordinate assignment [-h]\n                             {request,accept,handoff,blocker,unblock,closeout,review-result,mark-done,mark-done-prepare,mark-done-preflight,mark-done-claim,mark-done-apply,mark-done-files,mark-done-record}\n                             ...\n\npositional arguments:\n  {request,accept,handoff,blocker,unblock,closeout,review-result,mark-done,mark-done-prepare,mark-done-preflight,mark-done-claim,mark-done-apply,mark-done-files,mark-done-record}\n    request             Request a task assignment\n    accept              Accept a task assignment\n    handoff             Hand off a task to another agent\n    blocker             Raise a blocker on a task\n    unblock             Resolve a blocker on a task\n    closeout            Request closeout review for a task\n    review-result       Submit a review result for a task\n    mark-done           Mark a task as done\n    mark-done-prepare   Validate the closeout/review gate on the control plane and issue a one-\n                        time completion.authorized receipt binding the host-aware mark-done files\n                        + record pair.\n    mark-done-preflight\n                        Read-only: re-query a receipt from the control-plane DB and return its\n                        authoritative workspace/task/status/expiry. The coding host calls this\n                        through coord-ssh before mutating the canonical checklist so it never\n                        trusts its own claims.\n    mark-done-claim     Atomically reserve a receipt authorized -> claimed on the control plane,\n                        recording before/expected-after fingerprints. Server-side sink invoked by\n                        the coding host through coord-ssh BEFORE the checklist mutation (two-phase\n                        reserve step).\n    mark-done-apply     Acknowledge a claimed receipt -> applied on the control plane, recording\n                        the actual after-fingerprint. Server-side sink invoked by the coding host\n                        through coord-ssh AFTER the canonical checklist write lands (two-phase\n                        apply step).\n    mark-done-files     Coding-host half of host-aware mark-done. Writes local checklist file half\n                        only. Normal path requires --receipt and a remote coord CLI (--event-cli-\n                        path) to verify/claim the receipt online before any file mutation.\n                        --repair-reason selects the explicit repair-only path.\n    mark-done-record    Server half of host-aware mark-done. Writes the control-plane task.done\n                        event after re-verifying the receipt and the deployed harness. Normal path\n                        requires --receipt; --repair-reason selects the explicit repair-only path.\n\noptions:\n  -h, --help            show this help message and exit\n"
+_PRE_R5B_MARK_DONE_FILES_HELP = "usage: coordinate assignment mark-done-files [-h] --workspace-path WORKSPACE_PATH --harness-root\n                                             HARNESS_ROOT --task-id TASK_ID\n                                             [--workspace-id WORKSPACE_ID] [--actor ACTOR]\n                                             [--verification VERIFICATION] [--receipt RECEIPT]\n                                             [--event-cli-path EVENT_CLI_PATH]\n                                             [--repair-reason REPAIR_REASON]\n                                             [--allow-runtime-copy]\n\noptions:\n  -h, --help            show this help message and exit\n  --workspace-path WORKSPACE_PATH\n  --harness-root HARNESS_ROOT\n  --task-id TASK_ID\n  --workspace-id WORKSPACE_ID\n  --actor ACTOR\n  --verification VERIFICATION\n  --receipt RECEIPT\n  --event-cli-path EVENT_CLI_PATH\n                        Path to a coord CLI that runs mark-done-preflight / mark-done-claim\n                        against the control-plane DB (e.g. <HOME>/.local/bin/coord-ssh). Required\n                        for the normal receipt path so the host verifies the receipt online before\n                        mutating files.\n  --repair-reason REPAIR_REASON\n  --allow-runtime-copy  Allow mutation of /opt deployment copy\n"
+_PRE_R5B_EVENT_CLI_PATH_HELP = "Path to a coord CLI that runs mark-done-preflight / mark-done-claim against the control-plane DB (e.g. <HOME>/.local/bin/coord-ssh). Required for the normal receipt path so the host verifies the receipt online before mutating files."
+
+
+def _remove_r3_mcp_serve_delta(contract: dict[str, object]) -> dict[str, object]:
+    """Return a copy of *contract* with the R3 streamable-HTTP serve delta
+    removed, restoring the pre-R3 ``mcp``/``mcp serve``/root nodes.
+
+    R3 added ``--host/--port/--path/--auth-file/--allowed-host/
+    --allowed-origin`` to ``mcp serve``, widened the ``--transport`` choices
+    and rewrote the serve/mcp/root help texts. Every historical rewind must
+    strip this delta (it postdates the last committed fixture regeneration)
+    before older baseline SHA proofs stay meaningful. No-op when the delta
+    is already absent; fails closed on structural surprises.
+    """
+    historical = copy.deepcopy(contract)
+    serve_node = next(
+        (node for node in historical["nodes"] if node["path"] == ["mcp", "serve"]),
+        None,
+    )
+    if serve_node is None:
+        # Pre-R1 tree (no mcp command at all): nothing to strip.
+        return historical
+    r3_dests = {
+        "host", "port", "path", "auth_file", "allowed_host", "allowed_origin",
+    }
+    if not any(action.get("dest") in r3_dests for action in serve_node["actions"]):
+        return historical
+
+    found: set[str] = set()
+    for node in historical["nodes"]:
+        if node["path"] == ["mcp", "serve"]:
+            for action in node["actions"]:
+                if action.get("dest") in r3_dests:
+                    found.add(action["dest"])
+            node["actions"] = [
+                action
+                for action in node["actions"]
+                if action.get("dest") not in r3_dests
+            ]
+            for action in node["actions"]:
+                if action.get("dest") == "transport":
+                    if action.get("choices") != ["stdio", "streamable-http"]:
+                        raise AssertionError("unexpected R3 transport choices delta")
+                    action["choices"] = ["stdio"]
+                    action["help"] = _PRE_R3_MCP_SERVE_TRANSPORT_HELP
+                elif action.get("dest") == "actor":
+                    action["help"] = _PRE_R3_MCP_SERVE_ACTOR_HELP
+            node["help"] = _PRE_R3_MCP_SERVE_HELP
+            found.add("serve-node")
+        elif node["path"] == ["mcp"]:
+            node["help"] = _PRE_R3_MCP_HELP
+            found.add("mcp-node")
+        elif node["path"] == []:
+            node["help"] = _PRE_R3_ROOT_HELP
+            found.add("root-node")
+    if found != {
+        "serve-node", "mcp-node", "root-node",
+        "host", "port", "path", "auth_file", "allowed_host", "allowed_origin",
+    }:
+        raise AssertionError(f"incomplete R3 mcp-serve CLI delta: {sorted(found)}")
+    return historical
+
+
+def _remove_r5b_mark_done_mcp_delta(contract: dict[str, object]) -> dict[str, object]:
+    """Return a copy of *contract* with the R5B Remote MCP transport delta
+    removed from ``assignment mark-done-files``.
+
+    R5B added ``--event-mcp-url``/``--event-mcp-token-env`` and reworded the
+    ``--event-cli-path`` help. Every historical rewind must strip this delta
+    first so pre-R5B baseline SHA proofs stay meaningful. No-op when the
+    delta is already absent; fails closed on structural surprises.
+    """
+    historical = _remove_r3_mcp_serve_delta(contract)
+    node = next(
+        (
+            candidate
+            for candidate in historical["nodes"]
+            if candidate["path"] == ["assignment", "mark-done-files"]
+        ),
+        None,
+    )
+    if node is None:
+        return historical
+    r5b_dests = {"event_mcp_url", "event_mcp_token_env"}
+    if not any(action.get("dest") in r5b_dests for action in node["actions"]):
+        return historical
+    removed = [action for action in node["actions"] if action.get("dest") in r5b_dests]
+    if sorted(action["dest"] for action in removed) != ["event_mcp_token_env", "event_mcp_url"]:
+        raise AssertionError("unexpected R5B mark-done-files parser delta")
+    for action in removed:
+        expected = (
+            ["--event-mcp-url"] if action["dest"] == "event_mcp_url"
+            else ["--event-mcp-token-env"]
+        )
+        if action.get("option_strings") != expected:
+            raise AssertionError(f"unexpected {action['dest']} option strings")
+    node["actions"] = [
+        action for action in node["actions"] if action.get("dest") not in r5b_dests
+    ]
+    for action in node["actions"]:
+        if action.get("dest") == "event_cli_path":
+            action["help"] = _PRE_R5B_EVENT_CLI_PATH_HELP
+    node["help"] = _PRE_R5B_MARK_DONE_FILES_HELP
+    # The parent ``assignment`` node help carries the mark-done-files
+    # description line; restore the pre-R5B text.
+    for parent in historical["nodes"]:
+        if parent["path"] == ["assignment"]:
+            parent["help"] = _PRE_R5B_ASSIGNMENT_HELP
+    return historical
+
+
+def _remove_mcp_delta(contract: dict[str, object]) -> dict[str, object]:
+    """Return a copy of *contract* with the R1 ``mcp`` command delta removed.
+
+    R1 adds exactly one top-level command (``mcp``), one leaf (``mcp serve``)
+    and two nodes (``mcp``, ``mcp serve``). Every historical baseline rewind
+    must strip this delta first so pre-R1 SHA proofs stay meaningful. No-op
+    when the delta is already absent. The post-R1 R5B and R3 CLI deltas are
+    stripped first so pre-R1 rewinds stay free of them too.
+    """
+    historical = _remove_r5b_mark_done_mcp_delta(contract)
+    historical = _remove_update_dependencies_delta(historical)
+    historical = _strip_runtime_http_nodes(historical)
+    has_mcp = any(node["path"] == ["mcp"] for node in historical["nodes"])
+    if not has_mcp:
+        return historical
+
+    historical["nodes"] = [
+        node
+        for node in historical["nodes"]
+        if node["path"] not in (["mcp"], ["mcp", "serve"])
+    ]
+    historical["leaf_paths"] = [
+        path for path in historical["leaf_paths"] if path != "mcp serve"
+    ]
+    historical["metadata"]["leaf_count"] = int(
+        historical["metadata"]["leaf_count"]
+    ) - 1
+    historical["metadata"]["node_count"] = int(
+        historical["metadata"]["node_count"]
+    ) - 2
+    historical["metadata"]["top_level_commands"] = [
+        name
+        for name in historical["metadata"]["top_level_commands"]
+        if name != "mcp"
+    ]
+
+    found = set()
+    for node in historical["nodes"]:
+        if not node["path"]:
+            subparsers = [
+                action
+                for action in node["actions"]
+                if action["action_class"] == "_SubParsersAction"
+            ]
+            if len(subparsers) != 1 or "mcp" not in subparsers[0]["choices"]:
+                raise AssertionError("unexpected root subparser delta")
+            subparsers[0]["choices"] = [
+                choice for choice in subparsers[0]["choices"] if choice != "mcp"
+            ]
+            node["help"] = _restore_pre_r1_root_help(node["help"])
+            found.add("root")
+    if found != {"root"}:
+        raise AssertionError(f"incomplete mcp CLI delta: {sorted(found)}")
+    return historical
+
+
 def _remove_targeted_reconcile_delta(contract: dict[str, object]) -> dict[str, object]:
     """Return a copy of *contract* with the targeted-reconcile ``--task-id``
     parser delta removed, restoring the pre-targeted baseline help.
@@ -408,7 +753,7 @@ def _remove_targeted_reconcile_delta(contract: dict[str, object]) -> dict[str, o
     fails closed on structural surprises (missing or multiple reconcile
     nodes, unexpected task_id action).
     """
-    historical = copy.deepcopy(contract)
+    historical = _remove_mcp_delta(contract)
     matches = [node for node in historical["nodes"] if node["path"] == ["reconcile"]]
     if not matches:
         raise AssertionError("missing reconcile parser node; cannot strip targeted delta")
@@ -449,7 +794,7 @@ def _remove_plan_revise_delta(contract: dict[str, object]) -> dict[str, object]:
     counts so historical baseline rewinds are not polluted by the later CLI
     addition.  No-op when the delta is already absent.
     """
-    historical = copy.deepcopy(contract)
+    historical = _remove_mcp_delta(contract)
     revise_path = ["plan", "revise"]
     has_revise = any(node["path"] == revise_path for node in historical["nodes"])
     if not has_revise:
@@ -498,10 +843,11 @@ def _rewrite_contract_to_p9_3c1_p1_baseline(
 ) -> dict[str, object]:
     """Remove only the P9-3C1 P1 parser delta from a generated contract.
 
-    Any later delta (targeted-reconcile ``--task-id``, ``plan revise``) is
-    stripped first so historical baseline rewinds stay free of post-P9-3C1
-    CLI additions. This function is the shared entry of every cumulative
-    rewind chain.
+    Any later delta (targeted-reconcile ``--task-id``, ``plan revise``, R1
+    ``mcp``) is stripped first so historical baseline rewinds stay free of
+    post-P9-3C1 CLI additions. This function is the shared entry of every
+    cumulative rewind chain; ``_remove_targeted_reconcile_delta`` already
+    strips the R1 ``mcp`` delta, so it is not repeated here.
     """
     historical = _remove_targeted_reconcile_delta(contract)
     historical = _remove_plan_revise_delta(historical)
@@ -678,7 +1024,7 @@ def _remove_p9_2a_executor_leaves(contract: dict[str, object]) -> dict[str, obje
     Restores the pre-P9-2A runtime help string so historical baseline proofs
     keep their meaning.
     """
-    historical = copy.deepcopy(contract)
+    historical = _remove_mcp_delta(contract)
     leaf_paths_to_remove = set(P9_2A_EXECUTOR_LEAVES.keys())
     node_paths_to_remove = {tuple(p.split()) for p in leaf_paths_to_remove} | {("runtime", "executor")}
 
@@ -810,7 +1156,7 @@ def _restore_pre_p9_3a_runtime_help(help_text: str) -> str:
 
 def _remove_p9_3a_capacity_leaves(contract: dict[str, object]) -> dict[str, object]:
     """Return a copy of *contract* with the P9-3A ``runtime capacity`` subtree removed."""
-    historical = copy.deepcopy(contract)
+    historical = _remove_mcp_delta(contract)
     leaf_paths_to_remove = set(P9_3A_CAPACITY_LEAVES)
     node_paths_to_remove = {tuple(p.split()) for p in leaf_paths_to_remove} | {("runtime", "capacity")}
 
@@ -932,7 +1278,7 @@ def _remove_p9_3b_lease_leaves(contract: dict[str, object]) -> dict[str, object]
     and restores the captured pre-P9-3B help strings so historical baseline
     proofs keep their meaning.
     """
-    historical = copy.deepcopy(contract)
+    historical = _remove_mcp_delta(contract)
     leaf_paths_to_remove = set(P9_3B_LEASE_LEAVES.keys())
     node_paths_to_remove = {tuple(p.split()) for p in leaf_paths_to_remove} | {("runtime", "job", "lease")}
 
@@ -1015,7 +1361,7 @@ def _rewrite_contract_to_s4d_baseline(contract: dict[str, object]) -> dict[str, 
     Strips the ``--no-projections`` flag from ``workspace doctor`` so the
     C2-to-D delta proof is independent of Git topology and fixture generation.
     """
-    historical = copy.deepcopy(contract)
+    historical = _remove_mcp_delta(contract)
 
     for node in historical["nodes"]:
         if node["path"] == ["workspace", "doctor"]:
@@ -1036,11 +1382,111 @@ class CLIContractTests(unittest.TestCase):
     def test_contract_counts_match_plan(self) -> None:
         contract = _build_contract()
         metadata = contract["metadata"]
-        self.assertEqual(len(metadata["top_level_commands"]), 21)
-        self.assertEqual(metadata["leaf_count"], 90)
-        self.assertEqual(metadata["node_count"], 118)
-        self.assertEqual(len(contract["leaf_paths"]), 90)
-        self.assertEqual(len(contract["nodes"]), 118)
+        self.assertEqual(len(metadata["top_level_commands"]), 23)
+        self.assertEqual(metadata["leaf_count"], 94)
+        self.assertEqual(metadata["node_count"], 124)
+        self.assertEqual(len(contract["leaf_paths"]), 94)
+        self.assertEqual(len(contract["nodes"]), 124)
+
+    def test_r2a_runtime_http_serve_delta_exactly(self) -> None:
+        """R2A adds exactly ``runtime-http serve`` and nothing else."""
+        contract = _build_contract()
+        self.assertEqual(contract["leaf_paths"].count("runtime-http serve"), 1)
+        self.assertNotIn("runtime-http", contract["leaf_paths"])
+        rt_nodes = [
+            node for node in contract["nodes"] if node["path"][:1] == ["runtime-http"]
+        ]
+        self.assertEqual(
+            [node["path"] for node in rt_nodes],
+            [["runtime-http"], ["runtime-http", "serve"]],
+        )
+        serve = next(
+            node for node in rt_nodes if node["path"] == ["runtime-http", "serve"]
+        )
+        self.assertEqual(
+            serve["defaults"]["handler"],
+            "coordinate.runtime_http_cli.handle_runtime_http_serve",
+        )
+        host_action = next(
+            action
+            for action in serve["actions"]
+            if action.get("dest") == "host"
+        )
+        self.assertEqual(host_action["default"], "127.0.0.1")
+        auth_action = next(
+            action for action in serve["actions"] if action.get("dest") == "auth_file"
+        )
+        self.assertTrue(auth_action["required"])
+        rt_parent = next(node for node in rt_nodes if node["path"] == ["runtime-http"])
+        subparsers = [
+            action
+            for action in rt_parent["actions"]
+            if action["action_class"] == "_SubParsersAction"
+        ]
+        self.assertEqual(len(subparsers), 1)
+        self.assertEqual(subparsers[0]["choices"], ["serve"])
+        self.assertIn("runtime-http", contract["metadata"]["top_level_commands"])
+        # Rewinding the R2A delta must restore the pre-R2A tree exactly.
+        historical = _remove_runtime_http_delta(contract)
+        self.assertEqual(
+            len(historical["metadata"]["top_level_commands"]), 22
+        )
+        self.assertEqual(historical["metadata"]["leaf_count"], 93)
+        self.assertEqual(historical["metadata"]["node_count"], 122)
+        self.assertNotIn("runtime-http", historical["metadata"]["top_level_commands"])
+        self.assertNotIn("runtime-http serve", historical["leaf_paths"])
+
+    def test_r1_mcp_serve_delta_exactly(self) -> None:
+        """R1 adds exactly ``mcp serve`` and nothing else to the CLI tree."""
+        contract = _build_contract()
+        self.assertEqual(contract["leaf_paths"].count("mcp serve"), 1)
+        self.assertNotIn("mcp", contract["leaf_paths"])
+        mcp_nodes = [
+            node for node in contract["nodes"] if node["path"][:1] == ["mcp"]
+        ]
+        self.assertEqual(
+            [node["path"] for node in mcp_nodes], [["mcp"], ["mcp", "serve"]]
+        )
+        serve = next(
+            node for node in mcp_nodes if node["path"] == ["mcp", "serve"]
+        )
+        self.assertEqual(
+            serve["defaults"]["handler"],
+            "coordinate.mcp_cli.handle_mcp_serve",
+        )
+        transport_action = next(
+            action
+            for action in serve["actions"]
+            if action.get("dest") == "transport"
+        )
+        self.assertEqual(transport_action["default"], "stdio")
+        # R3 extends the same R1 leaf with the loopback streamable-http
+        # profile; stdio remains the default and the remote flags stay on the
+        # same leaf (no new nodes/leaves).
+        self.assertEqual(
+            transport_action["choices"], ["stdio", "streamable-http"]
+        )
+        for flag in ("--host", "--port", "--path", "--auth-file",
+                     "--allowed-host", "--allowed-origin"):
+            self.assertIn(flag, [action.get("option_strings", [None])[0] for action in serve["actions"]])
+        mcp_parent = next(node for node in mcp_nodes if node["path"] == ["mcp"])
+        subparsers = [
+            action
+            for action in mcp_parent["actions"]
+            if action["action_class"] == "_SubParsersAction"
+        ]
+        self.assertEqual(len(subparsers), 1)
+        self.assertEqual(subparsers[0]["choices"], ["serve"])
+        self.assertIn("mcp", contract["metadata"]["top_level_commands"])
+        # Rewinding the R1 delta must restore the pre-R1 tree exactly.
+        historical = _remove_mcp_delta(contract)
+        self.assertEqual(
+            len(historical["metadata"]["top_level_commands"]), 21
+        )
+        self.assertEqual(historical["metadata"]["leaf_count"], 90)
+        self.assertEqual(historical["metadata"]["node_count"], 118)
+        self.assertNotIn("mcp", historical["metadata"]["top_level_commands"])
+        self.assertNotIn("mcp serve", historical["leaf_paths"])
 
     def test_plan_revise_present_exactly_once(self) -> None:
         contract = _build_contract()
