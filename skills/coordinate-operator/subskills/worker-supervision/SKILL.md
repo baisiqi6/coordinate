@@ -25,3 +25,16 @@ dogfood 小修、ordinary 小任务或主线之外独立分支可以委派局部
 
 可见 `[PLAN]`/`[HANDOFF]`/`[DONE]` 消息只证明广播，不证明目标 Agent 已接受。真实 managed handoff 使用
 registered agent identity 与 durable task/job evidence。
+
+## Reviewer context 与 runtime identity
+
+Coordinate 记录 Reviewer 的 agent/session/job、receipt 与 verdict，但不另行定义审查方法；采用
+EXharness 时，以其 `reviewer-strategy.md` 为语义权威。
+
+- Reviewer 必须独立于 Worker 及其 mutation authority；连续验证上一轮局部修复时，可以复用
+  Reviewer 自己的 session。
+- 有明显锚定风险、争议判断、架构转向或高风险最终 closeout 时，使用 `fresh`；一般最终 closeout
+  优先 `limited-fresh`，只传底层目标、canonical plan、当前代码/diff、non-goals 与必要证据，
+  不传旧 verdict。
+- 无论复用还是刷新上下文，都必须记录并核验真实 agent/session/job locator。context mode 的选择
+  不会授予 merge、deploy、delete 或其他新增 authority。

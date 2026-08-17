@@ -1,6 +1,6 @@
 ---
 name: coordinate-operator
-description: Use when operating Coordinate across local development, coding hosts, production control plane, Remote MCP, Runtime HTTP, GitHub, or Discord/KOOK. This parent skill is a progressive-disclosure router: load only the task-specific subskill for workspace/task lifecycle, runtime execution, messaging, GitHub collaboration, worker supervision, production recovery, or Windows multi-CLI work. It is for AI operator onboarding, not for implementing new Coordinate features.
+description: "Use when operating Coordinate across local development, coding hosts, production control plane, Remote MCP, Runtime HTTP, GitHub, or Discord/KOOK. This parent skill is a progressive-disclosure router: load only the task-specific subskill for workspace/task lifecycle, runtime execution, messaging, GitHub collaboration, worker supervision, production recovery, or Windows multi-CLI work. It is for AI operator onboarding, not for implementing new Coordinate features."
 ---
 
 # Coordinate Operator
