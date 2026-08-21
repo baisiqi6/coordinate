@@ -1,4 +1,4 @@
-"""Parse agent metadata from discord-nexus agents.toml for registry sync."""
+"""Parse agent metadata from MultiNexus agents.toml for registry sync."""
 from __future__ import annotations
 
 import hashlib
