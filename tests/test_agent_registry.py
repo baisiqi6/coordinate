@@ -645,7 +645,7 @@ class LegacyMigrationTests(unittest.TestCase):
         )
         conn.commit()
         migrate(conn)
-        self.assertEqual(conn.execute("PRAGMA user_version").fetchone()[0], 14)
+        self.assertEqual(conn.execute("PRAGMA user_version").fetchone()[0], 16)
         rows = conn.execute(
             "SELECT agent_name, entry_kind, discord_user_id FROM workspace_agent_registry_entries WHERE workspace_id = ?",
             ("legacy-ws",),
@@ -689,7 +689,7 @@ class LegacyMigrationTests(unittest.TestCase):
             ("ws",),
         ).fetchone()
         self.assertEqual(rows["n"], 1)
-        self.assertEqual(conn.execute("PRAGMA user_version").fetchone()[0], 14)
+        self.assertEqual(conn.execute("PRAGMA user_version").fetchone()[0], 16)
         conn.close()
 
 

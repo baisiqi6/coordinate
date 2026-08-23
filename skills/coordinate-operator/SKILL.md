@@ -51,6 +51,7 @@ mutation、deployment、rotation、recovery 与 break-glass。三者不共享 cr
 | request/job、agentd、executor/capacity、lease、runner | `subskills/runtime-execution/SKILL.md` |
 | event/delivery、Discord/KOOK、channel binding/provisioning | `subskills/messaging-delivery/SKILL.md` |
 | GitHub Issue 认领、branch/PR、CI/review/merge gate | `subskills/github-collaboration/SKILL.md` |
+| 从 task/job 入口只读重建一次执行的关联 trace（evidence states、next gate） | `coordinate trace task|job`（Issue #11 R1 只读投影；细节看 `--help`） |
 | 观察 worker、JSONL、direct/managed delegation、局部 Operator | `subskills/worker-supervision/SKILL.md` |
 | deploy、`/opt`、production SSH、policy mutation、事故恢复 | `subskills/production-recovery/SKILL.md` |
 | Windows Codex/OMP/ZCode、Remote MCP 配置、NSSM、credential rotation | `subskills/windows-multi-cli/SKILL.md` |

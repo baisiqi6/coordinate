@@ -36,9 +36,12 @@ from coordinate.split_operations import (
     OPERATION_KIND_TASK_CREATE,
     STATUS_RECORD_APPLIED,
     TARGET_KIND_CHECKLIST_TASK,
+    apply_task_adopt_files,
+    apply_task_adopt_record,
     apply_task_create_files,
     apply_task_create_record,
     compute_plan_sha256,
+    prepare_task_adoption,
 )
 
 
@@ -3507,6 +3510,285 @@ class PreflightRequiredLinkTest(ProjectionDoctorTestBase):
         state = _lookup_receipt_for_preflight(conn, receipt_id)
         self.assertFalse(state.get("broken", False))
         self.assertEqual(state.get("status"), "consumed")
+
+
+class TaskAdoptionFindingsTest(ProjectionDoctorTestBase):
+    """task.adopt operations must be recognized, never flagged unsupported."""
+
+    def _find(self, report: ProjectionReport, kind: str) -> Finding | None:
+        return next((f for f in report.findings if f.kind == kind), None)
+
+    def _seed_legacy_item(self, harness_root: str, task_id: str = "legacy-1") -> None:
+        Path(harness_root, "mvp-checklist.json").write_text(
+            json.dumps({
+                "project": "demo",
+                "harness_root": ".",
+                "version": 1,
+                "updated_at": "2026-07-13",
+                "items": [{
+                    "id": task_id,
+                    "title": "Legacy One",
+                    "status": "todo",
+                    "phase": "todo",
+                    "priority": "p1",
+                    "owner": None,
+                    "selected_in_session": None,
+                    "updated_at": "2026-07-13T00:00:00Z",
+                    "dependencies": [],
+                    "blocked_by": [],
+                    "blocked_reason": "",
+                    "acceptance": "legacy acceptance",
+                    "verification": "",
+                    "handoff": {"from": None, "to": None, "reason": None},
+                    "plan_path": "plans/plan.md",
+                    "artifact_path": "plans/plan.md",
+                    "artifacts": {"plan": "plans/plan.md"},
+                    "workflow": {"status": "todo", "branch": None,
+                                 "updated_at": "2026-07-13T00:00:00Z"},
+                }],
+            }, ensure_ascii=False, indent=2) + "\n",
+            encoding="utf-8",
+        )
+
+    def _adopt_files(self, conn, tmp, ws, operation_id):
+        prepare = prepare_task_adoption(
+            workspace_path=tmp,
+            harness_root=ws.harness_root,
+            workspace_id="demo",
+            task_id="legacy-1",
+            plan_doc="plans/plan.md",
+            operation_id=operation_id,
+        )
+        return apply_task_adopt_files(
+            workspace_path=tmp,
+            harness_root=ws.harness_root,
+            workspace_id="demo",
+            task_id="legacy-1",
+            plan_doc="plans/plan.md",
+            operation_id=prepare.operation_id,
+            expected_item_fingerprint=prepare.item_fingerprint,
+            expected_plan_sha256=prepare.plan_sha256,
+        )
+
+    def _make_real_exharness_shape(self, harness_root: str) -> None:
+        checklist_path = Path(harness_root, "mvp-checklist.json")
+        checklist = json.loads(checklist_path.read_text())
+        item = checklist["items"][0]
+        item.pop("phase", None)
+        item["workflow"] = {"mode": "high-risk"}
+        item["artifacts"] = {}
+        checklist_path.write_text(
+            json.dumps(checklist, ensure_ascii=False, indent=2) + "\n",
+            encoding="utf-8",
+        )
+
+    def test_record_applied_adoption_produces_no_unsupported_or_errors(self):
+        conn = self._make_conn()
+        with tempfile.TemporaryDirectory() as tmp:
+            ws = self._make_workspace(conn, tmp)
+            self._make_plan(tmp)
+            self._seed_legacy_item(ws.harness_root)
+            operation_id = "12345678-1234-1234-1234-123456789abc"
+            files = self._adopt_files(conn, tmp, ws, operation_id)
+            apply_task_adopt_record(
+                conn,
+                workspace_id="demo",
+                task_id="legacy-1",
+                plan_doc="plans/plan.md",
+                operation_id=operation_id,
+                input_fingerprint=files.input_fingerprint,
+                before_fingerprint=files.before_fingerprint,
+                after_fingerprint=files.after_fingerprint,
+                actor="operator",
+                target="worker",
+            )
+            report = diagnose_projections(conn, ws)
+            self.assertIsNone(self._find(report, "operation_contract_unsupported"))
+            error_kinds = {f.kind for f in report.findings if f.severity == SEVERITY_ERROR}
+            self.assertEqual(error_kinds, set())
+
+    def test_real_exharness_adoption_without_phase_or_artifacts_plan_is_clean(self):
+        conn = self._make_conn()
+        with tempfile.TemporaryDirectory() as tmp:
+            ws = self._make_workspace(conn, tmp)
+            self._make_plan(tmp)
+            self._seed_legacy_item(ws.harness_root)
+            self._make_real_exharness_shape(ws.harness_root)
+            operation_id = "12345678-1234-1234-1234-123456789abc"
+            files = self._adopt_files(conn, tmp, ws, operation_id)
+            result = apply_task_adopt_record(
+                conn,
+                workspace_id="demo",
+                task_id="legacy-1",
+                plan_doc="plans/plan.md",
+                operation_id=operation_id,
+                input_fingerprint=files.input_fingerprint,
+                before_fingerprint=files.before_fingerprint,
+                after_fingerprint=files.after_fingerprint,
+                actor="operator",
+                target="worker",
+            )
+
+            report = diagnose_projections(conn, ws)
+
+            self.assertEqual(result.task["phase"], "todo")
+            error_kinds = {f.kind for f in report.findings if f.severity == SEVERITY_ERROR}
+            self.assertEqual(error_kinds, set())
+
+    def test_adoption_preserves_legacy_extension_field_without_false_error(self):
+        conn = self._make_conn()
+        with tempfile.TemporaryDirectory() as tmp:
+            ws = self._make_workspace(conn, tmp)
+            self._make_plan(tmp)
+            self._seed_legacy_item(ws.harness_root)
+            checklist_path = Path(ws.harness_root, "mvp-checklist.json")
+            checklist = json.loads(checklist_path.read_text())
+            checklist["items"][0]["notes"] = "legacy extension"
+            checklist_path.write_text(
+                json.dumps(checklist, ensure_ascii=False, indent=2) + "\n",
+                encoding="utf-8",
+            )
+            operation_id = "12345678-1234-1234-1234-123456789abc"
+            files = self._adopt_files(conn, tmp, ws, operation_id)
+            apply_task_adopt_record(
+                conn,
+                workspace_id="demo",
+                task_id="legacy-1",
+                plan_doc="plans/plan.md",
+                operation_id=operation_id,
+                input_fingerprint=files.input_fingerprint,
+                before_fingerprint=files.before_fingerprint,
+                after_fingerprint=files.after_fingerprint,
+                actor="operator",
+                target="worker",
+            )
+
+            report = diagnose_projections(conn, ws)
+
+            error_kinds = {f.kind for f in report.findings if f.severity == SEVERITY_ERROR}
+            self.assertEqual(error_kinds, set())
+
+    def test_adoption_with_artifacts_plan_as_only_locator_is_clean(self):
+        conn = self._make_conn()
+        with tempfile.TemporaryDirectory() as tmp:
+            ws = self._make_workspace(conn, tmp)
+            self._make_plan(tmp)
+            self._seed_legacy_item(ws.harness_root)
+            checklist_path = Path(ws.harness_root, "mvp-checklist.json")
+            checklist = json.loads(checklist_path.read_text())
+            item = checklist["items"][0]
+            item.pop("plan_path", None)
+            item.pop("artifact_path", None)
+            item["artifacts"] = {"plan": "plans/plan.md"}
+            checklist_path.write_text(
+                json.dumps(checklist, ensure_ascii=False, indent=2) + "\n",
+                encoding="utf-8",
+            )
+            operation_id = "12345678-1234-1234-1234-123456789abc"
+            files = self._adopt_files(conn, tmp, ws, operation_id)
+            apply_task_adopt_record(
+                conn,
+                workspace_id="demo",
+                task_id="legacy-1",
+                plan_doc="plans/plan.md",
+                operation_id=operation_id,
+                input_fingerprint=files.input_fingerprint,
+                before_fingerprint=files.before_fingerprint,
+                after_fingerprint=files.after_fingerprint,
+                actor="operator",
+                target="worker",
+            )
+
+            report = diagnose_projections(conn, ws)
+
+            error_kinds = {f.kind for f in report.findings if f.severity == SEVERITY_ERROR}
+            self.assertEqual(error_kinds, set())
+
+    def test_adoption_normalizes_legacy_artifact_path_alias(self):
+        conn = self._make_conn()
+        with tempfile.TemporaryDirectory() as tmp:
+            ws = self._make_workspace(conn, tmp)
+            self._make_plan(tmp)
+            self._seed_legacy_item(ws.harness_root)
+            checklist_path = Path(ws.harness_root, "mvp-checklist.json")
+            checklist = json.loads(checklist_path.read_text())
+            checklist["items"][0]["artifact_path"] = "./plans/plan.md"
+            checklist_path.write_text(
+                json.dumps(checklist, ensure_ascii=False, indent=2) + "\n",
+                encoding="utf-8",
+            )
+            operation_id = "12345678-1234-1234-1234-123456789abc"
+            files = self._adopt_files(conn, tmp, ws, operation_id)
+            apply_task_adopt_record(
+                conn,
+                workspace_id="demo",
+                task_id="legacy-1",
+                plan_doc="plans/plan.md",
+                operation_id=operation_id,
+                input_fingerprint=files.input_fingerprint,
+                before_fingerprint=files.before_fingerprint,
+                after_fingerprint=files.after_fingerprint,
+                actor="operator",
+                target="worker",
+            )
+
+            report = diagnose_projections(conn, ws)
+
+            error_kinds = {f.kind for f in report.findings if f.severity == SEVERITY_ERROR}
+            self.assertEqual(error_kinds, set())
+
+    def test_file_pending_adoption_is_recognized_warning_not_repairable(self):
+        conn = self._make_conn()
+        with tempfile.TemporaryDirectory() as tmp:
+            ws = self._make_workspace(conn, tmp)
+            self._make_plan(tmp)
+            self._seed_legacy_item(ws.harness_root)
+            self._adopt_files(conn, tmp, ws, "12345678-1234-1234-1234-123456789abc")
+            report = diagnose_projections(conn, ws)
+            self.assertIsNone(self._find(report, "operation_contract_unsupported"))
+            f = self._find(report, "operation_file_pending")
+            self.assertIsNotNone(f)
+            self.assertEqual(f.severity, SEVERITY_WARNING)
+            # No record-only intent in the envelope: repairability must not be
+            # guessed from the checklist item alone.
+            self.assertFalse(f.repairable)
+
+    def test_adoption_drift_detected_as_precise_finding(self):
+        conn = self._make_conn()
+        with tempfile.TemporaryDirectory() as tmp:
+            ws = self._make_workspace(conn, tmp)
+            self._make_plan(tmp)
+            self._seed_legacy_item(ws.harness_root)
+            operation_id = "12345678-1234-1234-1234-123456789abc"
+            files = self._adopt_files(conn, tmp, ws, operation_id)
+            apply_task_adopt_record(
+                conn,
+                workspace_id="demo",
+                task_id="legacy-1",
+                plan_doc="plans/plan.md",
+                operation_id=operation_id,
+                input_fingerprint=files.input_fingerprint,
+                before_fingerprint=files.before_fingerprint,
+                after_fingerprint=files.after_fingerprint,
+                actor="operator",
+                target="worker",
+            )
+            # Tamper the deployed title after the fact: the doctor must
+            # recompute the adopt fingerprints and flag the drift precisely.
+            checklist_path = Path(ws.harness_root, "mvp-checklist.json")
+            checklist = json.loads(checklist_path.read_text())
+            checklist["items"][0]["title"] = "Drifted"
+            checklist_path.write_text(
+                json.dumps(checklist, ensure_ascii=False, indent=2) + "\n", encoding="utf-8"
+            )
+            report = diagnose_projections(conn, ws)
+            f = self._find(report, "operation_envelope_drift")
+            self.assertIsNotNone(f)
+            self.assertEqual(f.severity, SEVERITY_ERROR)
+            evidence_text = json.dumps(
+                [e for e in f.evidence], default=lambda o: getattr(o, "__dict__", str(o))
+            )
+            self.assertIn("fingerprint", evidence_text.lower())
 
 
 if __name__ == "__main__":

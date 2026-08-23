@@ -30,6 +30,7 @@ MultiNexus、Harness 或 Executor 定义。
 - `scope.md` — 仓库范围与非目标。
 - `architecture.md` — 当前实现组件、流程和权威边界。
 - `domain-model.md` — Coordinate 拥有的运行时实体和投影。
+- `usage-evidence.md` — 托管 usage evidence（schema v16）、幂等累计与 task-scoped warning。
 - `runbook.md` — 日常运维与恢复。
 
 ## 历史材料

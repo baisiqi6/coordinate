@@ -5,6 +5,7 @@ import contextlib
 import io
 import json
 import os
+import sqlite3
 import subprocess
 import sys
 import tempfile
@@ -413,6 +414,284 @@ class WorkspaceCliBehaviorTests(unittest.TestCase):
             )
             self.assertEqual(code, 1)
             self.assertIn("--replace is required", stderr)
+
+
+
+
+class WorktreeRootsCliTests(unittest.TestCase):
+    """Issue #18: workspace host-profile set sibling worktree-root flags."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.db_path = str(Path(self.tmp.name) / "coordinator.sqlite3")
+        code, _, _ = self._run_cli(
+            "--db", self.db_path,
+            "workspace", "add", "demo",
+            "--path", self.tmp.name,
+            "--harness-root", self.tmp.name,
+        )
+        self.assertEqual(code, 0)
+
+    def _run_cli(self, *args):
+        stdout = io.StringIO()
+        stderr = io.StringIO()
+        with contextlib.redirect_stdout(stdout), contextlib.redirect_stderr(stderr):
+            try:
+                code = main(list(args))
+            except SystemExit as exc:
+                code = exc.code if isinstance(exc.code, int) else 1
+        raw_out = stdout.getvalue()
+        payload = json.loads(raw_out) if raw_out.strip() else {}
+        return code, payload, stderr.getvalue()
+
+    def _set_profile(self, *extra):
+        return self._run_cli(
+            "--db", self.db_path,
+            "workspace", "host-profile", "set", "demo",
+            "--host-id", "mac",
+            "--workspace-path", "/host/ws",
+            "--harness-root", "/host/harness",
+            *extra,
+        )
+
+    def test_repeat_worktree_root_flags_replace_allowlist(self):
+        code, payload, _ = self._set_profile(
+            "--worktree-root", "/host/worktrees/a",
+            "--worktree-root", "/host/worktrees/b",
+        )
+        self.assertEqual(code, 0)
+        self.assertEqual(
+            payload["result"]["worktree_roots"],
+            ["/host/worktrees/a", "/host/worktrees/b"],
+        )
+
+    def test_omitted_flags_preserve_roots(self):
+        self._set_profile("--worktree-root", "/host/worktrees/a")
+        code, payload, _ = self._set_profile()
+        self.assertEqual(code, 0)
+        self.assertEqual(payload["result"]["worktree_roots"], ["/host/worktrees/a"])
+
+    def test_clear_worktree_roots_flag_clears(self):
+        self._set_profile("--worktree-root", "/host/worktrees/a")
+        code, payload, _ = self._set_profile("--clear-worktree-roots")
+        self.assertEqual(code, 0)
+        self.assertEqual(payload["result"]["worktree_roots"], [])
+
+    def test_clear_and_root_are_mutually_exclusive(self):
+        code, _, stderr = self._set_profile(
+            "--worktree-root", "/host/worktrees/a",
+            "--clear-worktree-roots",
+        )
+        self.assertEqual(code, 2)
+        self.assertIn("not allowed with argument", stderr)
+
+    def test_invalid_root_returns_error(self):
+        code, _, stderr = self._set_profile("--worktree-root", "relative/root")
+        self.assertEqual(code, 1)
+        self.assertIn("error:", stderr)
+        self.assertIn("invalid worktree root", stderr)
+
+    def test_list_roundtrips_roots(self):
+        self._set_profile(
+            "--worktree-root", "/host/worktrees/a",
+            "--worktree-root", "/host/worktrees/b",
+        )
+        code, payload, _ = self._run_cli(
+            "--db", self.db_path,
+            "workspace", "host-profile", "list", "demo",
+        )
+        self.assertEqual(code, 0)
+        self.assertEqual(
+            payload["profiles"][0]["worktree_roots"],
+            ["/host/worktrees/a", "/host/worktrees/b"],
+        )
+
+    def test_fresh_profile_without_flags_has_empty_roots(self):
+        code, payload, _ = self._set_profile()
+        self.assertEqual(code, 0)
+        self.assertEqual(payload["result"]["worktree_roots"], [])
+
+class ReadOnlyRegistryCliTests(unittest.TestCase):
+    """T6/T7: workspace list / host-profile list run strictly read-only:
+    missing/legacy/unknown DBs fail closed with zero mutation; current-schema
+    queries keep the exact output contract and never touch the DB file."""
+
+    def _run_cli(self, *args: str) -> tuple[int, dict, str]:
+        stdout = io.StringIO()
+        stderr = io.StringIO()
+        with contextlib.redirect_stdout(stdout), contextlib.redirect_stderr(stderr):
+            try:
+                code = main(list(args))
+            except SystemExit as exc:
+                code = exc.code if isinstance(exc.code, int) else 1
+        raw_out = stdout.getvalue()
+        payload = json.loads(raw_out) if raw_out.strip() else {}
+        return code, payload, stderr.getvalue()
+
+    def _snapshot(self, db_path: str) -> tuple[bytes | None, int | None]:
+        p = Path(db_path)
+        if not p.exists():
+            return None, None
+        return p.read_bytes(), p.stat().st_mtime_ns
+
+    def _assert_sidecars_absent(self, db_path: str) -> None:
+        for suffix in ("-journal", "-wal", "-shm"):
+            self.assertFalse(Path(f"{db_path}{suffix}").exists(), f"unexpected sidecar {suffix}")
+
+    def _downgrade_to_v15(self, db_path: str) -> None:
+        conn = sqlite3.connect(db_path)
+        conn.execute("DROP TABLE task_usage_warning_policies")
+        conn.execute("DROP TABLE job_attempt_usage")
+        conn.execute("PRAGMA user_version = 15")
+        conn.commit()
+        conn.close()
+
+    def _assert_fail_closed(
+        self,
+        db_path: str,
+        stderr: str,
+        before: tuple[bytes | None, int | None],
+    ) -> None:
+        """Assert the CLI action failed closed: clean error, and the baseline
+        captured BEFORE the action is byte-identical afterwards (bytes are the
+        primary zero-write evidence; mtime is a same-platform auxiliary)."""
+        self.assertIn("error:", stderr)
+        self.assertNotIn("Traceback", stderr)
+        self.assertIsNotNone(before[0])
+        after_bytes, after_mtime = self._snapshot(db_path)
+        self.assertEqual(after_bytes, before[0], "DB bytes changed")
+        self.assertEqual(after_mtime, before[1], "DB mtime changed")
+        self._assert_sidecars_absent(db_path)
+
+    def test_workspace_list_missing_db_fails_closed(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            db_path = str(Path(tmp) / "coordinator.sqlite3")
+            code, payload, stderr = self._run_cli("--db", db_path, "workspace", "list")
+            self.assertEqual(code, 1)
+            self.assertEqual(payload, {})
+            self.assertIn("error:", stderr)
+            self.assertFalse(Path(db_path).exists())
+            self._assert_sidecars_absent(db_path)
+
+    def test_workspace_list_legacy_schema_fails_closed(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            db_path = str(Path(tmp) / "coordinator.sqlite3")
+            from coordinate.db import initialize
+            conn = initialize(db_path)
+            conn.close()
+            self._downgrade_to_v15(db_path)
+            before = self._snapshot(db_path)
+            code, payload, stderr = self._run_cli("--db", db_path, "workspace", "list")
+            self.assertEqual(code, 1)
+            self.assertEqual(payload, {})
+            self.assertIn("schema version 15", stderr)
+            self._assert_fail_closed(db_path, stderr, before)
+
+    def test_workspace_list_unknown_schema_fails_closed(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            db_path = str(Path(tmp) / "coordinator.sqlite3")
+            from coordinate.db import initialize
+            conn = initialize(db_path)
+            conn.execute("PRAGMA user_version = 17")
+            conn.commit()
+            conn.close()
+            before = self._snapshot(db_path)
+            code, payload, stderr = self._run_cli("--db", db_path, "workspace", "list")
+            self.assertEqual(code, 1)
+            self.assertEqual(payload, {})
+            self.assertIn("schema version 17", stderr)
+            self._assert_fail_closed(db_path, stderr, before)
+
+    def test_workspace_list_current_schema_zero_mutation(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            db_path = str(Path(tmp) / "coordinator.sqlite3")
+            code, payload, _ = self._run_cli(
+                "--db", db_path, "workspace", "add", "demo",
+                "--path", tmp, "--harness-root", tmp,
+            )
+            self.assertEqual(code, 0)
+            before = self._snapshot(db_path)
+            code, payload, stderr = self._run_cli("--db", db_path, "workspace", "list")
+            self.assertEqual(code, 0)
+            self.assertEqual(payload["workspaces"][0]["id"], "demo")
+            self.assertEqual(stderr, "")
+            after_bytes, after_mtime = self._snapshot(db_path)
+            self.assertEqual(after_bytes, before[0], "DB bytes changed")
+            self.assertEqual(after_mtime, before[1], "DB mtime changed")
+            self._assert_sidecars_absent(db_path)
+
+    def test_host_profile_list_missing_db_fails_closed(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            db_path = str(Path(tmp) / "coordinator.sqlite3")
+            code, payload, stderr = self._run_cli(
+                "--db", db_path, "workspace", "host-profile", "list", "demo"
+            )
+            self.assertEqual(code, 1)
+            self.assertEqual(payload, {})
+            self.assertIn("error:", stderr)
+            self.assertFalse(Path(db_path).exists())
+            self._assert_sidecars_absent(db_path)
+
+    def test_host_profile_list_legacy_schema_fails_closed(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            db_path = str(Path(tmp) / "coordinator.sqlite3")
+            from coordinate.db import initialize
+            conn = initialize(db_path)
+            conn.close()
+            self._downgrade_to_v15(db_path)
+            before = self._snapshot(db_path)
+            code, payload, stderr = self._run_cli(
+                "--db", db_path, "workspace", "host-profile", "list", "demo"
+            )
+            self.assertEqual(code, 1)
+            self.assertEqual(payload, {})
+            self.assertIn("schema version 15", stderr)
+            self._assert_fail_closed(db_path, stderr, before)
+
+    def test_host_profile_list_unknown_schema_fails_closed(self) -> None:
+        """F3: host-profile list on an unknown/future schema fails closed with
+        zero mutation (bytes before == bytes after, no new sidecars)."""
+        with tempfile.TemporaryDirectory() as tmp:
+            db_path = str(Path(tmp) / "coordinator.sqlite3")
+            from coordinate.db import initialize
+            conn = initialize(db_path)
+            conn.execute("PRAGMA user_version = 17")
+            conn.commit()
+            conn.close()
+            before = self._snapshot(db_path)
+            code, payload, stderr = self._run_cli(
+                "--db", db_path, "workspace", "host-profile", "list", "demo"
+            )
+            self.assertEqual(code, 1)
+            self.assertEqual(payload, {})
+            self.assertIn("schema version 17", stderr)
+            self._assert_fail_closed(db_path, stderr, before)
+
+    def test_host_profile_list_current_schema_zero_mutation(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            db_path = str(Path(tmp) / "coordinator.sqlite3")
+            code, _, _ = self._run_cli(
+                "--db", db_path, "workspace", "add", "demo",
+                "--path", tmp, "--harness-root", tmp,
+            )
+            self.assertEqual(code, 0)
+            code, _, _ = self._run_cli(
+                "--db", db_path, "workspace", "host-profile", "set", "demo",
+                "--host-id", "mac", "--workspace-path", tmp,
+            )
+            self.assertEqual(code, 0)
+            before = self._snapshot(db_path)
+            code, payload, stderr = self._run_cli(
+                "--db", db_path, "workspace", "host-profile", "list", "demo"
+            )
+            self.assertEqual(code, 0)
+            self.assertEqual(payload["profiles"][0]["host_id"], "mac")
+            self.assertEqual(stderr, "")
+            after_bytes, after_mtime = self._snapshot(db_path)
+            self.assertEqual(after_bytes, before[0], "DB bytes changed")
+            self.assertEqual(after_mtime, before[1], "DB mtime changed")
+            self._assert_sidecars_absent(db_path)
 
 
 if __name__ == "__main__":

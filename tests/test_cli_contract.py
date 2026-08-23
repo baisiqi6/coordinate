@@ -48,6 +48,12 @@ P9_3B_LEASE_LEAVES = {
     "runtime job lease reap": "handle_runtime_job_lease_reap",
 }
 
+# Issue #12 added these usage leaves under runtime usage.
+P9_ISSUE12_USAGE_LEAVES = {
+    "runtime usage policy-set": "handle_runtime_usage_policy_set",
+    "runtime usage status": "handle_runtime_usage_status",
+}
+
 _P9_3C1_P1_BASE_FIXTURE_SHA256 = (
     "869084cdc985a0efb9921266af98f5813d0d6efca03b90aeebf5c7916f2b5746"
 )
@@ -456,6 +462,75 @@ def _restore_pre_r2a_root_help(help_text: str) -> str:
         result.append(line)
     return "\n".join(result) + "\n"
 
+def _restore_pre_trace_root_help(help_text: str) -> str:
+    """Rebuild the pre-trace root help without the ``trace`` subcommand.
+
+    Issue #11 adds ``trace`` between ``runtime-http`` and ``serve`` in the
+    root choices plus one description line; removing both restores the exact
+    pre-trace bytes. Description-column alignment is unchanged because
+    ``runtime-http`` remains the longest subcommand name.
+    """
+    result: list[str] = []
+    for line in help_text.splitlines():
+        if ",trace," in line:
+            result.append(line.replace(",trace,", ","))
+            continue
+        if line.startswith("    trace ") and "trace projection (Issue #11)" in line:
+            continue
+        result.append(line)
+    return "\n".join(result) + "\n"
+
+
+def _remove_trace_delta(contract: dict[str, object]) -> dict[str, object]:
+    """Return a copy of *contract* with the Issue #11 ``trace`` delta removed.
+
+    Issue #11 adds exactly one top-level command (``trace``), two leaves
+    (``trace task`` / ``trace job``) and three nodes. Historical rewind
+    proofs strip this post-baseline delta first so their pinned baseline
+    SHA-256 proofs keep verifying the pre-trace bytes. No-op when absent.
+    """
+    historical = _remove_issue12_usage_leaves(contract)
+    has_trace = any(node["path"][:1] == ["trace"] for node in historical["nodes"])
+    if not has_trace:
+        return historical
+
+    historical["nodes"] = [
+        node for node in historical["nodes"] if node["path"][:1] != ["trace"]
+    ]
+    historical["leaf_paths"] = [
+        path for path in historical["leaf_paths"] if not path.startswith("trace ")
+    ]
+    historical["metadata"]["leaf_count"] = int(
+        historical["metadata"]["leaf_count"]
+    ) - 2
+    historical["metadata"]["node_count"] = int(
+        historical["metadata"]["node_count"]
+    ) - 3
+    historical["metadata"]["top_level_commands"] = [
+        name
+        for name in historical["metadata"]["top_level_commands"]
+        if name != "trace"
+    ]
+
+    found = set()
+    for node in historical["nodes"]:
+        if not node["path"]:
+            subparsers = [
+                action
+                for action in node["actions"]
+                if action["action_class"] == "_SubParsersAction"
+            ]
+            if len(subparsers) != 1 or "trace" not in subparsers[0]["choices"]:
+                raise AssertionError("unexpected root subparser delta for trace")
+            subparsers[0]["choices"] = [
+                choice for choice in subparsers[0]["choices"] if choice != "trace"
+            ]
+            node["help"] = _restore_pre_trace_root_help(node["help"])
+            found.add("root")
+    if found != {"root"}:
+        raise AssertionError(f"incomplete trace CLI delta: {sorted(found)}")
+    return historical
+
 
 def _remove_runtime_http_delta(contract: dict[str, object]) -> dict[str, object]:
     """Return a copy of *contract* with the R2A ``runtime-http`` delta removed.
@@ -466,9 +541,9 @@ def _remove_runtime_http_delta(contract: dict[str, object]) -> dict[str, object]
     """
     return _strip_runtime_http_nodes(copy.deepcopy(contract))
 
-
 def _strip_runtime_http_nodes(historical: dict[str, object]) -> dict[str, object]:
     """Strip the two ``runtime-http`` nodes from a copy of *historical*."""
+    historical = _remove_trace_delta(historical)
     has_rt = any(node["path"] == ["runtime-http"] for node in historical["nodes"])
     if not has_rt:
         return historical
@@ -580,6 +655,78 @@ _PRE_R5B_ASSIGNMENT_HELP = "usage: coordinate assignment [-h]\n                 
 _PRE_R5B_MARK_DONE_FILES_HELP = "usage: coordinate assignment mark-done-files [-h] --workspace-path WORKSPACE_PATH --harness-root\n                                             HARNESS_ROOT --task-id TASK_ID\n                                             [--workspace-id WORKSPACE_ID] [--actor ACTOR]\n                                             [--verification VERIFICATION] [--receipt RECEIPT]\n                                             [--event-cli-path EVENT_CLI_PATH]\n                                             [--repair-reason REPAIR_REASON]\n                                             [--allow-runtime-copy]\n\noptions:\n  -h, --help            show this help message and exit\n  --workspace-path WORKSPACE_PATH\n  --harness-root HARNESS_ROOT\n  --task-id TASK_ID\n  --workspace-id WORKSPACE_ID\n  --actor ACTOR\n  --verification VERIFICATION\n  --receipt RECEIPT\n  --event-cli-path EVENT_CLI_PATH\n                        Path to a coord CLI that runs mark-done-preflight / mark-done-claim\n                        against the control-plane DB (e.g. <HOME>/.local/bin/coord-ssh). Required\n                        for the normal receipt path so the host verifies the receipt online before\n                        mutating files.\n  --repair-reason REPAIR_REASON\n  --allow-runtime-copy  Allow mutation of /opt deployment copy\n"
 _PRE_R5B_EVENT_CLI_PATH_HELP = "Path to a coord CLI that runs mark-done-preflight / mark-done-claim against the control-plane DB (e.g. <HOME>/.local/bin/coord-ssh). Required for the normal receipt path so the host verifies the receipt online before mutating files."
 
+# Pre-Issue-#18 ``workspace host-profile set`` help, extracted from the
+# committed fixture before the sibling worktree-root flags landed. Restoring it
+# keeps historical rewind SHA proofs free of the later CLI addition.
+_PRE_ISSUE18_HOST_PROFILE_SET_HELP = (
+    "usage: coordinate workspace host-profile set [-h] --host-id HOST_ID --workspace-path\n"
+    "                                             WORKSPACE_PATH [--harness-root HARNESS_ROOT]\n"
+    "                                             [--harnessctl-path HARNESSCTL_PATH]\n"
+    "                                             [--coordinator-cli-path COORDINATOR_CLI_PATH]\n"
+    "                                             [--coordinator-db-path COORDINATOR_DB_PATH]\n"
+    "                                             [--shell SHELL] [--metadata-json METADATA_JSON]\n"
+    "                                             workspace_id\n"
+    "\n"
+    "positional arguments:\n"
+    "  workspace_id\n"
+    "\n"
+    "options:\n"
+    "  -h, --help            show this help message and exit\n"
+    "  --host-id HOST_ID\n"
+    "  --workspace-path WORKSPACE_PATH\n"
+    "  --harness-root HARNESS_ROOT\n"
+    "  --harnessctl-path HARNESSCTL_PATH\n"
+    "  --coordinator-cli-path COORDINATOR_CLI_PATH\n"
+    "  --coordinator-db-path COORDINATOR_DB_PATH\n"
+    "  --shell SHELL\n"
+    "  --metadata-json METADATA_JSON\n"
+)
+
+
+def _remove_issue18_worktree_roots_delta(
+    contract: dict[str, object],
+) -> dict[str, object]:
+    """Return a copy of *contract* with the Issue #18 sibling worktree-root
+    parser delta removed from ``workspace host-profile set``.
+
+    Issue #18 added the mutually exclusive ``--worktree-root`` (append) and
+    ``--clear-worktree-roots`` actions and reworded the leaf help. Every
+    historical rewind must strip this delta first so older baseline SHA proofs
+    stay meaningful. No-op when the delta is already absent; fails closed on
+    structural surprises.
+    """
+    historical = copy.deepcopy(contract)
+    node = next(
+        (
+            candidate
+            for candidate in historical["nodes"]
+            if candidate["path"] == ["workspace", "host-profile", "set"]
+        ),
+        None,
+    )
+    if node is None:
+        return historical
+    delta_dests = {"worktree_roots", "clear_worktree_roots"}
+    if not any(action.get("dest") in delta_dests for action in node["actions"]):
+        return historical
+    removed = [
+        action
+        for action in node["actions"]
+        if action.get("dest") in delta_dests
+    ]
+    if sorted(action["dest"] for action in removed) != [
+        "clear_worktree_roots",
+        "worktree_roots",
+    ]:
+        raise AssertionError("unexpected Issue #18 worktree-roots parser delta")
+    node["actions"] = [
+        action
+        for action in node["actions"]
+        if action.get("dest") not in delta_dests
+    ]
+    node["help"] = _PRE_ISSUE18_HOST_PROFILE_SET_HELP
+    return historical
+
 
 def _remove_r3_mcp_serve_delta(contract: dict[str, object]) -> dict[str, object]:
     """Return a copy of *contract* with the R3 streamable-HTTP serve delta
@@ -592,7 +739,7 @@ def _remove_r3_mcp_serve_delta(contract: dict[str, object]) -> dict[str, object]
     before older baseline SHA proofs stay meaningful. No-op when the delta
     is already absent; fails closed on structural surprises.
     """
-    historical = copy.deepcopy(contract)
+    historical = _remove_issue18_worktree_roots_delta(contract)
     serve_node = next(
         (node for node in historical["nodes"] if node["path"] == ["mcp", "serve"]),
         None,
@@ -689,6 +836,178 @@ def _remove_r5b_mark_done_mcp_delta(contract: dict[str, object]) -> dict[str, ob
     return historical
 
 
+# Pre-Issue-#12 help for the ``runtime`` node, captured from the committed
+# fixture before the usage leaves were added. Every historical rewind restores
+# this exact string after stripping the ``runtime usage`` subtree.
+_OLD_RUNTIME_USAGE_HELP = (
+    "usage: coordinate runtime [-h] {agent,request,job,executor,capacity} ...\n"
+    "\n"
+    "positional arguments:\n"
+    "  {agent,request,job,executor,capacity}\n"
+    "    agent               Register or heartbeat a runtime client\n"
+    "    request             Submit a bridge request and create a pending agent job\n"
+    "    job                 Claim or report runtime jobs\n"
+    "    executor            Sync and inspect the executor identity catalog\n"
+    "    capacity            Sync and inspect the capacity catalog\n"
+    "\n"
+    "options:\n"
+    "  -h, --help            show this help message and exit\n"
+)
+
+
+# Pre-adoption ``task`` node help (extracted from the committed fixture before
+# the ``task adopt`` / ``adopt-files`` / ``adopt-record`` leaves landed).
+_PRE_ADOPT_TASK_HELP = (
+    "usage: coordinate task [-h]\n"
+    "                       {create,create-files,create-record,update-dependencies,update-dependencies-files,handoff}\n"
+    "                       ...\n"
+    "\n"
+    "positional arguments:\n"
+    "  {create,create-files,create-record,update-dependencies,update-dependencies-files,handoff}\n"
+    "    create              Combined managed create: checklist file half first, DB record half second\n"
+    "                        (idempotent; --operation-id to pin)\n"
+    "    create-files        Coding-host half of host-aware task create: checklist file half only (no\n"
+    "                        DB write)\n"
+    "    create-record       Server half of host-aware task create: write DB task mirror + plan.ready\n"
+    "                        only (no checklist write)\n"
+    "    update-dependencies\n"
+    "                        Combined managed dependency update: checklist file mutation first, state\n"
+    "                        refresh + targeted reconcile second (idempotent)\n"
+    "    update-dependencies-files\n"
+    "                        Coding-host half of dependency update: canonical checklist file only (no\n"
+    "                        DB write, no harnessctl preflight)\n"
+    "    handoff             Generate a structured worker handoff\n"
+    "\n"
+    "options:\n"
+    "  -h, --help            show this help message and exit\n"
+)
+
+TASK_ADOPT_LEAVES = {
+    "task adopt": "handle_task_adopt",
+    "task adopt-files": "handle_task_adopt_files",
+    "task adopt-record": "handle_task_adopt_record",
+}
+
+
+def _remove_task_adopt_delta(contract: dict[str, object]) -> dict[str, object]:
+    """Return a copy of *contract* with the legacy-adoption ``task`` delta removed.
+
+    The adoption entry adds exactly three leaves (``task adopt``,
+    ``task adopt-files``, ``task adopt-record``) and the matching choices on
+    the ``task`` subparser. Every historical baseline rewind must strip this
+    delta first so older baseline SHA proofs stay meaningful. No-op when the
+    delta is already absent; fails closed on structural surprises.
+    """
+    historical = copy.deepcopy(contract)
+    leaf_paths_to_remove = set(TASK_ADOPT_LEAVES)
+    has_adopt = any(
+        path in historical["leaf_paths"] for path in leaf_paths_to_remove
+    )
+    if not has_adopt:
+        return historical
+
+    historical["nodes"] = [
+        node
+        for node in historical["nodes"]
+        if " ".join(node["path"]) not in leaf_paths_to_remove
+    ]
+    historical["leaf_paths"] = [
+        path for path in historical["leaf_paths"] if path not in leaf_paths_to_remove
+    ]
+    historical["metadata"]["leaf_count"] = (
+        int(historical["metadata"]["leaf_count"]) - len(leaf_paths_to_remove)
+    )
+    historical["metadata"]["node_count"] = (
+        int(historical["metadata"]["node_count"]) - len(leaf_paths_to_remove)
+    )
+
+    found = set()
+    for node in historical["nodes"]:
+        if node["path"] != ["task"]:
+            continue
+        subparsers = [
+            action
+            for action in node["actions"]
+            if action["action_class"] == "_SubParsersAction"
+        ]
+        if len(subparsers) != 1 or not set(
+            path.split(" ", 1)[1] for path in leaf_paths_to_remove
+        ).issubset(subparsers[0]["choices"]):
+            raise AssertionError("unexpected task adopt CLI delta")
+        subparsers[0]["choices"] = [
+            choice
+            for choice in subparsers[0]["choices"]
+            if f"task {choice}" not in leaf_paths_to_remove
+        ]
+        node["help"] = _PRE_ADOPT_TASK_HELP
+        found.add("task")
+    if found != {"task"}:
+        raise AssertionError(f"incomplete task adopt CLI delta: {sorted(found)}")
+    return historical
+
+
+def _remove_issue12_usage_leaves(
+    contract: dict[str, object],
+) -> dict[str, object]:
+    """Return a copy of *contract* with the Issue #12 ``runtime usage`` subtree
+    removed, restoring the pre-Issue-#12 ``runtime`` node.
+
+    Issue #12 adds exactly one node (``runtime usage``), two leaves
+    (``policy-set``, ``status``) and the ``usage`` choice on the runtime
+    subparser. Every historical baseline rewind must strip this delta first so
+    older baseline SHA proofs stay meaningful. No-op when the delta is already
+    absent; fails closed on structural surprises. The later ``task adopt``
+    delta is stripped first for the same reason.
+    """
+    historical = _remove_task_adopt_delta(copy.deepcopy(contract))
+    leaf_paths_to_remove = set(P9_ISSUE12_USAGE_LEAVES)
+    node_paths_to_remove = {tuple(p.split()) for p in leaf_paths_to_remove} | {
+        ("runtime", "usage")
+    }
+    has_usage = any(
+        tuple(node["path"]) == ("runtime", "usage") for node in historical["nodes"]
+    )
+    if not has_usage:
+        return historical
+
+    historical["nodes"] = [
+        node
+        for node in historical["nodes"]
+        if tuple(node["path"]) not in node_paths_to_remove
+    ]
+    historical["leaf_paths"] = [
+        path
+        for path in historical["leaf_paths"]
+        if path not in leaf_paths_to_remove
+    ]
+    historical["metadata"]["leaf_count"] = (
+        int(historical["metadata"]["leaf_count"]) - len(leaf_paths_to_remove)
+    )
+    historical["metadata"]["node_count"] = (
+        int(historical["metadata"]["node_count"]) - len(node_paths_to_remove)
+    )
+
+    found = set()
+    for node in historical["nodes"]:
+        if node["path"] != ["runtime"]:
+            continue
+        subparsers = [
+            action
+            for action in node["actions"]
+            if action["action_class"] == "_SubParsersAction"
+        ]
+        if len(subparsers) != 1 or "usage" not in subparsers[0]["choices"]:
+            raise AssertionError("unexpected runtime usage CLI delta")
+        subparsers[0]["choices"] = [
+            choice for choice in subparsers[0]["choices"] if choice != "usage"
+        ]
+        node["help"] = _OLD_RUNTIME_USAGE_HELP
+        found.add("runtime")
+    if found != {"runtime"}:
+        raise AssertionError(f"incomplete issue-12 usage CLI delta: {sorted(found)}")
+    return historical
+
+
 def _remove_mcp_delta(contract: dict[str, object]) -> dict[str, object]:
     """Return a copy of *contract* with the R1 ``mcp`` command delta removed.
 
@@ -698,7 +1017,8 @@ def _remove_mcp_delta(contract: dict[str, object]) -> dict[str, object]:
     when the delta is already absent. The post-R1 R5B and R3 CLI deltas are
     stripped first so pre-R1 rewinds stay free of them too.
     """
-    historical = _remove_r5b_mark_done_mcp_delta(contract)
+    historical = _remove_issue12_usage_leaves(contract)
+    historical = _remove_r5b_mark_done_mcp_delta(historical)
     historical = _remove_update_dependencies_delta(historical)
     historical = _strip_runtime_http_nodes(historical)
     has_mcp = any(node["path"] == ["mcp"] for node in historical["nodes"])
@@ -934,6 +1254,12 @@ _P9_2B_BASELINE_FIXTURE_SHA256 = (
 # proof to argparse line wrapping.
 _P9_3C0_WORKTREE_PATH_BASELINE_FIXTURE_SHA256 = (
     "1f6a8784fcea3baf9749c856ad40eff2ad183bc6b092db30646c05d1542577fc"
+)
+
+# SHA-256 of the committed pre-Issue-#18 ``workspace host-profile set`` node
+# (the reviewed baseline before the sibling worktree-root flags landed).
+_ISSUE18_PRE_WORKTREE_ROOTS_SET_NODE_SHA256 = (
+    "e73603750a508975d368e9b275e96dc0925775bc8f9a28f9a2e900eb4cc3b3e6"
 )
 
 # P9-2A added exactly these 3 executor leaves under ``runtime executor``.
@@ -1382,11 +1708,109 @@ class CLIContractTests(unittest.TestCase):
     def test_contract_counts_match_plan(self) -> None:
         contract = _build_contract()
         metadata = contract["metadata"]
-        self.assertEqual(len(metadata["top_level_commands"]), 23)
-        self.assertEqual(metadata["leaf_count"], 94)
-        self.assertEqual(metadata["node_count"], 124)
-        self.assertEqual(len(contract["leaf_paths"]), 94)
-        self.assertEqual(len(contract["nodes"]), 124)
+        self.assertEqual(len(metadata["top_level_commands"]), 24)
+        self.assertEqual(metadata["leaf_count"], 101)
+        self.assertEqual(metadata["node_count"], 133)
+        self.assertEqual(len(contract["leaf_paths"]), 101)
+        self.assertEqual(len(contract["nodes"]), 133)
+
+    def test_task_adopt_delta_rewind_is_idempotent(self) -> None:
+        """Stripping the adoption delta twice is a no-op the second time."""
+        contract = _build_contract()
+        once = _remove_task_adopt_delta(contract)
+        twice = _remove_task_adopt_delta(once)
+        self.assertEqual(twice["metadata"], once["metadata"])
+        self.assertEqual(twice["leaf_paths"], once["leaf_paths"])
+        self.assertEqual(
+            [n["path"] for n in twice["nodes"]], [n["path"] for n in once["nodes"]]
+        )
+
+    def test_task_adopt_delta_rewind_fails_closed_on_malformed_structure(self) -> None:
+        """A task leaf without the matching subparser choice fails closed."""
+        contract = _build_contract()
+        task_node = next(n for n in contract["nodes"] if n["path"] == ["task"])
+        subparsers = [
+            a for a in task_node["actions"] if a.get("action_class") == "_SubParsersAction"
+        ]
+        # Simulate structural corruption: the leaf exists but the subparser
+        # choices were tampered with.
+        subparsers[0]["choices"] = ["create"]
+        with self.assertRaises(AssertionError):
+            _remove_task_adopt_delta(contract)
+
+    def test_task_adopt_delta_exactly(self) -> None:
+        contract = _build_contract()
+        for path, handler in TASK_ADOPT_LEAVES.items():
+            self.assertEqual(contract["leaf_paths"].count(path), 1)
+            node = next(
+                node for node in contract["nodes"] if " ".join(node["path"]) == path
+            )
+            self.assertEqual(
+                node["defaults"]["handler"], f"coordinate.planning_cli.{handler}"
+            )
+        # Rewinding the delta restores the pre-adoption task tree exactly.
+        historical = _remove_task_adopt_delta(contract)
+        self.assertEqual(
+            historical["metadata"]["leaf_count"],
+            int(contract["metadata"]["leaf_count"]) - 3,
+        )
+        for path in TASK_ADOPT_LEAVES:
+            self.assertNotIn(path, historical["leaf_paths"])
+        task_node = next(
+            node for node in historical["nodes"] if node["path"] == ["task"]
+        )
+        self.assertEqual(task_node["help"], _PRE_ADOPT_TASK_HELP)
+        subparsers = [
+            action
+            for action in task_node["actions"]
+            if action["action_class"] == "_SubParsersAction"
+        ]
+        self.assertEqual(
+            subparsers[0]["choices"],
+            [
+                "create",
+                "create-files",
+                "create-record",
+                "update-dependencies",
+                "update-dependencies-files",
+                "handoff",
+            ],
+        )
+
+    def test_contract_issue12_usage_delta_matches_baseline(self) -> None:
+        """Issue #12 adds exactly ``runtime usage policy-set`` and
+        ``runtime usage status`` under a new ``runtime usage`` node."""
+        contract = _build_contract()
+        for path, handler in P9_ISSUE12_USAGE_LEAVES.items():
+            self.assertEqual(contract["leaf_paths"].count(path), 1)
+            node = next(
+                node for node in contract["nodes"] if " ".join(node["path"]) == path
+            )
+            self.assertEqual(
+                node["defaults"]["handler"], f"coordinate.usage_cli.{handler}"
+            )
+        usage_nodes = [
+            node for node in contract["nodes"] if node["path"][:2] == ["runtime", "usage"]
+        ]
+        self.assertEqual(
+            [node["path"] for node in usage_nodes],
+            [
+                ["runtime", "usage"],
+                ["runtime", "usage", "policy-set"],
+                ["runtime", "usage", "status"],
+            ],
+        )
+        # Rewinding the delta restores the pre-Issue-#12 tree exactly.
+        historical = _remove_issue12_usage_leaves(contract)
+        self.assertEqual(historical["metadata"]["leaf_count"], 96)
+        self.assertEqual(historical["metadata"]["node_count"], 127)
+        self.assertNotIn("runtime usage", historical["leaf_paths"])
+        self.assertNotIn("runtime usage policy-set", historical["leaf_paths"])
+        self.assertNotIn("runtime usage status", historical["leaf_paths"])
+        runtime = next(
+            node for node in historical["nodes"] if node["path"] == ["runtime"]
+        )
+        self.assertEqual(runtime["help"], _OLD_RUNTIME_USAGE_HELP)
 
     def test_r2a_runtime_http_serve_delta_exactly(self) -> None:
         """R2A adds exactly ``runtime-http serve`` and nothing else."""
@@ -1650,6 +2074,54 @@ class CLIContractTests(unittest.TestCase):
             hashlib.sha256(_serialize_contract(historical)).hexdigest(),
             _P9_3C0_WORKTREE_PATH_BASELINE_FIXTURE_SHA256,
             "P9-3C0 CLI delta must be limited to the optional worktree_path action and its help reflow",
+        )
+
+    def test_contract_issue18_worktree_roots_delta_matches_baseline(self) -> None:
+        """Issue #18 delta proof: the ``workspace host-profile set`` leaf carries
+        exactly the two approved sibling worktree-root actions, and stripping
+        them restores the pre-delta node bytes byte-for-byte."""
+        contract = _build_contract()
+        set_node = next(
+            node
+            for node in contract["nodes"]
+            if node["path"] == ["workspace", "host-profile", "set"]
+        )
+        actions = {action.get("dest"): action for action in set_node["actions"]}
+        self.assertEqual(actions["worktree_roots"]["option_strings"], ["--worktree-root"])
+        self.assertEqual(actions["worktree_roots"]["action_class"], "_AppendAction")
+        self.assertFalse(actions["worktree_roots"]["required"])
+        self.assertEqual(
+            actions["clear_worktree_roots"]["option_strings"],
+            ["--clear-worktree-roots"],
+        )
+        self.assertEqual(
+            actions["clear_worktree_roots"]["action_class"],
+            "_StoreTrueAction",
+        )
+        self.assertIn("--worktree-root", set_node["help"])
+        self.assertIn("--clear-worktree-roots", set_node["help"])
+
+        historical = _remove_issue18_worktree_roots_delta(contract)
+        hist_set = next(
+            node
+            for node in historical["nodes"]
+            if node["path"] == ["workspace", "host-profile", "set"]
+        )
+        self.assertNotIn("worktree_roots", {a.get("dest") for a in hist_set["actions"]})
+        self.assertNotIn(
+            "clear_worktree_roots", {a.get("dest") for a in hist_set["actions"]}
+        )
+        self.assertEqual(
+            hashlib.sha256(_serialize_contract(hist_set)).hexdigest(),
+            _ISSUE18_PRE_WORKTREE_ROOTS_SET_NODE_SHA256,
+            "Issue #18 rewind must restore the pre-delta host-profile set node exactly",
+        )
+
+        stripped = _remove_issue18_worktree_roots_delta(historical)
+        self.assertEqual(
+            _serialize_contract(stripped),
+            _serialize_contract(historical),
+            "Stripping an already-stripped contract must no-op",
         )
 
     def test_contract_p9_2b_delta_matches_baseline(self) -> None:

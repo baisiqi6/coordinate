@@ -8,6 +8,7 @@ subprocess, no repair execution.
 from __future__ import annotations
 
 import json
+import os
 import re
 import sqlite3
 from collections.abc import Mapping
@@ -17,6 +18,7 @@ from types import MappingProxyType
 from typing import Any
 
 from .agent_registry import parse_agents_toml
+from .checklist_io import item_plan_locator_fields
 from .db import (
     Workspace,
     get_workspace,
@@ -30,11 +32,13 @@ from .split_operations import (
     CONTRACT_VERSION,
     LIFECYCLE_OWNED_ITEM_FIELDS,
     OPERATION_KIND_ISSUE_MATERIALIZE,
+    OPERATION_KIND_TASK_ADOPT,
     OPERATION_KIND_TASK_CREATE,
     SOURCE_KIND_ISSUE_TRIAGED_EVENT,
     STANDARD_CREATION_ITEM_FIELDS,
     STATUS_RECORD_APPLIED,
     build_issue_materialize_input_fingerprint,
+    build_task_adopt_input_fingerprint,
     build_task_create_input_fingerprint,
     compute_plan_sha256,
     compute_task_item_fingerprint,
@@ -42,8 +46,10 @@ from .split_operations import (
     reconstruct_creation_time_checklist_item,
     resolve_workspace_path,
     verify_issue_materialize_envelope_readonly,
+    verify_task_adopt_envelope_readonly,
     verify_task_create_envelope_readonly,
 )
+from .task_projection import task_mirror_from_item
 
 _SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
 
@@ -60,6 +66,14 @@ SEVERITY_RANK = {
 OPERATION_EVENT_TYPE = {
     OPERATION_KIND_TASK_CREATE: "plan.ready",
     OPERATION_KIND_ISSUE_MATERIALIZE: "issue.materialized",
+    OPERATION_KIND_TASK_ADOPT: "plan.ready",
+}
+
+# Ledger/envelope kinds the doctor recognizes (everything else is unsupported).
+SUPPORTED_OPERATION_KINDS = {
+    OPERATION_KIND_TASK_CREATE,
+    OPERATION_KIND_ISSUE_MATERIALIZE,
+    OPERATION_KIND_TASK_ADOPT,
 }
 
 # Recognized top-level checklist item fields: creation-time projection plus the
@@ -585,7 +599,7 @@ def _diagnose_split_operations(
         op_kind = envelope.get("operation_kind")
         contract_version = envelope.get("contract_version")
         unsupported = (
-            op_kind not in {OPERATION_KIND_TASK_CREATE, OPERATION_KIND_ISSUE_MATERIALIZE}
+            op_kind not in SUPPORTED_OPERATION_KINDS
             or contract_version != CONTRACT_VERSION
         )
         if unsupported:
@@ -604,7 +618,7 @@ def _diagnose_split_operations(
                     operation_id=op_id,
                     operation_kind=op_kind,
                     contract_version=contract_version,
-                    supported_kinds=[OPERATION_KIND_TASK_CREATE, OPERATION_KIND_ISSUE_MATERIALIZE],
+                    supported_kinds=sorted(SUPPORTED_OPERATION_KINDS),
                     supported_contract_version=CONTRACT_VERSION,
                 ),
                 repairable=False,
@@ -751,6 +765,25 @@ def _file_pending_record_inputs(
             return False, inputs
         return True, inputs
 
+    if op_kind == OPERATION_KIND_TASK_ADOPT:
+        # task.adopt record consumes: workspace_id, task_id, plan_doc,
+        # operation_id, fingerprints, and at minimum actor; owner/branch/
+        # target/payload are optional but must not be guessed.  The envelope
+        # carries no record-only intent (no record_actor), so a file-pending
+        # adoption is recognized but NOT repairable from envelope evidence
+        # alone: the operator must re-run `task adopt-record` with the
+        # original record intent.
+        inputs = {
+            "workspace_id": workspace.id,
+            "task_id": task_id,
+            "plan_doc": plan_doc,
+            "operation_id": envelope.get("operation_id"),
+            "input_fingerprint": envelope.get("input_fingerprint"),
+            "before_fingerprint": envelope.get("before_fingerprint"),
+            "after_fingerprint": envelope.get("after_fingerprint"),
+        }
+        return False, inputs
+
     return False, {}
 
 
@@ -783,7 +816,7 @@ def _diagnose_one_split_operation(
         ))
 
     if (
-        op_kind not in {OPERATION_KIND_TASK_CREATE, OPERATION_KIND_ISSUE_MATERIALIZE}
+        op_kind not in SUPPORTED_OPERATION_KINDS
         or op.contract_version != CONTRACT_VERSION
     ):
         findings.append(Finding(
@@ -800,7 +833,7 @@ def _diagnose_one_split_operation(
             evidence=_evidence(
                 operation_kind=op_kind,
                 contract_version=op.contract_version,
-                supported_kinds=[OPERATION_KIND_TASK_CREATE, OPERATION_KIND_ISSUE_MATERIALIZE],
+                supported_kinds=sorted(SUPPORTED_OPERATION_KINDS),
                 supported_contract_version=CONTRACT_VERSION,
             ),
             repairable=False,
@@ -883,6 +916,16 @@ def _diagnose_one_split_operation(
             before_fingerprint=op.before_fingerprint,
             after_fingerprint=op.after_fingerprint,
         )
+    elif op_kind == OPERATION_KIND_TASK_ADOPT:
+        shape_errors = verify_task_adopt_envelope_readonly(
+            envelope=envelope,
+            workspace_id=workspace.id,
+            task_id=task_id,
+            operation_id=op_id,
+            input_fingerprint=op.input_fingerprint,
+            before_fingerprint=op.before_fingerprint,
+            after_fingerprint=op.after_fingerprint,
+        )
     else:
         shape_errors = verify_issue_materialize_envelope_readonly(
             envelope=envelope,
@@ -921,7 +964,7 @@ def _diagnose_one_split_operation(
         return findings
 
     # Creation-time fingerprint proof from the immutable record payload.
-    proof_errors = _creation_time_proof_errors(op, envelope, ready_payload)
+    proof_errors = _creation_time_proof_errors(op, envelope, ready_payload, item=item)
     if proof_errors:
         findings.append(Finding(
             finding_id=_make_finding_id(
@@ -947,6 +990,7 @@ def _diagnose_one_split_operation(
         ready_payload=ready_payload,
         task_id=task_id,
         operation_id=op_id,
+        operation_kind=op_kind,
     )
     if identity_errors:
         findings.append(Finding(
@@ -1051,8 +1095,16 @@ def _diagnose_one_split_operation(
 
 
 def _plan_doc_from_envelope_or_item(envelope: dict[str, Any], item: dict[str, Any]) -> str | None:
-    # The ledger does not store plan_doc directly, but the deployed item's
-    # plan_path is the authoritative record-half plan reference.
+    # The ledger does not store plan_doc directly.  Adoption accepts any one
+    # of the existing EXharness locator fields, provided every present locator
+    # resolves to the same normalized path; mirror that write-path rule here.
+    if envelope.get("operation_kind") == OPERATION_KIND_TASK_ADOPT:
+        locators = item_plan_locator_fields(item)
+        if locators:
+            return os.path.normpath(locators[0][1])
+        return None
+
+    # Creation/materialization require the canonical top-level plan_path.
     plan_doc = item.get("plan_path")
     if isinstance(plan_doc, str) and plan_doc:
         return plan_doc
@@ -1189,7 +1241,8 @@ def _operation_ready_event(
         ))
         return None, None, findings
 
-    if op_kind == OPERATION_KIND_TASK_CREATE:
+    if op_kind in (OPERATION_KIND_TASK_CREATE, OPERATION_KIND_TASK_ADOPT):
+        # For create and adopt the record event itself is the plan.ready.
         ready_event_row = record_row
         ready_payload = record_payload
     else:
@@ -1291,12 +1344,19 @@ def _creation_time_proof_errors(
     op: Any,
     envelope: dict[str, Any],
     ready_payload: dict[str, Any],
+    item: dict[str, Any] | None = None,
 ) -> list[str]:
     """Return errors validating the creation-time fingerprint proof.
 
     Recomputes the input fingerprint and the creation-time checklist projection
     from the immutable ready payload and compares them to the ledger/envelope
     fingerprints.  Any mismatch means the historical record is corrupted.
+
+    For ``task.adopt`` there is no creation-time projection to reconstruct:
+    adoption preserves the deployed legacy item, so the before/after
+    fingerprints are the deployed item's own projection fingerprint and the
+    input fingerprint recomputes from that projection plus the recorded plan
+    digest (shared split_operations helpers; no third fingerprint logic).
     """
     errors: list[str] = []
     op_kind = op.operation_kind
@@ -1311,6 +1371,34 @@ def _creation_time_proof_errors(
     if not _is_canonical_sha256(ready_payload.get("plan_sha256")):
         errors.append("ready payload plan_sha256 is not a canonical SHA-256")
     if errors:
+        return errors
+
+    if op_kind == OPERATION_KIND_TASK_ADOPT:
+        if not isinstance(item, dict):
+            return ["task.adopt proof requires the deployed checklist item"]
+        try:
+            item_fingerprint = compute_task_item_fingerprint(item=item, task_id=task_id)
+            expected_input = build_task_adopt_input_fingerprint(
+                workspace_id=workspace_id,
+                task_id=task_id,
+                plan_doc=ready_payload["plan_doc"],
+                plan_sha256=ready_payload["plan_sha256"],
+                item_fingerprint=item_fingerprint,
+            )
+        except Exception as exc:
+            return [f"task.adopt fingerprint recomputation failed: {exc}"]
+        if expected_input != op.input_fingerprint:
+            errors.append(
+                f"input_fingerprint: stored={op.input_fingerprint!r} recomputed={expected_input!r}"
+            )
+        if item_fingerprint != op.before_fingerprint:
+            errors.append(
+                f"before_fingerprint: stored={op.before_fingerprint!r} recomputed={item_fingerprint!r}"
+            )
+        if item_fingerprint != op.after_fingerprint:
+            errors.append(
+                f"after_fingerprint: stored={op.after_fingerprint!r} recomputed={item_fingerprint!r}"
+            )
         return errors
 
     try:
@@ -1379,6 +1467,7 @@ def _immutable_identity_errors(
     ready_payload: dict[str, Any],
     task_id: str,
     operation_id: str,
+    operation_kind: str,
 ) -> list[str]:
     """Return errors for immutable identity drift and unknown top-level fields."""
     errors: list[str] = []
@@ -1388,9 +1477,14 @@ def _immutable_identity_errors(
         errors.append(
             f"title: deployed={item.get('title')!r} recorded={ready_payload.get('title')!r}"
         )
-    if item.get("phase") != ready_payload.get("phase"):
+    deployed_phase = (
+        task_mirror_from_item(item)["phase"]
+        if operation_kind == OPERATION_KIND_TASK_ADOPT
+        else item.get("phase")
+    )
+    if deployed_phase != ready_payload.get("phase"):
         errors.append(
-            f"phase: deployed={item.get('phase')!r} recorded={ready_payload.get('phase')!r}"
+            f"phase: deployed={deployed_phase!r} recorded={ready_payload.get('phase')!r}"
         )
     if item.get("priority") != ready_payload.get("priority"):
         errors.append(
@@ -1402,21 +1496,34 @@ def _immutable_identity_errors(
     artifacts = item.get("artifacts")
     artifacts_plan = artifacts.get("plan") if isinstance(artifacts, dict) else None
 
-    if not isinstance(plan_path, str) or not plan_path:
-        errors.append(f"plan_path: missing or malformed ({plan_path!r})")
-    elif plan_path != recorded_plan_doc:
-        errors.append(
-            f"plan_path: deployed={plan_path!r} recorded={recorded_plan_doc!r}"
-        )
+    if operation_kind == OPERATION_KIND_TASK_ADOPT:
+        locators = item_plan_locator_fields(item)
+        if not locators:
+            errors.append("plan locator: missing or malformed")
+        else:
+            expected = os.path.normpath(recorded_plan_doc or "")
+            for locator_name, locator_value in locators:
+                if os.path.normpath(locator_value) != expected:
+                    errors.append(
+                        f"{locator_name}: deployed={locator_value!r} "
+                        f"recorded={recorded_plan_doc!r}"
+                    )
+    else:
+        if not isinstance(plan_path, str) or not plan_path:
+            errors.append(f"plan_path: missing or malformed ({plan_path!r})")
+        elif plan_path != recorded_plan_doc:
+            errors.append(
+                f"plan_path: deployed={plan_path!r} recorded={recorded_plan_doc!r}"
+            )
 
-    if not isinstance(artifacts, dict):
-        errors.append(f"artifacts: missing or malformed ({artifacts!r})")
-    elif not isinstance(artifacts_plan, str) or not artifacts_plan:
-        errors.append(f"artifacts.plan: missing or malformed ({artifacts_plan!r})")
-    elif artifacts_plan != recorded_plan_doc:
-        errors.append(
-            f"artifacts.plan: deployed={artifacts_plan!r} recorded={recorded_plan_doc!r}"
-        )
+        if not isinstance(artifacts, dict):
+            errors.append(f"artifacts: missing or malformed ({artifacts!r})")
+        elif not isinstance(artifacts_plan, str) or not artifacts_plan:
+            errors.append(f"artifacts.plan: missing or malformed ({artifacts_plan!r})")
+        elif artifacts_plan != recorded_plan_doc:
+            errors.append(
+                f"artifacts.plan: deployed={artifacts_plan!r} recorded={recorded_plan_doc!r}"
+            )
 
     # Optional legacy alias: absent/null stays compatible with historical
     # items, but a present value must be a non-empty string matching the
@@ -1425,12 +1532,16 @@ def _immutable_identity_errors(
     if artifact_path is not None:
         if not isinstance(artifact_path, str) or not artifact_path:
             errors.append(f"artifact_path: malformed ({artifact_path!r})")
-        elif artifact_path != recorded_plan_doc:
+        elif (
+            os.path.normpath(artifact_path) != os.path.normpath(recorded_plan_doc or "")
+            if operation_kind == OPERATION_KIND_TASK_ADOPT
+            else artifact_path != recorded_plan_doc
+        ):
             errors.append(
                 f"artifact_path: deployed={artifact_path!r} recorded={recorded_plan_doc!r}"
             )
 
-    if (
+    if operation_kind != OPERATION_KIND_TASK_ADOPT and (
         isinstance(plan_path, str)
         and isinstance(artifacts_plan, str)
         and plan_path != artifacts_plan
@@ -1444,9 +1555,13 @@ def _immutable_identity_errors(
             f"envelope operation_id: {envelope.get('operation_id')!r} != {operation_id!r}"
         )
 
-    unknown_keys = set(item.keys()) - RECOGNIZED_CHECKLIST_ITEM_FIELDS
-    for key in sorted(unknown_keys):
-        errors.append(f"unknown top-level field: {key!r}")
+    # task.adopt binds the exact legacy item fingerprint, including extension
+    # fields that predate Coordinate.  Those fields are not creation-identity
+    # drift; later changes are still caught by the envelope fingerprints.
+    if operation_kind != OPERATION_KIND_TASK_ADOPT:
+        unknown_keys = set(item.keys()) - RECOGNIZED_CHECKLIST_ITEM_FIELDS
+        for key in sorted(unknown_keys):
+            errors.append(f"unknown top-level field: {key!r}")
 
     return errors
 
@@ -1648,9 +1763,14 @@ def _diagnose_task_mirrors(
                 record_mismatches.append(
                     f"title: mirror={payload.get('title')!r} deployed={item.get('title')!r}"
                 )
-            if payload.get("phase") != item.get("phase"):
+            deployed_phase = (
+                task_mirror_from_item(item)["phase"]
+                if op.operation_kind == OPERATION_KIND_TASK_ADOPT
+                else item.get("phase")
+            )
+            if payload.get("phase") != deployed_phase:
                 record_mismatches.append(
-                    f"phase: mirror={payload.get('phase')!r} deployed={item.get('phase')!r}"
+                    f"phase: mirror={payload.get('phase')!r} deployed={deployed_phase!r}"
                 )
             plan_doc = _plan_doc_from_envelope_or_item(envelope, item)
             if payload.get("plan_doc") != plan_doc:

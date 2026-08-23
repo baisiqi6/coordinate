@@ -12,11 +12,17 @@ from typing import Any, Iterable
 
 from coordinate.schema import (
     SCHEMA_VERSION,  # noqa: F401
+    SchemaCompatibilityError,  # noqa: F401
     _add_column_if_missing,  # noqa: F401
     _table_columns,  # noqa: F401
+    assert_schema_compatible,  # noqa: F401
     migrate,
 )
 from coordinate.db_support import _absolute_path, _json_dumps, utc_now
+from coordinate.execution_resources import (
+    normalize_worktree_root_list,
+    parse_normalized_worktree_roots,
+)
 from coordinate.job_repository import (  # noqa: F401
     create_job,
     get_job,
@@ -88,6 +94,58 @@ def connect(db_path: str | Path, *, must_exist: bool = False) -> sqlite3.Connect
     return conn
 
 
+class ReadOnlyConnectionError(ValueError):
+    """Read-only registry query cannot open/use the DB without mutation."""
+
+
+def connect_readonly(db_path: str | Path) -> sqlite3.Connection:
+    """Open a strictly read-only, existing-only SQLite connection.
+
+    URI ``mode=ro`` never creates the database file, parent directories, or
+    any journal/WAL/SHM sidecar; ``PRAGMA query_only = ON`` is set and verified
+    as a second, connection-level write barrier. ``initialize``/``migrate`` is
+    never run. A missing file (or missing parent directory) fails closed with
+    ``ReadOnlyConnectionError`` instead of creating an empty database.
+    """
+    if str(db_path) == ":memory:":
+        raise ReadOnlyConnectionError(
+            "read-only registry queries require an existing database file, "
+            "not ':memory:'"
+        )
+    path = Path(db_path).expanduser()
+    try:
+        conn = sqlite3.connect(
+            path.resolve().as_uri() + "?mode=ro",
+            factory=CoordinatorConnection,
+            uri=True,
+        )
+    except sqlite3.OperationalError as exc:
+        raise ReadOnlyConnectionError(
+            f"read-only query refused: database does not exist or is not "
+            f"readable: {path}"
+        ) from exc
+    try:
+        conn.row_factory = sqlite3.Row
+        conn.execute("PRAGMA foreign_keys = ON")
+        conn.execute("PRAGMA busy_timeout = 30000")
+        conn.execute("PRAGMA query_only = ON")
+        if conn.execute("PRAGMA query_only").fetchone()[0] != 1:
+            raise ReadOnlyConnectionError(
+                f"read-only query refused: could not enable query_only for {path}"
+            )
+    except sqlite3.Error as exc:
+        conn.close()
+        raise ReadOnlyConnectionError(
+            f"read-only query refused: failed to configure read-only "
+            f"connection: {exc}"
+        ) from exc
+    except BaseException:
+        conn.close()
+        raise
+    _OPEN_CONNECTIONS.append(conn)
+    return conn
+
+
 def initialize(db_path: str | Path) -> sqlite3.Connection:
     conn = connect(db_path)
     migrate(conn)
@@ -145,6 +203,7 @@ class WorkspaceHostProfile:
     coordinator_db_path: str | None = None
     shell: str | None = None
     metadata: dict[str, Any] | None = None
+    worktree_roots: tuple[str, ...] = ()
 
     @classmethod
     def from_row(cls, row: sqlite3.Row) -> "WorkspaceHostProfile":
@@ -158,6 +217,9 @@ class WorkspaceHostProfile:
             coordinator_db_path=row["coordinator_db_path"],
             shell=row["shell"],
             metadata=json.loads(row["metadata_json"]) if row["metadata_json"] else {},
+            worktree_roots=parse_normalized_worktree_roots(
+                row["worktree_roots_json"], workspace_path=row["workspace_path"]
+            ),
         )
 
     def to_dict(self) -> dict[str, Any]:
@@ -171,6 +233,7 @@ class WorkspaceHostProfile:
             "coordinator_db_path": self.coordinator_db_path,
             "shell": self.shell,
             "metadata": self.metadata or {},
+            "worktree_roots": list(self.worktree_roots),
         }
 
 
@@ -289,7 +352,19 @@ def upsert_workspace_host_profile(
     coordinator_db_path: str | None = None,
     shell: str | None = None,
     metadata: dict[str, Any] | None = None,
+    worktree_roots: list[str] | None = None,
 ) -> WorkspaceHostProfile:
+    """Upsert one (workspace_id, host_id) host execution profile.
+
+    ``worktree_roots`` is the only asymmetric field: ``None`` preserves the
+    existing allowlist (or writes ``[]`` for a new row) so legacy CLI and
+    automation never silently clear configured sibling roots. Preserved roots
+    are still re-validated (normalize + path flavour) against the workspace_path
+    supplied by THIS call, so a flavour-changing workspace_path update can
+    never silently keep now-invalid roots. An explicit list replaces the whole
+    allowlist (normalized and deduplicated) and an explicit empty list clears
+    it. Every other ``None`` field keeps the existing None=clear semantics.
+    """
     if get_workspace(conn, workspace_id) is None:
         raise ValueError(f"unknown workspace: {workspace_id}")
     if not host_id.strip():
@@ -297,15 +372,47 @@ def upsert_workspace_host_profile(
     if not workspace_path.strip():
         raise ValueError("workspace_path is required")
 
+    if worktree_roots is None:
+        # Preserve: "keep the same root set", not "skip validation". This is
+        # the ONLY path that reads/parses the existing profile, so an explicit
+        # list (or explicit []) can always repair malformed stored JSON. The
+        # preserved roots still pass the SAME validator against THIS upsert's
+        # workspace_path, so a POSIX->Windows (or reverse) workspace_path
+        # change can never silently keep cross-flavour roots. Failures happen
+        # before any DB mutation.
+        existing = get_workspace_host_profile(
+            conn, workspace_id=workspace_id, host_id=host_id
+        )
+        preserved = list(existing.worktree_roots) if existing else []
+        normalized_roots = (
+            normalize_worktree_root_list(
+                preserved,
+                workspace_path=workspace_path,
+                entry_label="worktree root",
+                dedupe=True,
+            )
+            if preserved
+            else []
+        )
+    else:
+        if isinstance(worktree_roots, str) or not isinstance(worktree_roots, (list, tuple)):
+            raise ValueError("worktree_roots must be a list of path strings")
+        normalized_roots = normalize_worktree_root_list(
+            worktree_roots,
+            workspace_path=workspace_path,
+            entry_label="worktree root",
+            dedupe=True,
+        )
+
     now = utc_now()
     conn.execute(
         """
         INSERT INTO workspace_host_profiles (
           workspace_id, host_id, workspace_path, harness_root, harnessctl_path,
           coordinator_cli_path, coordinator_db_path, shell, metadata_json,
-          created_at, updated_at
+          worktree_roots_json, created_at, updated_at
         )
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         ON CONFLICT(workspace_id, host_id) DO UPDATE SET
           workspace_path = excluded.workspace_path,
           harness_root = excluded.harness_root,
@@ -314,6 +421,7 @@ def upsert_workspace_host_profile(
           coordinator_db_path = excluded.coordinator_db_path,
           shell = excluded.shell,
           metadata_json = excluded.metadata_json,
+          worktree_roots_json = excluded.worktree_roots_json,
           updated_at = excluded.updated_at
         """,
         (
@@ -326,6 +434,7 @@ def upsert_workspace_host_profile(
             coordinator_db_path,
             shell,
             _json_dumps(metadata),
+            json.dumps(normalized_roots, ensure_ascii=False, sort_keys=True, separators=(",", ":")),
             now,
             now,
         ),
@@ -1555,6 +1664,7 @@ def row_to_dict(row: sqlite3.Row) -> dict[str, Any]:
         "env_json",
         "context_json",
         "decision_json",
+        "evidence_json",
     ):
         if key in result and result[key] is not None:
             result[key.removesuffix("_json")] = json.loads(result.pop(key))
@@ -2053,3 +2163,133 @@ def release_channel_workspace(
     conn.execute("RELEASE channel_binding_release")
     conn.commit()
     return {**receipt, "status": "released", "event_id": event.row["id"]}
+
+
+# ---------------------------------------------------------------------------
+# Issue #12: managed usage evidence + task-scoped warning policy storage.
+# SQL stays here; revision/warning business logic lives in usage_policy.py.
+# ---------------------------------------------------------------------------
+
+
+def insert_attempt_usage(
+    conn: sqlite3.Connection,
+    *,
+    job_id: str,
+    attempt_token: int,
+    workspace_id: str | None,
+    task_id: str | None,
+    evidence: dict[str, Any],
+    evidence_digest: str,
+    observed_tokens: int | None,
+    provider_cost_microusd: int | None,
+    completeness: str,
+    terminal_event_id: str | None,
+    event_created: bool,
+    recorded_at: str,
+    commit: bool = True,
+) -> bool:
+    """Insert one canonical attempt usage row; ``(job_id, attempt_token)`` is the
+    usage authority so an exact replay returns False and never re-accumulates."""
+    cursor = conn.execute(
+        """
+        INSERT INTO job_attempt_usage (
+          job_id, attempt_token, workspace_id, task_id, evidence_json,
+          evidence_digest, observed_tokens, provider_cost_microusd, completeness,
+          terminal_event_id, event_created, recorded_at
+        )
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        ON CONFLICT(job_id, attempt_token) DO NOTHING
+        """,
+        (
+            job_id,
+            attempt_token,
+            workspace_id,
+            task_id,
+            _json_dumps(evidence),
+            evidence_digest,
+            observed_tokens,
+            provider_cost_microusd,
+            completeness,
+            terminal_event_id,
+            1 if event_created else 0,
+            recorded_at,
+        ),
+    )
+    if commit:
+        conn.commit()
+    return cursor.rowcount > 0
+
+
+def get_attempt_usage(
+    conn: sqlite3.Connection, *, job_id: str, attempt_token: int
+) -> sqlite3.Row | None:
+    row = conn.execute(
+        "SELECT * FROM job_attempt_usage WHERE job_id = ? AND attempt_token = ?",
+        (job_id, attempt_token),
+    ).fetchone()
+    return row
+
+
+def list_attempt_usage_for_scope(
+    conn: sqlite3.Connection, *, workspace_id: str, task_id: str
+) -> list[sqlite3.Row]:
+    """Attempt usage rows in one task scope, oldest-first."""
+    return conn.execute(
+        """
+        SELECT * FROM job_attempt_usage
+        WHERE workspace_id = ? AND task_id = ?
+        ORDER BY recorded_at, job_id, attempt_token
+        """,
+        (workspace_id, task_id),
+    ).fetchall()
+
+
+def get_task_usage_warning_policy(
+    conn: sqlite3.Connection, *, workspace_id: str, task_id: str
+) -> sqlite3.Row | None:
+    row = conn.execute(
+        "SELECT * FROM task_usage_warning_policies WHERE workspace_id = ? AND task_id = ?",
+        (workspace_id, task_id),
+    ).fetchone()
+    return row
+
+
+def set_task_usage_warning_policy(
+    conn: sqlite3.Connection,
+    *,
+    workspace_id: str,
+    task_id: str,
+    revision: int,
+    observed_tokens_threshold: int,
+    enabled: bool,
+    created_at: str,
+    updated_at: str,
+    commit: bool = True,
+) -> sqlite3.Row:
+    """Plain upsert; the monotonic-revision/idempotency CAS lives in usage_policy."""
+    conn.execute(
+        """
+        INSERT INTO task_usage_warning_policies (
+          workspace_id, task_id, revision, observed_tokens_threshold, enabled,
+          created_at, updated_at
+        )
+        VALUES (?, ?, ?, ?, ?, ?, ?)
+        ON CONFLICT(workspace_id, task_id) DO UPDATE SET
+          revision = excluded.revision,
+          observed_tokens_threshold = excluded.observed_tokens_threshold,
+          enabled = excluded.enabled,
+          updated_at = excluded.updated_at
+        """,
+        (
+            workspace_id,
+            task_id,
+            revision,
+            observed_tokens_threshold,
+            1 if enabled else 0,
+            created_at,
+            updated_at,
+        ),
+    )
+    if commit:
+        conn.commit()
+    return get_task_usage_warning_policy(conn, workspace_id=workspace_id, task_id=task_id)

@@ -30,7 +30,7 @@ Coordinate 刻意将确定性状态机制与可替换判断分离。`operator.py
 | 入口 | `cli.py`, `daemon.py`, `__main__.py` | CLI/API/bot 命令接入和服务生命周期 |
 | Agent 接口 | `agent_interface.py`, `mcp_server.py`, `mcp_cli.py` | bounded agent-facing facade 与 MCP stdio adapter（R1） |
 | Runtime data plane | `runtime_interface.py`, `runtime_http.py`, `runtime_http_cli.py` | 共享 runtime facade 与 loopback HTTP adapter（R2A） |
-| 持久化存储 | `schema.py`, `db.py`, `events.py` | SQLite schema、幂等 events、jobs、deliveries、agents、mirrors |
+| 持久化存储 | `schema.py`, `db.py`, `events.py` | SQLite schema、幂等 events、jobs、deliveries、agents、mirrors；`workspace list` / `host-profile list` 走严格只读连接（`mode=ro` + `query_only` + 精确 schema gate，绝不创建/migrate DB） |
 | 项目生命周期 | `assignments.py`, `transitions.py`, `handoff.py`, `plan_gate.py` | 经验证的生命周期转换和任务级交接产物 |
 | Harness 边界 | `harness.py`, `reconcile.py`, `audit.py`, `doctor.py` | 调用 harness mutations、刷新投影、报告 drift |
 | 依赖更新入口 | `task_dependencies.py`, `planning_cli.py` | checklist `dependencies` 字段的受控 mutation：combined（preflight + file-first + targeted reconcile）与 coding-host file-only 两入口 |
@@ -95,6 +95,41 @@ coordinate task update-dependencies-files --workspace-path P --harness-root H ..
   并给出同命令重跑或 `coordinate reconcile WORKSPACE --task-id TASK` 两个恢复命令；
 - combined 禁止 full reconcile；/opt runtime-copy guard 保持 fail closed
   （`--allow-runtime-copy` 只用于显式 repair）。
+
+#### Legacy item 显式首 adoption（task.adopt）
+
+已存在于 canonical checklist、但没有 `split_operation` envelope 的 legacy item，
+通过**显式**入口 `task adopt` 首次纳入 managed lifecycle，与 `task create`
+（before-state 是 absent，创建新 item）和 `reconcile`（只做 completion repair /
+mirror 刷新）严格区分：
+
+```text
+coordinate task adopt WORKSPACE --task-id TASK --plan-doc PLAN
+  → 只读 prepare：推导 expected item fingerprint + plan bytes digest（stale gate 输入）
+  → file half：锁内校验 expected fingerprint/digest 后只给既有 unbound item
+    写入 task.adopt envelope（业务字段/identity/checklist authority 不变；DB 是 mirror）
+  → record half：从已部署 workspace/harness/plan readback 复核 fingerprint 后，
+    单一 SAVEPOINT 内原子建立 split_operations ledger + task mirror + plan.ready
+```
+
+- lifecycle projection 与 reconcile 共用 `workflow.status → status` 规则；legacy item
+  不要求顶层 `phase`，prepare/file/record 使用同一投影，避免 file half 后才发现
+  确定性不兼容；
+- stale-input gate：prepare 之后 item projection（title/status/dependencies
+  等）或 plan bytes 发生漂移，在文件写入前 fail closed（`fingerprint_drift`）；
+- split-host 路径：`task adopt --prepare-only` 取得 expected fingerprints →
+  coding host `task adopt-files` → commit/push/deploy → control plane
+  `task adopt-record`（exact argv 以各子命令 `--help` 为准）；
+- record 失败时返回**同一 operation id/fingerprint** 的 `task adopt-record`
+  结构化 recovery；不得用 `reconcile --task-id` 代替首 adoption 或 record recovery；
+- 幂等：exact same operation replay 不改 checklist bytes/mtime、不重复
+  ledger/mirror/event；已绑定其他 operation、malformed envelope、双 checklist
+  authority、缺 checklist/plan、非法相对路径均 fail closed；
+- 旧 reconcile 已建立的 mirror 仅在 file-owned payload 与当前 legacy item 完全一致
+  时可被显式 adoption 原子升级；Coordinate-owned owner/branch/PR/publish evidence
+  被保留，任何 lifecycle 或 operation identity 冲突仍在 DB mutation 前拒绝；
+- 无 schema migration；projection doctor 已识别 `task.adopt`（合法 file-pending
+  是 recognized warning，record-applied 零 unsupported，drift 仍精确报 finding）。
 
 ### 可见 delivery
 

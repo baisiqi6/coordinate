@@ -20,6 +20,9 @@
     "task create",
     "task create-files",
     "task create-record",
+    "task adopt",
+    "task adopt-files",
+    "task adopt-record",
     "task update-dependencies",
     "task update-dependencies-files",
     "task handoff",
@@ -76,6 +79,8 @@
     "runtime capacity sync",
     "runtime capacity list",
     "runtime capacity show",
+    "runtime usage policy-set",
+    "runtime usage status",
     "assignment request",
     "assignment accept",
     "assignment handoff",
@@ -93,12 +98,14 @@
     "operator pending",
     "mcp serve",
     "runtime-http serve",
+    "trace task",
+    "trace job",
     "serve"
   ],
   "metadata": {
     "default_db_path_sha256": "853182c0ba6a6dcd1e5a70dcb45bb3fcb80f31d53e26c28f29d4dae861a389b5",
-    "leaf_count": 94,
-    "node_count": 124,
+    "leaf_count": 101,
+    "node_count": 133,
     "prog": "coordinate",
     "top_level_commands": [
       "workspace",
@@ -123,6 +130,7 @@
       "operator",
       "mcp",
       "runtime-http",
+      "trace",
       "serve"
     ]
   },
@@ -200,6 +208,7 @@
             "operator",
             "mcp",
             "runtime-http",
+            "trace",
             "serve"
           ],
           "const": null,
@@ -214,7 +223,7 @@
         }
       ],
       "defaults": {},
-      "help": "usage: coordinate [-h] [--db DB] [--version]\n                  {workspace,state,event,task,plan,runner,reconcile,branch,pr,ci,review,merge,issue,job,delivery,policy,worker,runtime,assignment,operator,mcp,runtime-http,serve}\n                  ...\n\npositional arguments:\n  {workspace,state,event,task,plan,runner,reconcile,branch,pr,ci,review,merge,issue,job,delivery,policy,worker,runtime,assignment,operator,mcp,runtime-http,serve}\n    workspace           Manage harness workspaces\n    state               Refresh and print harness state for a workspace\n    event               Append or inspect normalized events\n    task                Create and inspect coordinator task mirrors\n    plan                Plan review and approval gate\n    runner              Manage runner profiles\n    reconcile           Sync coordinator task mirror from harness state\n    branch              Manage branch allocations\n    pr                  Manage PR links\n    ci                  Check CI status\n    review              Check PR review status\n    merge               Check merge readiness\n    issue               Scan and triage GitHub issues\n    job                 Create, run, and list jobs\n    delivery            Create, send, and list bus deliveries\n    policy              Render workflow events into visible deliveries\n    worker              Run coordinator worker loops\n    runtime             Bridge and agentd runtime operations\n    assignment          Manage task assignments\n    operator            Operator-facing pending-action queries\n    mcp                 MCP agent interface (stdio / streamable HTTP)\n    runtime-http        Loopback runtime HTTP data plane (R2A)\n    serve               Run coordinator daemon with Discord bot\n\noptions:\n  -h, --help            show this help message and exit\n  --db DB               SQLite database path\n  --version             show program's version number and exit\n",
+      "help": "usage: coordinate [-h] [--db DB] [--version]\n                  {workspace,state,event,task,plan,runner,reconcile,branch,pr,ci,review,merge,issue,job,delivery,policy,worker,runtime,assignment,operator,mcp,runtime-http,trace,serve}\n                  ...\n\npositional arguments:\n  {workspace,state,event,task,plan,runner,reconcile,branch,pr,ci,review,merge,issue,job,delivery,policy,worker,runtime,assignment,operator,mcp,runtime-http,trace,serve}\n    workspace           Manage harness workspaces\n    state               Refresh and print harness state for a workspace\n    event               Append or inspect normalized events\n    task                Create and inspect coordinator task mirrors\n    plan                Plan review and approval gate\n    runner              Manage runner profiles\n    reconcile           Sync coordinator task mirror from harness state\n    branch              Manage branch allocations\n    pr                  Manage PR links\n    ci                  Check CI status\n    review              Check PR review status\n    merge               Check merge readiness\n    issue               Scan and triage GitHub issues\n    job                 Create, run, and list jobs\n    delivery            Create, send, and list bus deliveries\n    policy              Render workflow events into visible deliveries\n    worker              Run coordinator worker loops\n    runtime             Bridge and agentd runtime operations\n    assignment          Manage task assignments\n    operator            Operator-facing pending-action queries\n    mcp                 MCP agent interface (stdio / streamable HTTP)\n    runtime-http        Loopback runtime HTTP data plane (R2A)\n    trace               Read-only task/job trace projection (Issue #11)\n    serve               Run coordinator daemon with Discord bot\n\noptions:\n  -h, --help            show this help message and exit\n  --db DB               SQLite database path\n  --version             show program's version number and exit\n",
       "path": [],
       "prog": "coordinate"
     },
@@ -1282,12 +1291,42 @@
           ],
           "required": false,
           "type": null
+        },
+        {
+          "action_class": "_AppendAction",
+          "choices": null,
+          "const": null,
+          "default": null,
+          "dest": "worktree_roots",
+          "help": "Allowlist one host-absolute sibling worktree root (repeatable). Omitted together with --clear-worktree-roots: existing roots are preserved (None=preserve, unlike every other field here).",
+          "metavar": "PATH",
+          "nargs": null,
+          "option_strings": [
+            "--worktree-root"
+          ],
+          "required": false,
+          "type": null
+        },
+        {
+          "action_class": "_StoreTrueAction",
+          "choices": null,
+          "const": true,
+          "default": false,
+          "dest": "clear_worktree_roots",
+          "help": "Explicitly clear the sibling worktree root allowlist. Mutually exclusive with --worktree-root; without either flag the stored roots are preserved.",
+          "metavar": null,
+          "nargs": 0,
+          "option_strings": [
+            "--clear-worktree-roots"
+          ],
+          "required": false,
+          "type": null
         }
       ],
       "defaults": {
         "handler": "coordinate.workspace_cli.handle_workspace_host_profile_set"
       },
-      "help": "usage: coordinate workspace host-profile set [-h] --host-id HOST_ID --workspace-path\n                                             WORKSPACE_PATH [--harness-root HARNESS_ROOT]\n                                             [--harnessctl-path HARNESSCTL_PATH]\n                                             [--coordinator-cli-path COORDINATOR_CLI_PATH]\n                                             [--coordinator-db-path COORDINATOR_DB_PATH]\n                                             [--shell SHELL] [--metadata-json METADATA_JSON]\n                                             workspace_id\n\npositional arguments:\n  workspace_id\n\noptions:\n  -h, --help            show this help message and exit\n  --host-id HOST_ID\n  --workspace-path WORKSPACE_PATH\n  --harness-root HARNESS_ROOT\n  --harnessctl-path HARNESSCTL_PATH\n  --coordinator-cli-path COORDINATOR_CLI_PATH\n  --coordinator-db-path COORDINATOR_DB_PATH\n  --shell SHELL\n  --metadata-json METADATA_JSON\n",
+      "help": "usage: coordinate workspace host-profile set [-h] --host-id HOST_ID --workspace-path\n                                             WORKSPACE_PATH [--harness-root HARNESS_ROOT]\n                                             [--harnessctl-path HARNESSCTL_PATH]\n                                             [--coordinator-cli-path COORDINATOR_CLI_PATH]\n                                             [--coordinator-db-path COORDINATOR_DB_PATH]\n                                             [--shell SHELL] [--metadata-json METADATA_JSON]\n                                             [--worktree-root PATH | --clear-worktree-roots]\n                                             workspace_id\n\npositional arguments:\n  workspace_id\n\noptions:\n  -h, --help            show this help message and exit\n  --host-id HOST_ID\n  --workspace-path WORKSPACE_PATH\n  --harness-root HARNESS_ROOT\n  --harnessctl-path HARNESSCTL_PATH\n  --coordinator-cli-path COORDINATOR_CLI_PATH\n  --coordinator-db-path COORDINATOR_DB_PATH\n  --shell SHELL\n  --metadata-json METADATA_JSON\n  --worktree-root PATH  Allowlist one host-absolute sibling worktree root (repeatable). Omitted\n                        together with --clear-worktree-roots: existing roots are preserved\n                        (None=preserve, unlike every other field here).\n  --clear-worktree-roots\n                        Explicitly clear the sibling worktree root allowlist. Mutually exclusive\n                        with --worktree-root; without either flag the stored roots are preserved.\n",
       "path": [
         "workspace",
         "host-profile",
@@ -2042,6 +2081,9 @@
             "create",
             "create-files",
             "create-record",
+            "adopt",
+            "adopt-files",
+            "adopt-record",
             "update-dependencies",
             "update-dependencies-files",
             "handoff"
@@ -2058,7 +2100,7 @@
         }
       ],
       "defaults": {},
-      "help": "usage: coordinate task [-h]\n                       {create,create-files,create-record,update-dependencies,update-dependencies-files,handoff}\n                       ...\n\npositional arguments:\n  {create,create-files,create-record,update-dependencies,update-dependencies-files,handoff}\n    create              Combined managed create: checklist file half first, DB record half second\n                        (idempotent; --operation-id to pin)\n    create-files        Coding-host half of host-aware task create: checklist file half only (no\n                        DB write)\n    create-record       Server half of host-aware task create: write DB task mirror + plan.ready\n                        only (no checklist write)\n    update-dependencies\n                        Combined managed dependency update: checklist file mutation first, state\n                        refresh + targeted reconcile second (idempotent)\n    update-dependencies-files\n                        Coding-host half of dependency update: canonical checklist file only (no\n                        DB write, no harnessctl preflight)\n    handoff             Generate a structured worker handoff\n\noptions:\n  -h, --help            show this help message and exit\n",
+      "help": "usage: coordinate task [-h]\n                       {create,create-files,create-record,adopt,adopt-files,adopt-record,update-dependencies,update-dependencies-files,handoff}\n                       ...\n\npositional arguments:\n  {create,create-files,create-record,adopt,adopt-files,adopt-record,update-dependencies,update-dependencies-files,handoff}\n    create              Combined managed create: checklist file half first, DB record half second\n                        (idempotent; --operation-id to pin)\n    create-files        Coding-host half of host-aware task create: checklist file half only (no\n                        DB write)\n    create-record       Server half of host-aware task create: write DB task mirror + plan.ready\n                        only (no checklist write)\n    adopt               Combined explicit legacy first-adoption: bind an existing unbound\n                        checklist item into the managed lifecycle (file half first, DB record half\n                        second; idempotent; --prepare-only for the read-only expected\n                        fingerprints)\n    adopt-files         Coding-host half of host-aware adoption: write the task.adopt envelope\n                        only (no DB write; requires the prepare-phase expected fingerprints)\n    adopt-record        Server half of host-aware adoption: write DB ledger + task mirror +\n                        plan.ready only (no checklist write)\n    update-dependencies\n                        Combined managed dependency update: checklist file mutation first, state\n                        refresh + targeted reconcile second (idempotent)\n    update-dependencies-files\n                        Coding-host half of dependency update: canonical checklist file only (no\n                        DB write, no harnessctl preflight)\n    handoff             Generate a structured worker handoff\n\noptions:\n  -h, --help            show this help message and exit\n",
       "path": [
         "task"
       ],
@@ -2735,6 +2777,599 @@
         "create-record"
       ],
       "prog": "coordinate task create-record"
+    },
+    {
+      "actions": [
+        {
+          "action_class": "_HelpAction",
+          "choices": null,
+          "const": null,
+          "default": "==SUPPRESS==",
+          "dest": "help",
+          "help": "show this help message and exit",
+          "metavar": null,
+          "nargs": 0,
+          "option_strings": [
+            "-h",
+            "--help"
+          ],
+          "required": false,
+          "type": null
+        },
+        {
+          "action_class": "_StoreAction",
+          "choices": null,
+          "const": null,
+          "default": null,
+          "dest": "workspace_id",
+          "help": null,
+          "metavar": null,
+          "nargs": null,
+          "option_strings": [],
+          "required": true,
+          "type": null
+        },
+        {
+          "action_class": "_StoreAction",
+          "choices": null,
+          "const": null,
+          "default": null,
+          "dest": "task_id",
+          "help": null,
+          "metavar": null,
+          "nargs": null,
+          "option_strings": [
+            "--task-id"
+          ],
+          "required": true,
+          "type": null
+        },
+        {
+          "action_class": "_StoreAction",
+          "choices": null,
+          "const": null,
+          "default": null,
+          "dest": "plan_doc",
+          "help": null,
+          "metavar": null,
+          "nargs": null,
+          "option_strings": [
+            "--plan-doc"
+          ],
+          "required": true,
+          "type": null
+        },
+        {
+          "action_class": "_StoreAction",
+          "choices": null,
+          "const": null,
+          "default": null,
+          "dest": "owner",
+          "help": null,
+          "metavar": null,
+          "nargs": null,
+          "option_strings": [
+            "--owner"
+          ],
+          "required": false,
+          "type": null
+        },
+        {
+          "action_class": "_StoreAction",
+          "choices": null,
+          "const": null,
+          "default": null,
+          "dest": "branch",
+          "help": null,
+          "metavar": null,
+          "nargs": null,
+          "option_strings": [
+            "--branch"
+          ],
+          "required": false,
+          "type": null
+        },
+        {
+          "action_class": "_StoreAction",
+          "choices": null,
+          "const": null,
+          "default": "operator",
+          "dest": "actor",
+          "help": null,
+          "metavar": null,
+          "nargs": null,
+          "option_strings": [
+            "--actor"
+          ],
+          "required": false,
+          "type": null
+        },
+        {
+          "action_class": "_StoreAction",
+          "choices": null,
+          "const": null,
+          "default": "worker",
+          "dest": "target",
+          "help": null,
+          "metavar": null,
+          "nargs": null,
+          "option_strings": [
+            "--target"
+          ],
+          "required": false,
+          "type": null
+        },
+        {
+          "action_class": "_StoreAction",
+          "choices": null,
+          "const": null,
+          "default": "{}",
+          "dest": "payload_json",
+          "help": null,
+          "metavar": null,
+          "nargs": null,
+          "option_strings": [
+            "--payload-json"
+          ],
+          "required": false,
+          "type": null
+        },
+        {
+          "action_class": "_StoreAction",
+          "choices": null,
+          "const": null,
+          "default": null,
+          "dest": "idempotency_key",
+          "help": null,
+          "metavar": null,
+          "nargs": null,
+          "option_strings": [
+            "--idempotency-key"
+          ],
+          "required": false,
+          "type": null
+        },
+        {
+          "action_class": "_StoreAction",
+          "choices": null,
+          "const": null,
+          "default": null,
+          "dest": "operation_id",
+          "help": "Pin the adoption operation id (default: fresh UUIDv4 or reuse the deployed envelope)",
+          "metavar": null,
+          "nargs": null,
+          "option_strings": [
+            "--operation-id"
+          ],
+          "required": false,
+          "type": null
+        },
+        {
+          "action_class": "_StoreTrueAction",
+          "choices": null,
+          "const": true,
+          "default": false,
+          "dest": "allow_runtime_copy",
+          "help": "Override the /opt runtime-copy guard",
+          "metavar": null,
+          "nargs": 0,
+          "option_strings": [
+            "--allow-runtime-copy"
+          ],
+          "required": false,
+          "type": null
+        },
+        {
+          "action_class": "_StoreTrueAction",
+          "choices": null,
+          "const": true,
+          "default": false,
+          "dest": "prepare_only",
+          "help": "Read-only: emit the expected item fingerprint and plan digest without mutating anything",
+          "metavar": null,
+          "nargs": 0,
+          "option_strings": [
+            "--prepare-only"
+          ],
+          "required": false,
+          "type": null
+        }
+      ],
+      "defaults": {
+        "handler": "coordinate.planning_cli.handle_task_adopt"
+      },
+      "help": "usage: coordinate task adopt [-h] --task-id TASK_ID --plan-doc PLAN_DOC [--owner OWNER]\n                             [--branch BRANCH] [--actor ACTOR] [--target TARGET]\n                             [--payload-json PAYLOAD_JSON] [--idempotency-key IDEMPOTENCY_KEY]\n                             [--operation-id OPERATION_ID] [--allow-runtime-copy] [--prepare-only]\n                             workspace_id\n\npositional arguments:\n  workspace_id\n\noptions:\n  -h, --help            show this help message and exit\n  --task-id TASK_ID\n  --plan-doc PLAN_DOC\n  --owner OWNER\n  --branch BRANCH\n  --actor ACTOR\n  --target TARGET\n  --payload-json PAYLOAD_JSON\n  --idempotency-key IDEMPOTENCY_KEY\n  --operation-id OPERATION_ID\n                        Pin the adoption operation id (default: fresh UUIDv4 or reuse the deployed\n                        envelope)\n  --allow-runtime-copy  Override the /opt runtime-copy guard\n  --prepare-only        Read-only: emit the expected item fingerprint and plan digest without\n                        mutating anything\n",
+      "path": [
+        "task",
+        "adopt"
+      ],
+      "prog": "coordinate task adopt"
+    },
+    {
+      "actions": [
+        {
+          "action_class": "_HelpAction",
+          "choices": null,
+          "const": null,
+          "default": "==SUPPRESS==",
+          "dest": "help",
+          "help": "show this help message and exit",
+          "metavar": null,
+          "nargs": 0,
+          "option_strings": [
+            "-h",
+            "--help"
+          ],
+          "required": false,
+          "type": null
+        },
+        {
+          "action_class": "_StoreAction",
+          "choices": null,
+          "const": null,
+          "default": null,
+          "dest": "workspace_path",
+          "help": null,
+          "metavar": null,
+          "nargs": null,
+          "option_strings": [
+            "--workspace-path"
+          ],
+          "required": true,
+          "type": null
+        },
+        {
+          "action_class": "_StoreAction",
+          "choices": null,
+          "const": null,
+          "default": null,
+          "dest": "harness_root",
+          "help": null,
+          "metavar": null,
+          "nargs": null,
+          "option_strings": [
+            "--harness-root"
+          ],
+          "required": true,
+          "type": null
+        },
+        {
+          "action_class": "_StoreAction",
+          "choices": null,
+          "const": null,
+          "default": null,
+          "dest": "workspace_id",
+          "help": null,
+          "metavar": null,
+          "nargs": null,
+          "option_strings": [
+            "--workspace-id"
+          ],
+          "required": true,
+          "type": null
+        },
+        {
+          "action_class": "_StoreAction",
+          "choices": null,
+          "const": null,
+          "default": null,
+          "dest": "operation_id",
+          "help": null,
+          "metavar": null,
+          "nargs": null,
+          "option_strings": [
+            "--operation-id"
+          ],
+          "required": true,
+          "type": null
+        },
+        {
+          "action_class": "_StoreAction",
+          "choices": null,
+          "const": null,
+          "default": null,
+          "dest": "task_id",
+          "help": null,
+          "metavar": null,
+          "nargs": null,
+          "option_strings": [
+            "--task-id"
+          ],
+          "required": true,
+          "type": null
+        },
+        {
+          "action_class": "_StoreAction",
+          "choices": null,
+          "const": null,
+          "default": null,
+          "dest": "plan_doc",
+          "help": null,
+          "metavar": null,
+          "nargs": null,
+          "option_strings": [
+            "--plan-doc"
+          ],
+          "required": true,
+          "type": null
+        },
+        {
+          "action_class": "_StoreAction",
+          "choices": null,
+          "const": null,
+          "default": null,
+          "dest": "expected_item_fingerprint",
+          "help": null,
+          "metavar": null,
+          "nargs": null,
+          "option_strings": [
+            "--expected-item-fingerprint"
+          ],
+          "required": true,
+          "type": null
+        },
+        {
+          "action_class": "_StoreAction",
+          "choices": null,
+          "const": null,
+          "default": null,
+          "dest": "expected_plan_sha256",
+          "help": null,
+          "metavar": null,
+          "nargs": null,
+          "option_strings": [
+            "--expected-plan-sha256"
+          ],
+          "required": true,
+          "type": null
+        },
+        {
+          "action_class": "_StoreTrueAction",
+          "choices": null,
+          "const": true,
+          "default": false,
+          "dest": "allow_runtime_copy",
+          "help": "Override the /opt runtime-copy guard",
+          "metavar": null,
+          "nargs": 0,
+          "option_strings": [
+            "--allow-runtime-copy"
+          ],
+          "required": false,
+          "type": null
+        }
+      ],
+      "defaults": {
+        "handler": "coordinate.planning_cli.handle_task_adopt_files"
+      },
+      "help": "usage: coordinate task adopt-files [-h] --workspace-path WORKSPACE_PATH --harness-root\n                                   HARNESS_ROOT --workspace-id WORKSPACE_ID --operation-id\n                                   OPERATION_ID --task-id TASK_ID --plan-doc PLAN_DOC\n                                   --expected-item-fingerprint EXPECTED_ITEM_FINGERPRINT\n                                   --expected-plan-sha256 EXPECTED_PLAN_SHA256\n                                   [--allow-runtime-copy]\n\noptions:\n  -h, --help            show this help message and exit\n  --workspace-path WORKSPACE_PATH\n  --harness-root HARNESS_ROOT\n  --workspace-id WORKSPACE_ID\n  --operation-id OPERATION_ID\n  --task-id TASK_ID\n  --plan-doc PLAN_DOC\n  --expected-item-fingerprint EXPECTED_ITEM_FINGERPRINT\n  --expected-plan-sha256 EXPECTED_PLAN_SHA256\n  --allow-runtime-copy  Override the /opt runtime-copy guard\n",
+      "path": [
+        "task",
+        "adopt-files"
+      ],
+      "prog": "coordinate task adopt-files"
+    },
+    {
+      "actions": [
+        {
+          "action_class": "_HelpAction",
+          "choices": null,
+          "const": null,
+          "default": "==SUPPRESS==",
+          "dest": "help",
+          "help": "show this help message and exit",
+          "metavar": null,
+          "nargs": 0,
+          "option_strings": [
+            "-h",
+            "--help"
+          ],
+          "required": false,
+          "type": null
+        },
+        {
+          "action_class": "_StoreAction",
+          "choices": null,
+          "const": null,
+          "default": null,
+          "dest": "workspace_id",
+          "help": null,
+          "metavar": null,
+          "nargs": null,
+          "option_strings": [],
+          "required": true,
+          "type": null
+        },
+        {
+          "action_class": "_StoreAction",
+          "choices": null,
+          "const": null,
+          "default": null,
+          "dest": "operation_id",
+          "help": null,
+          "metavar": null,
+          "nargs": null,
+          "option_strings": [
+            "--operation-id"
+          ],
+          "required": true,
+          "type": null
+        },
+        {
+          "action_class": "_StoreAction",
+          "choices": null,
+          "const": null,
+          "default": null,
+          "dest": "input_fingerprint",
+          "help": null,
+          "metavar": null,
+          "nargs": null,
+          "option_strings": [
+            "--input-fingerprint"
+          ],
+          "required": true,
+          "type": null
+        },
+        {
+          "action_class": "_StoreAction",
+          "choices": null,
+          "const": null,
+          "default": null,
+          "dest": "before_fingerprint",
+          "help": null,
+          "metavar": null,
+          "nargs": null,
+          "option_strings": [
+            "--before-fingerprint"
+          ],
+          "required": true,
+          "type": null
+        },
+        {
+          "action_class": "_StoreAction",
+          "choices": null,
+          "const": null,
+          "default": null,
+          "dest": "after_fingerprint",
+          "help": null,
+          "metavar": null,
+          "nargs": null,
+          "option_strings": [
+            "--after-fingerprint"
+          ],
+          "required": true,
+          "type": null
+        },
+        {
+          "action_class": "_StoreAction",
+          "choices": null,
+          "const": null,
+          "default": null,
+          "dest": "task_id",
+          "help": null,
+          "metavar": null,
+          "nargs": null,
+          "option_strings": [
+            "--task-id"
+          ],
+          "required": true,
+          "type": null
+        },
+        {
+          "action_class": "_StoreAction",
+          "choices": null,
+          "const": null,
+          "default": null,
+          "dest": "plan_doc",
+          "help": null,
+          "metavar": null,
+          "nargs": null,
+          "option_strings": [
+            "--plan-doc"
+          ],
+          "required": true,
+          "type": null
+        },
+        {
+          "action_class": "_StoreAction",
+          "choices": null,
+          "const": null,
+          "default": null,
+          "dest": "owner",
+          "help": null,
+          "metavar": null,
+          "nargs": null,
+          "option_strings": [
+            "--owner"
+          ],
+          "required": false,
+          "type": null
+        },
+        {
+          "action_class": "_StoreAction",
+          "choices": null,
+          "const": null,
+          "default": null,
+          "dest": "branch",
+          "help": null,
+          "metavar": null,
+          "nargs": null,
+          "option_strings": [
+            "--branch"
+          ],
+          "required": false,
+          "type": null
+        },
+        {
+          "action_class": "_StoreAction",
+          "choices": null,
+          "const": null,
+          "default": "operator",
+          "dest": "actor",
+          "help": null,
+          "metavar": null,
+          "nargs": null,
+          "option_strings": [
+            "--actor"
+          ],
+          "required": false,
+          "type": null
+        },
+        {
+          "action_class": "_StoreAction",
+          "choices": null,
+          "const": null,
+          "default": "worker",
+          "dest": "target",
+          "help": null,
+          "metavar": null,
+          "nargs": null,
+          "option_strings": [
+            "--target"
+          ],
+          "required": false,
+          "type": null
+        },
+        {
+          "action_class": "_StoreAction",
+          "choices": null,
+          "const": null,
+          "default": "{}",
+          "dest": "payload_json",
+          "help": null,
+          "metavar": null,
+          "nargs": null,
+          "option_strings": [
+            "--payload-json"
+          ],
+          "required": false,
+          "type": null
+        },
+        {
+          "action_class": "_StoreAction",
+          "choices": null,
+          "const": null,
+          "default": null,
+          "dest": "idempotency_key",
+          "help": null,
+          "metavar": null,
+          "nargs": null,
+          "option_strings": [
+            "--idempotency-key"
+          ],
+          "required": false,
+          "type": null
+        }
+      ],
+      "defaults": {
+        "handler": "coordinate.planning_cli.handle_task_adopt_record"
+      },
+      "help": "usage: coordinate task adopt-record [-h] --operation-id OPERATION_ID --input-fingerprint\n                                    INPUT_FINGERPRINT --before-fingerprint BEFORE_FINGERPRINT\n                                    --after-fingerprint AFTER_FINGERPRINT --task-id TASK_ID\n                                    --plan-doc PLAN_DOC [--owner OWNER] [--branch BRANCH]\n                                    [--actor ACTOR] [--target TARGET]\n                                    [--payload-json PAYLOAD_JSON]\n                                    [--idempotency-key IDEMPOTENCY_KEY]\n                                    workspace_id\n\npositional arguments:\n  workspace_id\n\noptions:\n  -h, --help            show this help message and exit\n  --operation-id OPERATION_ID\n  --input-fingerprint INPUT_FINGERPRINT\n  --before-fingerprint BEFORE_FINGERPRINT\n  --after-fingerprint AFTER_FINGERPRINT\n  --task-id TASK_ID\n  --plan-doc PLAN_DOC\n  --owner OWNER\n  --branch BRANCH\n  --actor ACTOR\n  --target TARGET\n  --payload-json PAYLOAD_JSON\n  --idempotency-key IDEMPOTENCY_KEY\n",
+      "path": [
+        "task",
+        "adopt-record"
+      ],
+      "prog": "coordinate task adopt-record"
     },
     {
       "actions": [
@@ -7647,7 +8282,8 @@
             "request",
             "job",
             "executor",
-            "capacity"
+            "capacity",
+            "usage"
           ],
           "const": null,
           "default": null,
@@ -7661,7 +8297,7 @@
         }
       ],
       "defaults": {},
-      "help": "usage: coordinate runtime [-h] {agent,request,job,executor,capacity} ...\n\npositional arguments:\n  {agent,request,job,executor,capacity}\n    agent               Register or heartbeat a runtime client\n    request             Submit a bridge request and create a pending agent job\n    job                 Claim or report runtime jobs\n    executor            Sync and inspect the executor identity catalog\n    capacity            Sync and inspect the capacity catalog\n\noptions:\n  -h, --help            show this help message and exit\n",
+      "help": "usage: coordinate runtime [-h] {agent,request,job,executor,capacity,usage} ...\n\npositional arguments:\n  {agent,request,job,executor,capacity,usage}\n    agent               Register or heartbeat a runtime client\n    request             Submit a bridge request and create a pending agent job\n    job                 Claim or report runtime jobs\n    executor            Sync and inspect the executor identity catalog\n    capacity            Sync and inspect the capacity catalog\n    usage               Task-scoped usage evidence and warning policy\n\noptions:\n  -h, --help            show this help message and exit\n",
       "path": [
         "runtime"
       ],
@@ -9294,6 +9930,225 @@
         "show"
       ],
       "prog": "coordinate runtime capacity show"
+    },
+    {
+      "actions": [
+        {
+          "action_class": "_HelpAction",
+          "choices": null,
+          "const": null,
+          "default": "==SUPPRESS==",
+          "dest": "help",
+          "help": "show this help message and exit",
+          "metavar": null,
+          "nargs": 0,
+          "option_strings": [
+            "-h",
+            "--help"
+          ],
+          "required": false,
+          "type": null
+        },
+        {
+          "action_class": "_SubParsersAction",
+          "choices": [
+            "policy-set",
+            "status"
+          ],
+          "const": null,
+          "default": null,
+          "dest": "runtime_usage_command",
+          "help": null,
+          "metavar": null,
+          "nargs": "A...",
+          "option_strings": [],
+          "required": false,
+          "type": null
+        }
+      ],
+      "defaults": {},
+      "help": "usage: coordinate runtime usage [-h] {policy-set,status} ...\n\npositional arguments:\n  {policy-set,status}\n    policy-set         Set the task-scoped usage warning policy revision\n    status             Show task-scoped usage aggregate, attempt ledger and warnings\n\noptions:\n  -h, --help           show this help message and exit\n",
+      "path": [
+        "runtime",
+        "usage"
+      ],
+      "prog": "coordinate runtime usage"
+    },
+    {
+      "actions": [
+        {
+          "action_class": "_HelpAction",
+          "choices": null,
+          "const": null,
+          "default": "==SUPPRESS==",
+          "dest": "help",
+          "help": "show this help message and exit",
+          "metavar": null,
+          "nargs": 0,
+          "option_strings": [
+            "-h",
+            "--help"
+          ],
+          "required": false,
+          "type": null
+        },
+        {
+          "action_class": "_StoreAction",
+          "choices": null,
+          "const": null,
+          "default": null,
+          "dest": "workspace_id",
+          "help": null,
+          "metavar": null,
+          "nargs": null,
+          "option_strings": [],
+          "required": true,
+          "type": null
+        },
+        {
+          "action_class": "_StoreAction",
+          "choices": null,
+          "const": null,
+          "default": null,
+          "dest": "task_id",
+          "help": null,
+          "metavar": null,
+          "nargs": null,
+          "option_strings": [
+            "--task-id"
+          ],
+          "required": true,
+          "type": null
+        },
+        {
+          "action_class": "_StoreAction",
+          "choices": null,
+          "const": null,
+          "default": null,
+          "dest": "revision",
+          "help": "Monotonic policy revision",
+          "metavar": null,
+          "nargs": null,
+          "option_strings": [
+            "--revision"
+          ],
+          "required": true,
+          "type": "builtins.int"
+        },
+        {
+          "action_class": "_StoreAction",
+          "choices": null,
+          "const": null,
+          "default": null,
+          "dest": "warn_observed_tokens",
+          "help": "Warn when an accepted attempt observes >= this many tokens",
+          "metavar": null,
+          "nargs": null,
+          "option_strings": [
+            "--warn-observed-tokens"
+          ],
+          "required": true,
+          "type": "builtins.int"
+        },
+        {
+          "action_class": "_StoreTrueAction",
+          "choices": null,
+          "const": true,
+          "default": false,
+          "dest": "disable",
+          "help": "Disable warnings for this policy revision",
+          "metavar": null,
+          "nargs": 0,
+          "option_strings": [
+            "--disable"
+          ],
+          "required": false,
+          "type": null
+        },
+        {
+          "action_class": "_StoreAction",
+          "choices": null,
+          "const": null,
+          "default": "operator",
+          "dest": "actor",
+          "help": null,
+          "metavar": null,
+          "nargs": null,
+          "option_strings": [
+            "--actor"
+          ],
+          "required": false,
+          "type": null
+        }
+      ],
+      "defaults": {
+        "handler": "coordinate.usage_cli.handle_runtime_usage_policy_set"
+      },
+      "help": "usage: coordinate runtime usage policy-set [-h] --task-id TASK_ID --revision REVISION\n                                           --warn-observed-tokens WARN_OBSERVED_TOKENS [--disable]\n                                           [--actor ACTOR]\n                                           workspace_id\n\npositional arguments:\n  workspace_id\n\noptions:\n  -h, --help            show this help message and exit\n  --task-id TASK_ID\n  --revision REVISION   Monotonic policy revision\n  --warn-observed-tokens WARN_OBSERVED_TOKENS\n                        Warn when an accepted attempt observes >= this many tokens\n  --disable             Disable warnings for this policy revision\n  --actor ACTOR\n",
+      "path": [
+        "runtime",
+        "usage",
+        "policy-set"
+      ],
+      "prog": "coordinate runtime usage policy-set"
+    },
+    {
+      "actions": [
+        {
+          "action_class": "_HelpAction",
+          "choices": null,
+          "const": null,
+          "default": "==SUPPRESS==",
+          "dest": "help",
+          "help": "show this help message and exit",
+          "metavar": null,
+          "nargs": 0,
+          "option_strings": [
+            "-h",
+            "--help"
+          ],
+          "required": false,
+          "type": null
+        },
+        {
+          "action_class": "_StoreAction",
+          "choices": null,
+          "const": null,
+          "default": null,
+          "dest": "workspace_id",
+          "help": null,
+          "metavar": null,
+          "nargs": null,
+          "option_strings": [],
+          "required": true,
+          "type": null
+        },
+        {
+          "action_class": "_StoreAction",
+          "choices": null,
+          "const": null,
+          "default": null,
+          "dest": "task_id",
+          "help": null,
+          "metavar": null,
+          "nargs": null,
+          "option_strings": [
+            "--task-id"
+          ],
+          "required": true,
+          "type": null
+        }
+      ],
+      "defaults": {
+        "handler": "coordinate.usage_cli.handle_runtime_usage_status"
+      },
+      "help": "usage: coordinate runtime usage status [-h] --task-id TASK_ID workspace_id\n\npositional arguments:\n  workspace_id\n\noptions:\n  -h, --help         show this help message and exit\n  --task-id TASK_ID\n",
+      "path": [
+        "runtime",
+        "usage",
+        "status"
+      ],
+      "prog": "coordinate runtime usage status"
     },
     {
       "actions": [
@@ -11469,6 +12324,175 @@
         "serve"
       ],
       "prog": "coordinate runtime-http serve"
+    },
+    {
+      "actions": [
+        {
+          "action_class": "_HelpAction",
+          "choices": null,
+          "const": null,
+          "default": "==SUPPRESS==",
+          "dest": "help",
+          "help": "show this help message and exit",
+          "metavar": null,
+          "nargs": 0,
+          "option_strings": [
+            "-h",
+            "--help"
+          ],
+          "required": false,
+          "type": null
+        },
+        {
+          "action_class": "_SubParsersAction",
+          "choices": [
+            "task",
+            "job"
+          ],
+          "const": null,
+          "default": null,
+          "dest": "trace_command",
+          "help": null,
+          "metavar": null,
+          "nargs": "A...",
+          "option_strings": [],
+          "required": false,
+          "type": null
+        }
+      ],
+      "defaults": {},
+      "help": "usage: coordinate trace [-h] {task,job} ...\n\npositional arguments:\n  {task,job}\n    task      Project the trace for a workspace task\n    job       Project the trace for one job\n\noptions:\n  -h, --help  show this help message and exit\n",
+      "path": [
+        "trace"
+      ],
+      "prog": "coordinate trace"
+    },
+    {
+      "actions": [
+        {
+          "action_class": "_HelpAction",
+          "choices": null,
+          "const": null,
+          "default": "==SUPPRESS==",
+          "dest": "help",
+          "help": "show this help message and exit",
+          "metavar": null,
+          "nargs": 0,
+          "option_strings": [
+            "-h",
+            "--help"
+          ],
+          "required": false,
+          "type": null
+        },
+        {
+          "action_class": "_StoreAction",
+          "choices": null,
+          "const": null,
+          "default": null,
+          "dest": "workspace_id",
+          "help": null,
+          "metavar": null,
+          "nargs": null,
+          "option_strings": [],
+          "required": true,
+          "type": null
+        },
+        {
+          "action_class": "_StoreAction",
+          "choices": null,
+          "const": null,
+          "default": null,
+          "dest": "task_id",
+          "help": null,
+          "metavar": null,
+          "nargs": null,
+          "option_strings": [],
+          "required": true,
+          "type": null
+        },
+        {
+          "action_class": "_StoreAction",
+          "choices": null,
+          "const": null,
+          "default": 20,
+          "dest": "history_limit",
+          "help": "Bounded related-job history (default 20, max 100)",
+          "metavar": null,
+          "nargs": null,
+          "option_strings": [
+            "--history-limit"
+          ],
+          "required": false,
+          "type": "builtins.int"
+        }
+      ],
+      "defaults": {
+        "handler": "coordinate.trace_cli.handle_trace_task"
+      },
+      "help": "usage: coordinate trace task [-h] [--history-limit HISTORY_LIMIT] workspace_id task_id\n\npositional arguments:\n  workspace_id\n  task_id\n\noptions:\n  -h, --help            show this help message and exit\n  --history-limit HISTORY_LIMIT\n                        Bounded related-job history (default 20, max 100)\n",
+      "path": [
+        "trace",
+        "task"
+      ],
+      "prog": "coordinate trace task"
+    },
+    {
+      "actions": [
+        {
+          "action_class": "_HelpAction",
+          "choices": null,
+          "const": null,
+          "default": "==SUPPRESS==",
+          "dest": "help",
+          "help": "show this help message and exit",
+          "metavar": null,
+          "nargs": 0,
+          "option_strings": [
+            "-h",
+            "--help"
+          ],
+          "required": false,
+          "type": null
+        },
+        {
+          "action_class": "_StoreAction",
+          "choices": null,
+          "const": null,
+          "default": null,
+          "dest": "job_id",
+          "help": null,
+          "metavar": null,
+          "nargs": null,
+          "option_strings": [],
+          "required": true,
+          "type": null
+        },
+        {
+          "action_class": "_StoreAction",
+          "choices": null,
+          "const": null,
+          "default": null,
+          "dest": "workspace_id",
+          "help": "Optional exact workspace guard",
+          "metavar": null,
+          "nargs": null,
+          "option_strings": [
+            "--workspace-id"
+          ],
+          "required": false,
+          "type": null
+        }
+      ],
+      "defaults": {
+        "handler": "coordinate.trace_cli.handle_trace_job"
+      },
+      "help": "usage: coordinate trace job [-h] [--workspace-id WORKSPACE_ID] job_id\n\npositional arguments:\n  job_id\n\noptions:\n  -h, --help            show this help message and exit\n  --workspace-id WORKSPACE_ID\n                        Optional exact workspace guard\n",
+      "path": [
+        "trace",
+        "job"
+      ],
+      "prog": "coordinate trace job"
     },
     {
       "actions": [

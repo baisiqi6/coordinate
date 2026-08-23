@@ -13,7 +13,13 @@ from types import MappingProxyType
 from typing import Any, Mapping
 
 from coordinate.db import Workspace, WorkspaceHostProfile
-from coordinate.execution_resources import ResourceIdentityError, normalize_worktree_path
+from coordinate.execution_resources import (
+    ResourceIdentityError,
+    classify_worktree_raw_path,
+    normalize_control_path_separators,
+    normalize_worktree_path,
+    resolve_allowlisted_worktree_path,
+)
 
 CONTRACT_VERSION = 1
 MAX_SCOPE_LEN = 256
@@ -189,8 +195,10 @@ def _map_foreign_path(
     if not _isabs(path_text):
         raise ContextError(f"path must be absolute under workspace: {path_text!r}")
 
-    control_root = control_root.rstrip("/")
-    normalized = path_text.replace("\\", "/")
+    # Same separator symmetry as classify_worktree_raw_path: the control root
+    # and the submitted path may use either separator.
+    control_root = normalize_control_path_separators(control_root).rstrip("/")
+    normalized = normalize_control_path_separators(path_text)
     segments = normalized.split("/")
     if _has_traversal(segments):
         raise ContextError(f"path contains traversal: {path_text!r}")
@@ -299,7 +307,20 @@ def resolve_execution_context_v1(
 
     workspace_path = _validate_path(profile.workspace_path, "workspace_path")
     if job_worktree_path is not None:
-        worktree_path = _map_foreign_path(workspace.path, workspace_path, job_worktree_path)
+        if classify_worktree_raw_path(workspace.path, job_worktree_path) == "control":
+            # Control branch: the raw path lies at or under the control
+            # workspace root, so it maps onto the canonical host workspace.
+            worktree_path = _map_foreign_path(workspace.path, workspace_path, job_worktree_path)
+        else:
+            # Host-native sibling branch: pure lexical validation against the
+            # allowlisted roots. This path is never resolved through the
+            # control host's filesystem (no Path.resolve/realpath/stat).
+            try:
+                worktree_path = resolve_allowlisted_worktree_path(
+                    job_worktree_path, profile.worktree_roots
+                )
+            except ResourceIdentityError as exc:
+                raise ContextError(f"worktree_path is invalid: {exc}") from exc
     else:
         worktree_path = workspace_path
     if not worktree_path:

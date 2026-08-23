@@ -507,6 +507,36 @@ class ValidatorDistributionParityTests(unittest.TestCase):
             "empty_acceptance": {"project": "p", "harness_root": ".", "updated_at": "2026-01-01", "items": [
                 _item_with(acceptance="")
             ]},
+            # I9 workflow.mode parity: the same canonical schema facts must
+            # hold in Coordinate-managed and standalone runtime layers.
+            "mode_only_ordinary_todo": {"project": "p", "harness_root": ".", "updated_at": "2026-01-01", "items": [
+                _item_with(workflow={"mode": "ordinary"})
+            ]},
+            "mode_only_high_risk_todo": {"project": "p", "harness_root": ".", "updated_at": "2026-01-01", "items": [
+                _item_with(workflow={"mode": "high-risk"})
+            ]},
+            "mode_with_status": {"project": "p", "harness_root": ".", "updated_at": "2026-01-01", "items": [
+                _item_with(workflow={"mode": "ordinary", "status": "todo", "updated_at": "2026-01-01T00:00:00Z"})
+            ]},
+            "invalid_workflow_mode": {"project": "p", "harness_root": ".", "updated_at": "2026-01-01", "items": [
+                _item_with(workflow={"mode": "medium"})
+            ]},
+            "null_workflow_mode": {"project": "p", "harness_root": ".", "updated_at": "2026-01-01", "items": [
+                _item_with(workflow={"mode": None})
+            ]},
+            "empty_workflow": {"project": "p", "harness_root": ".", "updated_at": "2026-01-01", "items": [
+                _item_with(workflow={})
+            ]},
+            "mode_only_on_doing": {"project": "p", "harness_root": ".", "updated_at": "2026-01-01", "items": [
+                _item_with(status="doing", owner="codex", selected_in_session="codex-1",
+                           workflow={"mode": "ordinary"})
+            ]},
+            "mode_with_fields_no_status": {"project": "p", "harness_root": ".", "updated_at": "2026-01-01", "items": [
+                _item_with(workflow={"mode": "ordinary", "branch": "main"})
+            ]},
+            "mode_with_updated_at_no_status": {"project": "p", "harness_root": ".", "updated_at": "2026-01-01", "items": [
+                _item_with(workflow={"mode": "ordinary", "updated_at": "2026-01-01T00:00:00Z"})
+            ]},
         }
         expected = json.loads(PARITY_FIXTURE.read_text(encoding="utf-8"))
         self.assertEqual(set(cases), set(expected))

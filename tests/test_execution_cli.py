@@ -314,6 +314,7 @@ class ExecutionCLIRegistrationTests(unittest.TestCase):
                 "operator",
                 "mcp",
                 "runtime-http",
+                "trace",
                 "serve",
             ],
         )
@@ -400,7 +401,14 @@ class ExecutionCLIRegistrationTests(unittest.TestCase):
 
         runtime = subcommands.choices["runtime"]
         runtime_leaves = list(runtime._subparsers._group_actions[0].choices.keys())
-        self.assertEqual(runtime_leaves, ["agent", "request", "job", "executor", "capacity"])
+        self.assertEqual(
+            runtime_leaves,
+            ["agent", "request", "job", "executor", "capacity", "usage"],
+        )
+
+        usage = runtime._subparsers._group_actions[0].choices["usage"]
+        usage_leaves = list(usage._subparsers._group_actions[0].choices.keys())
+        self.assertEqual(usage_leaves, ["policy-set", "status"])
 
 
 class ExecutionCLIDelegationTests(unittest.TestCase):

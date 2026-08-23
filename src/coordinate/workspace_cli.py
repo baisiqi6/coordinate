@@ -7,7 +7,7 @@ import sys
 from .agent_registry import parse_agents_toml
 from .audit import audit_workspace
 from .channel_binding_cli import register_workspace_channel_commands
-from .cli_support import open_connection, print_json
+from .cli_support import open_connection, open_readonly_connection, print_json
 from .db import (
     get_workspace,
     list_workspace_host_profiles,
@@ -30,6 +30,7 @@ from .reconcile import (
 
 # Compatibility aliases so handlers read like the originals.
 _conn = open_connection
+_readonly_conn = open_readonly_connection
 _print_json = print_json
 
 
@@ -52,7 +53,7 @@ def handle_workspace_add(args: argparse.Namespace) -> int:
 
 
 def handle_workspace_list(args: argparse.Namespace) -> int:
-    with _conn(args) as conn:
+    with _readonly_conn(args) as conn:
         workspaces = [workspace.to_dict() for workspace in list_workspaces(conn)]
     _print_json({"workspaces": workspaces})
     return 0
@@ -229,6 +230,12 @@ def handle_workspace_agent_sync(args: argparse.Namespace) -> int:
 
 def handle_workspace_host_profile_set(args: argparse.Namespace) -> int:
     metadata = json.loads(args.metadata_json) if args.metadata_json else {}
+    if args.clear_worktree_roots:
+        worktree_roots: list[str] | None = []
+    elif args.worktree_roots:
+        worktree_roots = list(args.worktree_roots)
+    else:
+        worktree_roots = None
     with _conn(args) as conn:
         profile = upsert_workspace_host_profile(
             conn,
@@ -241,13 +248,14 @@ def handle_workspace_host_profile_set(args: argparse.Namespace) -> int:
             coordinator_db_path=args.coordinator_db_path,
             shell=args.shell,
             metadata=metadata,
+            worktree_roots=worktree_roots,
         )
     _print_json({"result": profile.to_dict()})
     return 0
 
 
 def handle_workspace_host_profile_list(args: argparse.Namespace) -> int:
-    with _conn(args) as conn:
+    with _readonly_conn(args) as conn:
         profiles = list_workspace_host_profiles(conn, workspace_id=args.workspace_id)
     _print_json({"profiles": [profile.to_dict() for profile in profiles]})
     return 0
@@ -388,6 +396,30 @@ def register_workspace_commands(subcommands) -> None:
     workspace_host_set.add_argument("--coordinator-db-path")
     workspace_host_set.add_argument("--shell")
     workspace_host_set.add_argument("--metadata-json", default="{}")
+    # The sibling worktree root allowlist is the only None=preserve field:
+    # omitting both flags preserves the stored roots, so legacy automation can
+    # never silently clear them. Clearing requires the explicit flag below.
+    worktree_group = workspace_host_set.add_mutually_exclusive_group()
+    worktree_group.add_argument(
+        "--worktree-root",
+        action="append",
+        dest="worktree_roots",
+        metavar="PATH",
+        help=(
+            "Allowlist one host-absolute sibling worktree root (repeatable). "
+            "Omitted together with --clear-worktree-roots: existing roots are "
+            "preserved (None=preserve, unlike every other field here)."
+        ),
+    )
+    worktree_group.add_argument(
+        "--clear-worktree-roots",
+        action="store_true",
+        help=(
+            "Explicitly clear the sibling worktree root allowlist. Mutually "
+            "exclusive with --worktree-root; without either flag the stored "
+            "roots are preserved."
+        ),
+    )
     workspace_host_set.set_defaults(handler=handle_workspace_host_profile_set)
 
     workspace_host_list = workspace_host_sub.add_parser("list", help="List host execution profiles for a workspace")

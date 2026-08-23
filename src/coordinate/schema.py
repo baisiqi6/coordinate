@@ -7,7 +7,42 @@ from datetime import datetime, timezone
 from typing import Any
 
 
-SCHEMA_VERSION = 14
+SCHEMA_VERSION = 16
+
+
+class SchemaCompatibilityError(ValueError):
+    """Read-only query refused: DB schema is not exactly the current version."""
+
+
+def assert_schema_compatible(conn: sqlite3.Connection) -> None:
+    """Verify a connection's schema is exactly the current version, read-only.
+
+    Used by the strict read-only registry query path: legacy (< SCHEMA_VERSION)
+    and unknown (> SCHEMA_VERSION) schemas fail closed without any migration.
+    Only reads ``PRAGMA user_version`` and ``sqlite_master``; never mutates.
+    """
+    version = conn.execute("PRAGMA user_version").fetchone()[0]
+    if version != SCHEMA_VERSION:
+        raise SchemaCompatibilityError(
+            f"database schema version {version} is not supported; read-only "
+            f"queries require exactly {SCHEMA_VERSION} and never migrate "
+            "(legacy or unknown schemas fail closed)"
+        )
+    # Belt and suspenders: user_version alone is not schema identity. The
+    # registry tables the read-only queries read must exist, or the DB is not
+    # a current Coordinate database.
+    tables = {
+        row["name"]
+        for row in conn.execute(
+            "SELECT name FROM sqlite_master WHERE type = 'table'"
+        ).fetchall()
+    }
+    missing = sorted({"workspaces", "workspace_host_profiles"} - tables)
+    if missing:
+        raise SchemaCompatibilityError(
+            f"database is missing registry tables: {missing}; refusing "
+            "read-only query"
+        )
 
 
 def _table_columns(conn: sqlite3.Connection, table: str) -> set[str]:
@@ -268,6 +303,7 @@ def migrate(conn: sqlite3.Connection) -> None:
           coordinator_db_path TEXT,
           shell TEXT,
           metadata_json TEXT NOT NULL,
+          worktree_roots_json TEXT NOT NULL DEFAULT '[]',
           created_at TEXT NOT NULL,
           updated_at TEXT NOT NULL,
           PRIMARY KEY (workspace_id, host_id),
@@ -541,6 +577,84 @@ def migrate(conn: sqlite3.Connection) -> None:
             );
 
             PRAGMA user_version = 14;
+            COMMIT;
+            """
+            )
+        except Exception:
+            if conn.in_transaction:
+                conn.rollback()
+            raise
+
+    if starting_version < 15:
+        # P1-1: the ADD COLUMN and the version bump must commit atomically so
+        # a failure after the ALTER (but before the version update) rolls back
+        # both, leaving the file DB at v14 with the original rows untouched.
+        try:
+            conn.execute("BEGIN IMMEDIATE")
+            _add_column_if_missing(
+                conn,
+                "workspace_host_profiles",
+                "worktree_roots_json",
+                "TEXT NOT NULL DEFAULT '[]'",
+            )
+            conn.execute("PRAGMA user_version = 15")
+            conn.commit()
+        except Exception:
+            if conn.in_transaction:
+                conn.rollback()
+            raise
+
+    if starting_version < 16:
+        # Issue #12: typed managed usage evidence + task-scoped warning policy.
+        # The two CREATE TABLEs and the version bump must commit atomically so
+        # a failure mid-migration rolls back both, leaving a v15 file DB with
+        # byte-identical semantics. Both tables use ON DELETE RESTRICT for
+        # workspace/job retention (consistent with execution_attempt_leases);
+        # task_id is deliberately NOT a foreign key because task mirrors can be
+        # deleted while usage evidence and policy revisions must be retained.
+        try:
+            conn.executescript(
+                """
+            BEGIN IMMEDIATE;
+
+            CREATE TABLE IF NOT EXISTS job_attempt_usage (
+              job_id TEXT NOT NULL,
+              attempt_token INTEGER NOT NULL CHECK(attempt_token > 0),
+              workspace_id TEXT,
+              task_id TEXT,
+              evidence_json TEXT NOT NULL,
+              evidence_digest TEXT NOT NULL,
+              observed_tokens INTEGER,
+              provider_cost_microusd INTEGER,
+              completeness TEXT NOT NULL
+                CHECK(completeness IN ('complete', 'partial', 'unknown')),
+              terminal_event_id TEXT,
+              event_created INTEGER NOT NULL DEFAULT 0,
+              recorded_at TEXT NOT NULL,
+              PRIMARY KEY (job_id, attempt_token),
+              CHECK (observed_tokens IS NULL OR observed_tokens >= 0),
+              CHECK (provider_cost_microusd IS NULL OR provider_cost_microusd >= 0),
+              FOREIGN KEY(job_id) REFERENCES jobs(id) ON DELETE RESTRICT,
+              FOREIGN KEY(workspace_id) REFERENCES workspaces(id) ON DELETE RESTRICT,
+              FOREIGN KEY(terminal_event_id) REFERENCES events(id) ON DELETE SET NULL
+            );
+            CREATE INDEX IF NOT EXISTS idx_job_attempt_usage_scope
+              ON job_attempt_usage(workspace_id, task_id, recorded_at);
+
+            CREATE TABLE IF NOT EXISTS task_usage_warning_policies (
+              workspace_id TEXT NOT NULL,
+              task_id TEXT NOT NULL,
+              revision INTEGER NOT NULL CHECK(revision > 0),
+              observed_tokens_threshold INTEGER NOT NULL
+                CHECK(observed_tokens_threshold > 0),
+              enabled INTEGER NOT NULL DEFAULT 1,
+              created_at TEXT NOT NULL,
+              updated_at TEXT NOT NULL,
+              PRIMARY KEY (workspace_id, task_id),
+              FOREIGN KEY(workspace_id) REFERENCES workspaces(id) ON DELETE RESTRICT
+            );
+
+            PRAGMA user_version = 16;
             COMMIT;
             """
             )

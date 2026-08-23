@@ -3,14 +3,17 @@ import tempfile
 import threading
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 from coordinate.db import (
     append_event,
+    assert_schema_compatible,
     create_delivery,
     create_job,
     create_decision_request,
     create_task_group,
     connect,
+    connect_readonly,
     get_agent_discord_id,
     get_workspace,
     get_workspace_host_profile,
@@ -23,7 +26,9 @@ from coordinate.db import (
     list_workspace_host_profiles,
     list_workspaces,
     migrate,
+    ReadOnlyConnectionError,
     row_to_dict,
+    SchemaCompatibilityError,
     set_workspace_agent as _set_workspace_agent,
     upsert_workspace_host_profile,
     upsert_runner_profile,
@@ -54,7 +59,7 @@ class DatabaseTests(unittest.TestCase):
         }
         user_version = conn.execute("PRAGMA user_version").fetchone()[0]
 
-        self.assertEqual(user_version, 14)
+        self.assertEqual(user_version, 16)
         self.assertTrue(
             {
                 "workspaces",
@@ -150,7 +155,7 @@ class DatabaseTests(unittest.TestCase):
         migrate(conn)
 
         self.assertEqual(
-            conn.execute("PRAGMA user_version").fetchone()[0], 14
+            conn.execute("PRAGMA user_version").fetchone()[0], 16
         )
         # Active tasks must still be unique.
         conn.execute(
@@ -214,7 +219,7 @@ class DatabaseTests(unittest.TestCase):
         )
         migrate(conn)
 
-        self.assertEqual(conn.execute("PRAGMA user_version").fetchone()[0], 14)
+        self.assertEqual(conn.execute("PRAGMA user_version").fetchone()[0], 16)
         indexes = {
             row["name"]: row["sql"]
             for row in conn.execute(
@@ -279,7 +284,7 @@ class DatabaseTests(unittest.TestCase):
     def test_migration_creates_split_operations_table_v11(self):
         """v11 adds the split_operations ledger and its supporting indexes."""
         conn = initialize(":memory:")
-        self.assertEqual(conn.execute("PRAGMA user_version").fetchone()[0], 14)
+        self.assertEqual(conn.execute("PRAGMA user_version").fetchone()[0], 16)
 
         columns = {
             row["name"]
@@ -368,7 +373,7 @@ class DatabaseTests(unittest.TestCase):
 
         migrate(conn)
 
-        self.assertEqual(conn.execute("PRAGMA user_version").fetchone()[0], 14)
+        self.assertEqual(conn.execute("PRAGMA user_version").fetchone()[0], 16)
         rows = conn.execute("SELECT COUNT(*) FROM split_operations").fetchone()[0]
         self.assertEqual(rows, 0)
         # Existing workspace data survives.
@@ -957,9 +962,9 @@ class SchemaV13Tests(unittest.TestCase):
         conn.executescript(self._v12_schema_script())
         conn.commit()
         migrate(conn)
-        self.assertEqual(conn.execute("PRAGMA user_version").fetchone()[0], 14)
+        self.assertEqual(conn.execute("PRAGMA user_version").fetchone()[0], 16)
         migrate(conn)
-        self.assertEqual(conn.execute("PRAGMA user_version").fetchone()[0], 14)
+        self.assertEqual(conn.execute("PRAGMA user_version").fetchone()[0], 16)
 
     def test_failed_v13_migration_rolls_back_to_v12(self):
         conn = connect(":memory:")
@@ -1076,7 +1081,7 @@ class SchemaV14Tests(unittest.TestCase):
 
     def test_v14_channel_bindings_table_present(self):
         conn = initialize(":memory:")
-        self.assertEqual(conn.execute("PRAGMA user_version").fetchone()[0], 14)
+        self.assertEqual(conn.execute("PRAGMA user_version").fetchone()[0], 16)
         sql = conn.execute(
             "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'channel_bindings'"
         ).fetchone()["sql"]
@@ -1090,7 +1095,7 @@ class SchemaV14Tests(unittest.TestCase):
         conn = self._v13_fresh_conn()
         self.assertEqual(conn.execute("PRAGMA user_version").fetchone()[0], 13)
         migrate(conn)
-        self.assertEqual(conn.execute("PRAGMA user_version").fetchone()[0], 14)
+        self.assertEqual(conn.execute("PRAGMA user_version").fetchone()[0], 16)
         tables = {
             row["name"]
             for row in conn.execute(
@@ -1102,9 +1107,9 @@ class SchemaV14Tests(unittest.TestCase):
     def test_v14_repeated_migration_is_idempotent(self):
         conn = self._v13_fresh_conn()
         migrate(conn)
-        self.assertEqual(conn.execute("PRAGMA user_version").fetchone()[0], 14)
+        self.assertEqual(conn.execute("PRAGMA user_version").fetchone()[0], 16)
         migrate(conn)
-        self.assertEqual(conn.execute("PRAGMA user_version").fetchone()[0], 14)
+        self.assertEqual(conn.execute("PRAGMA user_version").fetchone()[0], 16)
 
     def test_composite_pk_blocks_second_workspace_for_channel(self):
         conn = initialize(":memory:")
@@ -1137,6 +1142,933 @@ class SchemaV14Tests(unittest.TestCase):
         )
         with self.assertRaises(sqlite3.IntegrityError):
             conn.execute("DELETE FROM workspaces WHERE id = ?", ("ws-a",))
+
+
+
+
+class SchemaV15Tests(unittest.TestCase):
+    """Issue #18: v15 adds workspace_host_profiles.worktree_roots_json."""
+
+    _V14_PROFILES_DDL = """
+        CREATE TABLE workspace_host_profiles (
+          workspace_id TEXT NOT NULL,
+          host_id TEXT NOT NULL,
+          workspace_path TEXT NOT NULL,
+          harness_root TEXT,
+          harnessctl_path TEXT,
+          coordinator_cli_path TEXT,
+          coordinator_db_path TEXT,
+          shell TEXT,
+          metadata_json TEXT NOT NULL,
+          created_at TEXT NOT NULL,
+          updated_at TEXT NOT NULL,
+          PRIMARY KEY (workspace_id, host_id),
+          FOREIGN KEY(workspace_id) REFERENCES workspaces(id) ON DELETE CASCADE
+        );
+    """
+
+    def _v14_fresh_conn(self) -> sqlite3.Connection:
+        """A connection migrated to v15, then rebuilt as a pre-v15 file DB."""
+        conn = initialize(":memory:")
+        conn.execute("DROP TABLE workspace_host_profiles")
+        conn.executescript(self._V14_PROFILES_DDL)
+        conn.execute("PRAGMA user_version = 14")
+        conn.commit()
+        return conn
+
+    def test_v15_fresh_db_has_column_and_version(self):
+        conn = initialize(":memory:")
+        self.assertEqual(conn.execute("PRAGMA user_version").fetchone()[0], 16)
+        columns = {
+            row["name"]
+            for row in conn.execute(
+                "PRAGMA table_info(workspace_host_profiles)"
+            ).fetchall()
+        }
+        self.assertIn("worktree_roots_json", columns)
+
+    def test_v14_to_v15_migration_backfills_empty_allowlist(self):
+        conn = self._v14_fresh_conn()
+        now = "2026-01-01T00:00:00Z"
+        conn.execute(
+            "INSERT INTO workspaces (id, name, path, harness_root, created_at, updated_at) "
+            "VALUES (?, ?, ?, ?, ?, ?)",
+            ("demo", "Demo", "/ws", "/ws/docs", now, now),
+        )
+        conn.execute(
+            "INSERT INTO workspace_host_profiles "
+            "(workspace_id, host_id, workspace_path, metadata_json, created_at, updated_at) "
+            "VALUES (?, ?, ?, ?, ?, ?)",
+            ("demo", "mac", "/ws", "{}", now, now),
+        )
+        conn.commit()
+        self.assertEqual(conn.execute("PRAGMA user_version").fetchone()[0], 14)
+        migrate(conn)
+        self.assertEqual(conn.execute("PRAGMA user_version").fetchone()[0], 16)
+        row = conn.execute(
+            "SELECT worktree_roots_json FROM workspace_host_profiles WHERE host_id = 'mac'"
+        ).fetchone()
+        self.assertEqual(row["worktree_roots_json"], "[]")
+        profile = get_workspace_host_profile(conn, workspace_id="demo", host_id="mac")
+        self.assertEqual(profile.worktree_roots, ())
+
+    def test_v15_repeated_migration_is_idempotent(self):
+        conn = self._v14_fresh_conn()
+        migrate(conn)
+        self.assertEqual(conn.execute("PRAGMA user_version").fetchone()[0], 16)
+        migrate(conn)
+        self.assertEqual(conn.execute("PRAGMA user_version").fetchone()[0], 16)
+
+    def test_failed_v15_migration_preserves_version_and_data(self):
+        conn = self._v14_fresh_conn()
+        now = "2026-01-01T00:00:00Z"
+        conn.execute(
+            "INSERT INTO workspaces (id, name, path, harness_root, created_at, updated_at) "
+            "VALUES (?, ?, ?, ?, ?, ?)",
+            ("demo", "Demo", "/ws", "/ws/docs", now, now),
+        )
+        conn.execute(
+            "INSERT INTO workspace_host_profiles "
+            "(workspace_id, host_id, workspace_path, metadata_json, created_at, updated_at) "
+            "VALUES (?, ?, ?, ?, ?, ?)",
+            ("demo", "mac", "/ws", "{}", now, now),
+        )
+        conn.commit()
+        with patch("coordinate.schema._add_column_if_missing", side_effect=RuntimeError("boom")):
+            with self.assertRaisesRegex(RuntimeError, "boom"):
+                migrate(conn)
+        self.assertEqual(conn.execute("PRAGMA user_version").fetchone()[0], 14)
+        rows = conn.execute("SELECT COUNT(*) FROM workspace_host_profiles").fetchone()[0]
+        self.assertEqual(rows, 1)
+        columns = {
+            row["name"]
+            for row in conn.execute(
+                "PRAGMA table_info(workspace_host_profiles)"
+            ).fetchall()
+        }
+        self.assertNotIn("worktree_roots_json", columns)
+
+
+    def test_failed_v15_migration_after_column_add_rolls_back(self):
+        """P1-1: a failure AFTER the real ADD COLUMN but BEFORE the version
+        bump must roll back both, leaving the file DB at v14 with the original
+        row intact and no column."""
+        import coordinate.schema as schema_module
+
+        conn = self._v14_fresh_conn()
+        now = "2026-01-01T00:00:00Z"
+        conn.execute(
+            "INSERT INTO workspaces (id, name, path, harness_root, created_at, updated_at) "
+            "VALUES (?, ?, ?, ?, ?, ?)",
+            ("demo", "Demo", "/ws", "/ws/docs", now, now),
+        )
+        conn.execute(
+            "INSERT INTO workspace_host_profiles "
+            "(workspace_id, host_id, workspace_path, metadata_json, created_at, updated_at) "
+            "VALUES (?, ?, ?, ?, ?, ?)",
+            ("demo", "mac", "/ws", '{"note":"keep"}', now, now),
+        )
+        conn.commit()
+
+        original_add_column = schema_module._add_column_if_missing
+
+        def _boom_after_alter(conn_, table, column, definition):
+            original_add_column(conn_, table, column, definition)
+            raise RuntimeError("boom after alter")
+
+        with patch(
+            "coordinate.schema._add_column_if_missing", side_effect=_boom_after_alter
+        ):
+            with self.assertRaisesRegex(RuntimeError, "boom after alter"):
+                migrate(conn)
+
+        self.assertEqual(conn.execute("PRAGMA user_version").fetchone()[0], 14)
+        columns = {
+            row["name"]
+            for row in conn.execute(
+                "PRAGMA table_info(workspace_host_profiles)"
+            ).fetchall()
+        }
+        self.assertNotIn("worktree_roots_json", columns)
+        row = conn.execute(
+            "SELECT workspace_path, metadata_json FROM workspace_host_profiles "
+            "WHERE host_id = 'mac'"
+        ).fetchone()
+        self.assertEqual(row["workspace_path"], "/ws")
+        self.assertEqual(row["metadata_json"], '{"note":"keep"}')
+        # The migration is still rerunnable from the same v14 state.
+        migrate(conn)
+        self.assertEqual(conn.execute("PRAGMA user_version").fetchone()[0], 16)
+        columns = {
+            row["name"]
+            for row in conn.execute(
+                "PRAGMA table_info(workspace_host_profiles)"
+            ).fetchall()
+        }
+        self.assertIn("worktree_roots_json", columns)
+        row = conn.execute(
+            "SELECT workspace_path, metadata_json FROM workspace_host_profiles "
+            "WHERE host_id = 'mac'"
+        ).fetchone()
+        self.assertEqual(row["workspace_path"], "/ws")
+        self.assertEqual(row["metadata_json"], '{"note":"keep"}')
+
+    def test_preserve_revalidates_roots_against_new_workspace_path(self):
+        """P1-2: None=preserve still runs the stored roots through the same
+        validator against the NEW workspace_path; a flavour-changing update
+        fails BEFORE any DB mutation."""
+        conn = initialize(":memory:")
+        upsert_workspace(
+            conn,
+            workspace_id="demo",
+            name="Demo",
+            path="/ws",
+            harness_root="/ws/docs",
+        )
+        upsert_workspace_host_profile(
+            conn,
+            workspace_id="demo",
+            host_id="mac",
+            workspace_path="/ws",
+            harness_root="/ws/docs",
+            worktree_roots=["/ws/worktrees/a"],
+        )
+        before = tuple(
+            conn.execute(
+                "SELECT * FROM workspace_host_profiles WHERE host_id = 'mac'"
+            ).fetchone()
+        )
+        with self.assertRaisesRegex(ValueError, "flavour"):
+            upsert_workspace_host_profile(
+                conn,
+                workspace_id="demo",
+                host_id="mac",
+                workspace_path="C:\\Users\\Admin\\projects\\multinexus",
+                harness_root="C:\\Users\\Admin\\projects\\multinexus\\harness",
+            )
+        after = tuple(
+            conn.execute(
+                "SELECT * FROM workspace_host_profiles WHERE host_id = 'mac'"
+            ).fetchone()
+        )
+        self.assertEqual(after, before)
+
+    def test_preserve_revalidates_same_flavour_roots_ok(self):
+        """P1-2 positive: preserve keeps working when the new workspace_path
+        keeps the same path flavour."""
+        conn = initialize(":memory:")
+        upsert_workspace(
+            conn,
+            workspace_id="demo",
+            name="Demo",
+            path="/ws",
+            harness_root="/ws/docs",
+        )
+        upsert_workspace_host_profile(
+            conn,
+            workspace_id="demo",
+            host_id="mac",
+            workspace_path="/ws",
+            harness_root="/ws/docs",
+            worktree_roots=["/ws/worktrees/a"],
+        )
+        updated = upsert_workspace_host_profile(
+            conn,
+            workspace_id="demo",
+            host_id="mac",
+            workspace_path="/ws/other",
+            harness_root="/ws/docs",
+        )
+        self.assertEqual(updated.worktree_roots, ("/ws/worktrees/a",))
+        self.assertEqual(updated.workspace_path, "/ws/other")
+
+    def test_stored_cross_flavour_roots_fail_closed_on_read(self):
+        """Corrupted stored state: roots whose flavour no longer matches the
+        row's workspace_path must fail closed on read."""
+        conn = initialize(":memory:")
+        upsert_workspace(
+            conn,
+            workspace_id="demo",
+            name="Demo",
+            path="/ws",
+            harness_root="/ws/docs",
+        )
+        upsert_workspace_host_profile(
+            conn,
+            workspace_id="demo",
+            host_id="mac",
+            workspace_path="/ws",
+            harness_root="/ws/docs",
+            worktree_roots=["/ws/worktrees/a"],
+        )
+        conn.execute(
+            "UPDATE workspace_host_profiles SET workspace_path = "
+            "'C:\\Users\\Admin\\projects\\multinexus' WHERE host_id = 'mac'"
+        )
+        conn.commit()
+        with self.assertRaisesRegex(ValueError, "flavour"):
+            get_workspace_host_profile(conn, workspace_id="demo", host_id="mac")
+
+    def test_stored_cross_flavour_roots_windows_side_fails_closed_on_read(self):
+        conn = initialize(":memory:")
+        upsert_workspace(
+            conn,
+            workspace_id="demo",
+            name="Demo",
+            path="/ws",
+            harness_root="/ws/docs",
+        )
+        upsert_workspace_host_profile(
+            conn,
+            workspace_id="demo",
+            host_id="mac",
+            workspace_path="C:\\Users\\Admin\\projects\\multinexus",
+            harness_root="C:\\Users\\Admin\\projects\\multinexus\\harness",
+            worktree_roots=["C:\\Users\\Admin\\projects\\WorkTrees"],
+        )
+        conn.execute(
+            "UPDATE workspace_host_profiles SET workspace_path = '/ws' "
+            "WHERE host_id = 'mac'"
+        )
+        conn.commit()
+        with self.assertRaisesRegex(ValueError, "flavour"):
+            get_workspace_host_profile(conn, workspace_id="demo", host_id="mac")
+    def test_profile_roundtrip_preserves_roots(self):
+        conn = initialize(":memory:")
+        upsert_workspace(
+            conn,
+            workspace_id="demo",
+            name="Demo",
+            path="/ws",
+            harness_root="/ws/docs",
+        )
+        profile = upsert_workspace_host_profile(
+            conn,
+            workspace_id="demo",
+            host_id="mac",
+            workspace_path="/ws",
+            harness_root="/ws/docs",
+            worktree_roots=["/ws/worktrees/a", "/ws/worktrees/b"],
+        )
+        loaded = get_workspace_host_profile(conn, workspace_id="demo", host_id="mac")
+        self.assertIsNotNone(loaded)
+        self.assertEqual(loaded.worktree_roots, ("/ws/worktrees/a", "/ws/worktrees/b"))
+        self.assertEqual(loaded.to_dict(), profile.to_dict())
+        self.assertEqual(
+            loaded.to_dict()["worktree_roots"],
+            ["/ws/worktrees/a", "/ws/worktrees/b"],
+        )
+
+
+class SchemaV16Tests(unittest.TestCase):
+    """Issue #12: v16 adds job_attempt_usage + task_usage_warning_policies."""
+
+    def _v15_fresh_conn(self) -> sqlite3.Connection:
+        """A v16-migrated connection rebuilt as a pre-v16 file DB."""
+        conn = initialize(":memory:")
+        for table in (
+            "task_usage_warning_policies",
+            "job_attempt_usage",
+        ):
+            conn.execute(f"DROP TABLE IF EXISTS {table}")
+        conn.execute("PRAGMA user_version = 15")
+        conn.commit()
+        return conn
+
+    def test_v16_fresh_db_has_tables_and_version(self):
+        conn = initialize(":memory:")
+        self.assertEqual(conn.execute("PRAGMA user_version").fetchone()[0], 16)
+        tables = {
+            row["name"]
+            for row in conn.execute(
+                "SELECT name FROM sqlite_master WHERE type = 'table'"
+            ).fetchall()
+        }
+        self.assertIn("job_attempt_usage", tables)
+        self.assertIn("task_usage_warning_policies", tables)
+
+    def test_job_attempt_usage_columns_and_keys(self):
+        conn = initialize(":memory:")
+        columns = {
+            row["name"]
+            for row in conn.execute("PRAGMA table_info(job_attempt_usage)").fetchall()
+        }
+        self.assertIn("job_id", columns)
+        self.assertIn("attempt_token", columns)
+        self.assertIn("workspace_id", columns)
+        self.assertIn("task_id", columns)
+        self.assertIn("evidence_json", columns)
+        self.assertIn("evidence_digest", columns)
+        self.assertIn("observed_tokens", columns)
+        self.assertIn("provider_cost_microusd", columns)
+        self.assertIn("completeness", columns)
+        self.assertIn("terminal_event_id", columns)
+        self.assertIn("event_created", columns)
+        self.assertIn("recorded_at", columns)
+        sql = conn.execute(
+            "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'job_attempt_usage'"
+        ).fetchone()[0]
+        self.assertIn("PRIMARY KEY (job_id, attempt_token)", sql)
+        self.assertIn("FOREIGN KEY(job_id) REFERENCES jobs(id) ON DELETE RESTRICT", sql)
+        self.assertIn("FOREIGN KEY(workspace_id) REFERENCES workspaces(id) ON DELETE RESTRICT", sql)
+        self.assertIn("FOREIGN KEY(terminal_event_id) REFERENCES events(id) ON DELETE SET NULL", sql)
+
+    def test_warning_policy_columns_and_keys(self):
+        conn = initialize(":memory:")
+        columns = {
+            row["name"]
+            for row in conn.execute(
+                "PRAGMA table_info(task_usage_warning_policies)"
+            ).fetchall()
+        }
+        self.assertIn("workspace_id", columns)
+        self.assertIn("task_id", columns)
+        self.assertIn("revision", columns)
+        self.assertIn("observed_tokens_threshold", columns)
+        self.assertIn("enabled", columns)
+        self.assertIn("created_at", columns)
+        self.assertIn("updated_at", columns)
+        sql = conn.execute(
+            "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'task_usage_warning_policies'"
+        ).fetchone()[0]
+        self.assertIn("PRIMARY KEY (workspace_id, task_id)", sql)
+        self.assertIn("FOREIGN KEY(workspace_id) REFERENCES workspaces(id) ON DELETE RESTRICT", sql)
+
+    def test_v15_to_v16_migration_creates_tables(self):
+        conn = self._v15_fresh_conn()
+        self.assertEqual(conn.execute("PRAGMA user_version").fetchone()[0], 15)
+        migrate(conn)
+        self.assertEqual(conn.execute("PRAGMA user_version").fetchone()[0], 16)
+        tables = {
+            row["name"]
+            for row in conn.execute(
+                "SELECT name FROM sqlite_master WHERE type = 'table'"
+            ).fetchall()
+        }
+        self.assertIn("job_attempt_usage", tables)
+        self.assertIn("task_usage_warning_policies", tables)
+
+    def test_v16_repeated_migration_is_idempotent(self):
+        conn = self._v15_fresh_conn()
+        migrate(conn)
+        self.assertEqual(conn.execute("PRAGMA user_version").fetchone()[0], 16)
+        migrate(conn)
+        self.assertEqual(conn.execute("PRAGMA user_version").fetchone()[0], 16)
+
+    def test_failed_v16_migration_rolls_back_to_v15(self):
+        """A failure mid-migration must roll back both tables AND the version
+        bump, leaving the v15 file DB byte-semantically intact and rerunnable.
+        The injected failure lands AFTER both CREATE TABLEs and the version
+        bump but BEFORE COMMIT — proving atomicity of the whole block."""
+        import tempfile
+
+        import coordinate.schema as schema_module
+
+        class _BoomAfterVersionBump(sqlite3.Connection):
+            def executescript(self, script):
+                if "job_attempt_usage" in script:
+                    script = script.replace(
+                        "PRAGMA user_version = 16;\n            COMMIT;",
+                        "PRAGMA user_version = 16;\n            SELECT broken_zzz;",
+                    )
+                return super().executescript(script)
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            db_path = f"{tmpdir}/v15.db"
+            conn = initialize(db_path)
+            conn.close()
+            # Downgrade the migrated file to v15 semantics: drop the new tables.
+            downgrade = sqlite3.connect(db_path)
+            downgrade.execute("DROP TABLE task_usage_warning_policies")
+            downgrade.execute("DROP TABLE job_attempt_usage")
+            downgrade.execute("PRAGMA user_version = 15")
+            now = "2026-01-01T00:00:00Z"
+            downgrade.execute(
+                "INSERT INTO workspaces (id, name, path, harness_root, created_at, updated_at) "
+                "VALUES (?, ?, ?, ?, ?, ?)",
+                ("demo", "Demo", "/ws", "/ws/docs", now, now),
+            )
+            downgrade.commit()
+            downgrade.close()
+
+            conn = sqlite3.connect(db_path, factory=_BoomAfterVersionBump)
+            conn.row_factory = sqlite3.Row
+            self.assertEqual(conn.execute("PRAGMA user_version").fetchone()[0], 15)
+            with self.assertRaisesRegex(sqlite3.OperationalError, "broken_zzz"):
+                schema_module.migrate(conn)
+            if conn.in_transaction:
+                conn.rollback()
+            conn.close()
+
+            verify = sqlite3.connect(db_path)
+            verify.row_factory = sqlite3.Row
+            self.assertEqual(verify.execute("PRAGMA user_version").fetchone()[0], 15)
+            tables = {
+                row["name"]
+                for row in verify.execute(
+                    "SELECT name FROM sqlite_master WHERE type = 'table'"
+                ).fetchall()
+            }
+            self.assertNotIn("job_attempt_usage", tables)
+            self.assertNotIn("task_usage_warning_policies", tables)
+            rows = verify.execute("SELECT COUNT(*) FROM workspaces").fetchone()[0]
+            self.assertEqual(rows, 1)
+            verify.close()
+            # Rerunnable from the same v15 state.
+            migrate(initialize(db_path))
+            final = sqlite3.connect(db_path)
+            final.row_factory = sqlite3.Row
+            self.assertEqual(final.execute("PRAGMA user_version").fetchone()[0], 16)
+            tables = {
+                row["name"]
+                for row in final.execute(
+                    "SELECT name FROM sqlite_master WHERE type = 'table'"
+                ).fetchall()
+            }
+            self.assertIn("job_attempt_usage", tables)
+            self.assertIn("task_usage_warning_policies", tables)
+            final.close()
+
+    def test_usage_rows_restrict_job_delete(self):
+        """RESTRICT retention: a job with an attempt usage row cannot be deleted."""
+        conn = initialize(":memory:")
+        from coordinate.db import create_job, get_job
+
+        now = "2026-01-01T00:00:00Z"
+        conn.execute(
+            "INSERT INTO workspaces (id, name, path, harness_root, created_at, updated_at) "
+            "VALUES (?, ?, ?, ?, ?, ?)",
+            ("demo", "Demo", "/ws", "/ws/docs", now, now),
+        )
+        conn.execute(
+            "INSERT INTO runner_profiles (id, name, runner_type, command, working_directory_strategy, env_json, created_at, updated_at) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+            ("rp", "rp", "agentd", "", "current_dir", "{}", now, now),
+        )
+        job = create_job(
+            conn,
+            workspace_id="demo",
+            task_id=None,
+            runner_profile_id="rp",
+            payload={},
+        )
+        conn.execute(
+            """
+            INSERT INTO job_attempt_usage (
+              job_id, attempt_token, workspace_id, task_id, evidence_json,
+              evidence_digest, observed_tokens, provider_cost_microusd, completeness,
+              terminal_event_id, event_created, recorded_at
+            )
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, 1, ?)
+            """,
+            (job["id"], 1, "demo", None, "{}", "digest", 1, 1, "complete", now),
+        )
+        conn.commit()
+        with self.assertRaises(sqlite3.IntegrityError):
+            conn.execute("DELETE FROM jobs WHERE id = ?", (job["id"],))
+
+    def test_policy_rows_restrict_workspace_delete(self):
+        """RESTRICT retention: a workspace with a policy row cannot be deleted."""
+        conn = initialize(":memory:")
+        now = "2026-01-01T00:00:00Z"
+        conn.execute(
+            "INSERT INTO workspaces (id, name, path, harness_root, created_at, updated_at) "
+            "VALUES (?, ?, ?, ?, ?, ?)",
+            ("demo", "Demo", "/ws", "/ws/docs", now, now),
+        )
+        conn.execute(
+            """
+            INSERT INTO task_usage_warning_policies (
+              workspace_id, task_id, revision, observed_tokens_threshold, enabled,
+              created_at, updated_at
+            )
+            VALUES (?, ?, ?, ?, ?, ?, ?)
+            """,
+            ("demo", "task-1", 1, 100, 1, now, now),
+        )
+        conn.commit()
+        with self.assertRaises(sqlite3.IntegrityError):
+            conn.execute("DELETE FROM workspaces WHERE id = ?", ("demo",))
+
+
+class ReadOnlyConnectionTests(unittest.TestCase):
+    """Strict read-only registry query path: mode=ro + query_only=ON + exact
+    schema gate. Zero mutation is proven by DB bytes (primary), mtime
+    (auxiliary, same-platform stable), and sidecar absence (discrete fact)."""
+
+    def _snapshot(self, db_path: str) -> dict[str, object]:
+        p = Path(db_path)
+        return {
+            "bytes": p.read_bytes() if p.exists() else None,
+            "mtime_ns": p.stat().st_mtime_ns if p.exists() else None,
+            "journal": Path(f"{db_path}-journal").exists(),
+            "wal": Path(f"{db_path}-wal").exists(),
+            "shm": Path(f"{db_path}-shm").exists(),
+        }
+
+    def _assert_zero_mutation(self, before: dict[str, object], after: dict[str, object]) -> None:
+        self.assertEqual(after["bytes"], before["bytes"], "DB bytes changed")
+        self.assertEqual(after["mtime_ns"], before["mtime_ns"], "DB mtime changed")
+        self.assertFalse(after["journal"] or after["wal"] or after["shm"], "sidecar created")
+
+    def _assert_sidecars_absent(self, db_path: str) -> None:
+        for suffix in ("-journal", "-wal", "-shm"):
+            self.assertFalse(Path(f"{db_path}{suffix}").exists(), f"unexpected sidecar {suffix}")
+
+    # T1: missing DB fails closed with zero file creation.
+    def test_connect_readonly_missing_db_fails_closed(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            missing_parent = str(Path(tmp) / "missing" / "coordinator.sqlite3")
+            with self.assertRaises(ReadOnlyConnectionError):
+                connect_readonly(missing_parent)
+            self.assertFalse(Path(missing_parent).exists())
+            self.assertFalse(Path(tmp).joinpath("missing").exists())
+            self._assert_sidecars_absent(missing_parent)
+
+            absent_file = str(Path(tmp) / "absent.sqlite3")
+            with self.assertRaises(ReadOnlyConnectionError):
+                connect_readonly(absent_file)
+            self.assertFalse(Path(absent_file).exists())
+            self._assert_sidecars_absent(absent_file)
+
+    def test_connect_readonly_rejects_memory(self) -> None:
+        with self.assertRaises(ReadOnlyConnectionError):
+            connect_readonly(":memory:")
+
+    # T2: current-schema queries succeed, file untouched.
+    def test_connect_readonly_current_schema_queries_ok(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            db_path = str(Path(tmp) / "coordinator.sqlite3")
+            conn = initialize(db_path)
+            upsert_workspace(
+                conn, workspace_id="demo", name="Demo", path="/ws", harness_root="/ws/docs"
+            )
+            upsert_workspace_host_profile(
+                conn, workspace_id="demo", host_id="mac", workspace_path="/ws"
+            )
+            conn.close()
+
+            ro = connect_readonly(db_path)
+            try:
+                assert_schema_compatible(ro)
+                self.assertEqual(ro.execute("PRAGMA query_only").fetchone()[0], 1)
+                self.assertEqual([w.id for w in list_workspaces(ro)], ["demo"])
+                self.assertEqual(
+                    [p.host_id for p in list_workspace_host_profiles(ro, workspace_id="demo")],
+                    ["mac"],
+                )
+            finally:
+                ro.close()
+
+    def test_readonly_query_leaves_file_byte_identical(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            db_path = str(Path(tmp) / "coordinator.sqlite3")
+            conn = initialize(db_path)
+            upsert_workspace(
+                conn, workspace_id="demo", name="Demo", path="/ws", harness_root="/ws/docs"
+            )
+            conn.close()
+            before = self._snapshot(db_path)
+            ro = connect_readonly(db_path)
+            assert_schema_compatible(ro)
+            list_workspaces(ro)
+            ro.close()
+            self._assert_zero_mutation(before, self._snapshot(db_path))
+
+    # T3: legacy/unknown/spoofed schemas fail closed without migration.
+    def _downgrade_to_v15(self, db_path: str) -> None:
+        conn = sqlite3.connect(db_path)
+        conn.execute("DROP TABLE task_usage_warning_policies")
+        conn.execute("DROP TABLE job_attempt_usage")
+        conn.execute("PRAGMA user_version = 15")
+        conn.commit()
+        conn.close()
+
+    def test_schema_gate_rejects_v15_without_migration(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            db_path = str(Path(tmp) / "coordinator.sqlite3")
+            conn = initialize(db_path)
+            conn.close()
+            self._downgrade_to_v15(db_path)
+            before = self._snapshot(db_path)
+            ro = connect_readonly(db_path)
+            with self.assertRaisesRegex(SchemaCompatibilityError, "schema version 15"):
+                assert_schema_compatible(ro)
+            self._assert_zero_mutation(before, self._snapshot(db_path))
+            # No migration ran: v16-only tables are still absent.
+            tables = {
+                row["name"]
+                for row in ro.execute(
+                    "SELECT name FROM sqlite_master WHERE type = 'table'"
+                ).fetchall()
+            }
+            self.assertNotIn("job_attempt_usage", tables)
+            ro.close()
+
+    def test_schema_gate_rejects_unknown_version(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            db_path = str(Path(tmp) / "coordinator.sqlite3")
+            conn = initialize(db_path)
+            conn.execute("PRAGMA user_version = 17")
+            conn.commit()
+            conn.close()
+            before = self._snapshot(db_path)
+            ro = connect_readonly(db_path)
+            with self.assertRaisesRegex(SchemaCompatibilityError, "schema version 17"):
+                assert_schema_compatible(ro)
+            self._assert_zero_mutation(before, self._snapshot(db_path))
+            ro.close()
+
+    def test_schema_gate_rejects_spoofed_version_missing_registry_tables(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            db_path = str(Path(tmp) / "coordinator.sqlite3")
+            conn = initialize(db_path)
+            conn.execute("DROP TABLE workspaces")
+            conn.commit()
+            conn.close()
+            ro = connect_readonly(db_path)
+            with self.assertRaisesRegex(SchemaCompatibilityError, "workspaces"):
+                assert_schema_compatible(ro)
+            ro.close()
+
+    # T4: writes on the read-only connection fail and leave the file untouched.
+    def test_readonly_connection_rejects_writes(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            db_path = str(Path(tmp) / "coordinator.sqlite3")
+            conn = initialize(db_path)
+            conn.close()
+            before = self._snapshot(db_path)
+            ro = connect_readonly(db_path)
+            try:
+                assert_schema_compatible(ro)
+                self.assertEqual(ro.execute("PRAGMA query_only").fetchone()[0], 1)
+                with self.assertRaises(sqlite3.OperationalError):
+                    ro.execute(
+                        "INSERT INTO workspaces "
+                        "(id, name, path, harness_root, created_at, updated_at) "
+                        "VALUES (?, ?, ?, ?, ?, ?)",
+                        ("demo", "Demo", "/ws", "/ws/docs", "2026-01-01T00:00:00Z",
+                         "2026-01-01T00:00:00Z"),
+                    )
+                self.assertEqual(ro.execute("PRAGMA query_only").fetchone()[0], 1)
+            finally:
+                ro.close()
+            self._assert_zero_mutation(before, self._snapshot(db_path))
+
+    # F1: a failure after the initial open (any post-open configuration step)
+    # must close the connection, never register it in _OPEN_CONNECTIONS, and
+    # surface a stable ReadOnlyConnectionError (sqlite3.Error) or the original
+    # exception (other BaseException) -- never a leaked sqlite3.Error.
+    def test_post_open_sqlite_failure_closes_and_fails_closed(self) -> None:
+        import coordinate.db as db_module
+
+        closed: list[bool] = []
+
+        class _Broken(sqlite3.Connection):
+            def close(self) -> None:
+                closed.append(True)
+                super().close()
+
+            def execute(self, sql, *args):
+                raise sqlite3.OperationalError("simulated post-open failure")
+
+        with tempfile.TemporaryDirectory() as tmp:
+            db_path = str(Path(tmp) / "coordinator.sqlite3")
+            conn = initialize(db_path)
+            conn.close()
+            before = list(db_module._OPEN_CONNECTIONS)
+            with patch("coordinate.db.sqlite3.connect", return_value=_Broken(":memory:")):
+                with self.assertRaisesRegex(ReadOnlyConnectionError, "failed to configure"):
+                    connect_readonly(db_path)
+            self.assertEqual(closed, [True], "connection must be closed on failure")
+            self.assertEqual(db_module._OPEN_CONNECTIONS, before, "must not register a failed connection")
+
+    def test_post_open_verification_failure_closes_and_fails_closed(self) -> None:
+        import coordinate.db as db_module
+
+        closed: list[bool] = []
+
+        class _FakeRow:
+            def fetchone(self):
+                return (0,)
+
+        class _QueryOnlyZero(sqlite3.Connection):
+            def close(self) -> None:
+                closed.append(True)
+                super().close()
+
+            def execute(self, sql, *args):
+                return _FakeRow()
+
+        with tempfile.TemporaryDirectory() as tmp:
+            db_path = str(Path(tmp) / "coordinator.sqlite3")
+            conn = initialize(db_path)
+            conn.close()
+            before = list(db_module._OPEN_CONNECTIONS)
+            with patch("coordinate.db.sqlite3.connect", return_value=_QueryOnlyZero(":memory:")):
+                with self.assertRaisesRegex(ReadOnlyConnectionError, "query_only"):
+                    connect_readonly(db_path)
+            self.assertEqual(closed, [True], "connection must be closed on failure")
+            self.assertEqual(db_module._OPEN_CONNECTIONS, before, "must not register a failed connection")
+
+    def test_post_open_non_sqlite_failure_closes_and_re_raises(self) -> None:
+        import coordinate.db as db_module
+
+        closed: list[bool] = []
+
+        class _Boom(sqlite3.Connection):
+            def close(self) -> None:
+                closed.append(True)
+                super().close()
+
+            def execute(self, sql, *args):
+                raise RuntimeError("simulated non-sqlite failure")
+
+        with tempfile.TemporaryDirectory() as tmp:
+            db_path = str(Path(tmp) / "coordinator.sqlite3")
+            conn = initialize(db_path)
+            conn.close()
+            before = list(db_module._OPEN_CONNECTIONS)
+            with patch("coordinate.db.sqlite3.connect", return_value=_Boom(":memory:")):
+                with self.assertRaisesRegex(RuntimeError, "simulated non-sqlite failure"):
+                    connect_readonly(db_path)
+            self.assertEqual(closed, [True], "connection must be closed on failure")
+            self.assertEqual(db_module._OPEN_CONNECTIONS, before, "must not register a failed connection")
+
+    # T5: concurrent/live DB boundaries.
+    def test_readonly_reads_committed_snapshot_under_pending_writer(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            db_path = str(Path(tmp) / "coordinator.sqlite3")
+            conn = initialize(db_path)
+            upsert_workspace(
+                conn, workspace_id="demo", name="Demo", path="/ws", harness_root="/ws/docs"
+            )
+            conn.close()
+            before = self._snapshot(db_path)
+            writer = sqlite3.connect(db_path)
+            try:
+                writer.execute("BEGIN IMMEDIATE")
+                writer.execute(
+                    "INSERT INTO workspaces "
+                    "(id, name, path, harness_root, created_at, updated_at) "
+                    "VALUES (?, ?, ?, ?, ?, ?)",
+                    ("pending", "Pending", "/p", "/p/docs", "2026-01-01T00:00:00Z",
+                     "2026-01-01T00:00:00Z"),
+                )
+                ro = connect_readonly(db_path)
+                try:
+                    assert_schema_compatible(ro)
+                    # Uncommitted writer row must not be visible.
+                    self.assertEqual([w.id for w in list_workspaces(ro)], ["demo"])
+                finally:
+                    ro.close()
+            finally:
+                writer.rollback()
+                writer.close()
+            self._assert_zero_mutation(before, self._snapshot(db_path))
+
+    def test_concurrent_readonly_readers(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            db_path = str(Path(tmp) / "coordinator.sqlite3")
+            conn = initialize(db_path)
+            upsert_workspace(
+                conn, workspace_id="demo", name="Demo", path="/ws", harness_root="/ws/docs"
+            )
+            conn.close()
+            before = self._snapshot(db_path)
+            errors: list[BaseException] = []
+            counts: list[int] = []
+
+            def reader() -> None:
+                try:
+                    ro = connect_readonly(db_path)
+                    try:
+                        assert_schema_compatible(ro)
+                        counts.append(len(list_workspaces(ro)))
+                    finally:
+                        ro.close()
+                except BaseException as exc:  # pragma: no cover - failure path
+                    errors.append(exc)
+
+            threads = [threading.Thread(target=reader) for _ in range(2)]
+            for thread in threads:
+                thread.start()
+            for thread in threads:
+                thread.join()
+            self.assertEqual(errors, [])
+            self.assertEqual(sorted(counts), [1, 1])
+            self._assert_zero_mutation(before, self._snapshot(db_path))
+
+    def test_wal_boundary_environment_aware(self) -> None:
+        """WAL-mode DB is readable while the writer keeps -wal/-shm sidecars.
+        The fail-closed missing-sidecar state is only asserted when this
+        environment deterministically produces it; the read-only path itself
+        never creates or modifies sidecars."""
+        with tempfile.TemporaryDirectory() as tmp:
+            db_path = str(Path(tmp) / "coordinator.sqlite3")
+            conn = initialize(db_path)
+            upsert_workspace(
+                conn, workspace_id="demo", name="Demo", path="/ws", harness_root="/ws/docs"
+            )
+            conn.commit()
+            mode = conn.execute("PRAGMA journal_mode=WAL").fetchone()[0]
+            self.assertEqual(mode, "wal")
+            conn.execute(
+                "INSERT INTO workspaces "
+                "(id, name, path, harness_root, created_at, updated_at) "
+                "VALUES (?, ?, ?, ?, ?, ?)",
+                ("wal-ws", "Wal", "/w", "/w/docs", "2026-01-01T00:00:00Z",
+                 "2026-01-01T00:00:00Z"),
+            )
+            conn.commit()
+            # Baseline AFTER the writer's own WAL switch/commit: the read-only
+            # path must leave these exact bytes untouched (the WAL-mode header
+            # rewrite is the writer's action, not the read-only path's).
+            before_wal = self._snapshot(db_path)
+            writer_sidecars = (
+                Path(f"{db_path}-wal").exists(),
+                Path(f"{db_path}-shm").exists(),
+            )
+            self.assertTrue(any(writer_sidecars), "writer must hold WAL sidecars")
+            ro = connect_readonly(db_path)
+            try:
+                assert_schema_compatible(ro)
+                self.assertEqual(len(list_workspaces(ro)), 2)
+            finally:
+                ro.close()
+            # The read-only path itself never modifies the DB file or creates
+            # sidecars: bytes stay identical to the pre-WAL state (uncommitted
+            # WAL content lives in -wal, not the DB file) and the sidecar set
+            # is exactly the writer's.
+            after_read = self._snapshot(db_path)
+            self.assertEqual(after_read["bytes"], before_wal["bytes"], "DB bytes changed")
+            self.assertEqual(after_read["mtime_ns"], before_wal["mtime_ns"], "DB mtime changed")
+            self.assertEqual(
+                (Path(f"{db_path}-wal").exists(), Path(f"{db_path}-shm").exists()),
+                writer_sidecars,
+            )
+            conn.close()
+            # After the last writer closes, SQLite checkpoints and removes the
+            # sidecars. Fail-closed on a sidecar-less WAL DB is SQLite-version
+            # dependent (>= 3.50 can read WAL without shared memory); assert
+            # the result the environment actually produces and never gate on
+            # internal cleanup timing.
+            if not Path(f"{db_path}-wal").exists() and not Path(f"{db_path}-shm").exists():
+                try:
+                    ro2 = connect_readonly(db_path)
+                except ReadOnlyConnectionError:
+                    self.assertFalse(Path(f"{db_path}-wal").exists())
+                    self.assertFalse(Path(f"{db_path}-shm").exists())
+                else:
+                    # SQLite >= 3.50: sidecar-less read-only WAL read works;
+                    # still run the gate and a real query before closing.
+                    try:
+                        assert_schema_compatible(ro2)
+                        self.assertEqual(len(list_workspaces(ro2)), 2)
+                    finally:
+                        ro2.close()
+                    self.assertFalse(Path(f"{db_path}-wal").exists())
+                    self.assertFalse(Path(f"{db_path}-shm").exists())
 
 
 if __name__ == "__main__":

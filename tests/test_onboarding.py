@@ -33,6 +33,9 @@ from coordinate.onboarding import (
     REASON_RUNTIME_SOURCE_INCOMPLETE,
     REASON_RUNTIME_TEMPLATE_PLACEHOLDER,
     RuntimeSourceError,
+    TaskAdoptRecovery,
+    adopt_plan_task_files,
+    adopt_plan_task_record,
     create_plan_task,
     create_plan_task_record,
     init_file_harness,
@@ -47,11 +50,13 @@ from coordinate.plan_gate import approve_plan, reject_plan
 from coordinate.projection_doctor import diagnose_projections
 from coordinate.split_operations import (
     CONTRACT_VERSION,
+    OPERATION_KIND_TASK_ADOPT,
     OPERATION_KIND_TASK_CREATE,
     REASON_OPERATION_CONFLICT,
     SplitOperationError,
     apply_task_create_files,
     apply_task_create_record,
+    prepare_task_adoption,
 )
 
 
@@ -1505,6 +1510,192 @@ class FullInitRuntimeContractTests(unittest.TestCase):
         self.assertEqual(ctx.exception.reason, REASON_RUNTIME_TEMPLATE_PLACEHOLDER)
         self.assertEqual(self._snapshot(), before)
         self.assertFalse((hr / "harness-config.json").exists())
+
+
+class AdoptPlanTaskWrapperTests(unittest.TestCase):
+    """Direct onboarding-level tests for the host-aware adoption wrappers."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.conn = initialize(":memory:")
+        self.workspace_path = Path(self.tmp.name) / "workspace"
+        self.harness_root = Path(self.tmp.name)  # checklist lives next to workspace dir
+        (self.workspace_path).mkdir()
+        self.plan_rel = "plans/legacy.md"
+        plan = self.workspace_path / self.plan_rel
+        plan.parent.mkdir(parents=True, exist_ok=True)
+        plan.write_text("# Legacy plan\n")
+        self.checklist_path = self.harness_root / CHECKLIST_LEGACY_NAME
+        self.checklist_path.write_text(
+            json.dumps({
+                "project": "demo",
+                "harness_root": ".",
+                "version": 1,
+                "updated_at": "2026-07-13",
+                "items": [{
+                    "id": "legacy-1",
+                    "title": "Legacy One",
+                    "status": "todo",
+                    "phase": "todo",
+                    "priority": "p1",
+                    "owner": None,
+                    "selected_in_session": None,
+                    "updated_at": "2026-07-13T00:00:00Z",
+                    "dependencies": [],
+                    "blocked_by": [],
+                    "blocked_reason": "",
+                    "acceptance": "legacy acceptance",
+                    "verification": "",
+                    "handoff": {"from": None, "to": None, "reason": None},
+                    "plan_path": self.plan_rel,
+                    "artifact_path": self.plan_rel,
+                    "artifacts": {"plan": self.plan_rel},
+                    "workflow": {"status": "todo", "branch": None,
+                                 "updated_at": "2026-07-13T00:00:00Z"},
+                }],
+            }, ensure_ascii=False, indent=2) + "\n",
+            encoding="utf-8",
+        )
+        upsert_workspace(
+            self.conn,
+            workspace_id="demo",
+            name="Demo",
+            path=str(self.workspace_path),
+            harness_root=str(self.harness_root),
+        )
+
+    def _prepare(self):
+        return prepare_task_adoption(
+            workspace_path=str(self.workspace_path),
+            harness_root=str(self.harness_root),
+            workspace_id="demo",
+            task_id="legacy-1",
+            plan_doc=self.plan_rel,
+        )
+
+    def _adopt_files(self, prepare=None, **overrides):
+        p = prepare or self._prepare()
+        kwargs = dict(
+            workspace_path=str(self.workspace_path),
+            harness_root=str(self.harness_root),
+            task_id="legacy-1",
+            plan_doc=self.plan_rel,
+            operation_id=p.operation_id,
+            workspace_id="demo",
+            expected_item_fingerprint=p.item_fingerprint,
+            expected_plan_sha256=p.plan_sha256,
+        )
+        kwargs.update(overrides)
+        return adopt_plan_task_files(**kwargs)
+
+    def _zero_state(self):
+        ledger = list_split_operations(self.conn, workspace_id="demo")
+        events = [
+            row_to_dict(e)
+            for e in list_events(self.conn, "demo")
+            if row_to_dict(e)["task_id"] == "legacy-1"
+        ]
+        return ledger, events
+
+    def test_adopt_files_refuses_opt_runtime_copy_before_mutation(self):
+        checklist_before = self.checklist_path.read_bytes()
+        # The guard fires on either path; keep the real harness root so a guard
+        # regression would also have a real checklist to corrupt.
+        with self.assertRaises(ValueError) as ctx:
+            self._adopt_files(workspace_path="/opt/coordinate-runtime/ws")
+        self.assertIn("/opt", str(ctx.exception))
+        # Zero mutation: the guard ran before any checklist work.
+        self.assertEqual(self.checklist_path.read_bytes(), checklist_before)
+        item = json.loads(self.checklist_path.read_text())["items"][0]
+        self.assertNotIn("split_operation", item)
+
+    def test_adopt_files_requires_split_host_inputs(self):
+        checklist_before = self.checklist_path.read_bytes()
+        prepare = self._prepare()
+        for overrides in (
+            {"operation_id": ""},
+            {"expected_item_fingerprint": ""},
+            {"expected_plan_sha256": ""},
+        ):
+            with self.subTest(overrides=overrides):
+                with self.assertRaises(ValueError):
+                    self._adopt_files(prepare=prepare, **overrides)
+                self.assertEqual(self.checklist_path.read_bytes(), checklist_before)
+        ledger, events = self._zero_state()
+        self.assertEqual((ledger, events), ([], []))
+
+    def test_adopt_record_rejects_malformed_fingerprint(self):
+        prepare = self._prepare()
+        with self.assertRaises(SplitOperationError) as ctx:
+            adopt_plan_task_record(
+                self.conn,
+                workspace_id="demo",
+                task_id="legacy-1",
+                plan_doc=self.plan_rel,
+                operation_id=prepare.operation_id,
+                input_fingerprint="not-a-sha256",
+                before_fingerprint=prepare.item_fingerprint,
+                after_fingerprint=prepare.item_fingerprint,
+            )
+        self.assertEqual(ctx.exception.reason, REASON_VALIDATION_ERROR)
+        ledger, events = self._zero_state()
+        self.assertEqual((ledger, events), ([], []))
+
+    def test_adopt_wrappers_forward_into_adoption_service_end_to_end(self):
+        prepare = self._prepare()
+        files = self._adopt_files(prepare=prepare)
+        # The file wrapper forwarded the exact workspace/operation/fingerprint
+        # values into the adoption service.
+        self.assertEqual(files.operation_id, prepare.operation_id)
+        self.assertEqual(files.operation_kind, OPERATION_KIND_TASK_ADOPT)
+        self.assertEqual(files.workspace_id, "demo")
+        self.assertEqual(files.input_fingerprint, prepare.input_fingerprint)
+        self.assertEqual(files.before_fingerprint, prepare.item_fingerprint)
+        self.assertEqual(files.after_fingerprint, prepare.item_fingerprint)
+        self.assertTrue(files.checklist_changed)
+        # DB untouched by the file half.
+        ledger, events = self._zero_state()
+        self.assertEqual((ledger, events), ([], []))
+
+        record = adopt_plan_task_record(
+            self.conn,
+            workspace_id="demo",
+            task_id="legacy-1",
+            plan_doc=self.plan_rel,
+            operation_id=files.operation_id,
+            input_fingerprint=files.input_fingerprint,
+            before_fingerprint=files.before_fingerprint,
+            after_fingerprint=files.after_fingerprint,
+        )
+        self.assertTrue(record.event_created)
+        self.assertEqual(record.operation["operation_kind"], OPERATION_KIND_TASK_ADOPT)
+        self.assertEqual(record.operation["operation_id"], prepare.operation_id)
+        ledger, events = self._zero_state()
+        self.assertEqual(len(ledger), 1)
+        self.assertEqual([e["event_type"] for e in events], ["plan.ready"])
+
+    def test_adopt_recovery_argv_defaults_target_worker_and_empty_payload(self):
+        recovery = TaskAdoptRecovery(
+            workspace_id="demo",
+            task_id="legacy-1",
+            plan_doc=self.plan_rel,
+            actor="operator",
+            target=None,
+            operation_id="12345678-1234-1234-1234-123456789abc",
+            input_fingerprint="a" * 64,
+            before_fingerprint="b" * 64,
+            after_fingerprint="c" * 64,
+        )
+        argv = recovery.recovery_argv()
+        self.assertIn("--target", argv)
+        self.assertEqual(argv[argv.index("--target") + 1], "worker")
+        self.assertIn("--payload-json", argv)
+        self.assertEqual(json.loads(argv[argv.index("--payload-json") + 1]), {})
+        # Optional record-only intent stays out of the argv when unset.
+        self.assertNotIn("--owner", argv)
+        self.assertNotIn("--branch", argv)
+        self.assertNotIn("--idempotency-key", argv)
 
 
 if __name__ == "__main__":

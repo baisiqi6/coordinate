@@ -449,6 +449,111 @@ class CliTests(unittest.TestCase):
             self.assertEqual(ok_code, 0)
             self.assertEqual(ok_payload["result"]["job"]["progress"]["stage"], "editing")
 
+    def test_runtime_usage_policy_set_and_status_cli(self):
+        """Issue #12 CLI: runtime usage policy-set / status flow with a
+        task-scoped warning; revision CAS and status aggregate are observable."""
+        with tempfile.TemporaryDirectory() as tmp:
+            db_path = str(Path(tmp) / "coordinator.sqlite3")
+            self.run_cli("--db", db_path, "workspace", "add", "demo", "--path", tmp, "--harness-root", tmp)
+            self.run_cli(
+                "--db", db_path, "workspace", "host-profile", "set", "demo",
+                "--host-id", "mac", "--workspace-path", tmp, "--harness-root", tmp,
+            )
+            self.run_cli(
+                "--db", db_path, "runtime", "agent", "register",
+                "--agent-id", "mac-codex", "--host-id", "mac",
+                "--capabilities-json", '{"models":["codex"]}',
+            )
+            # Task-scoped usage requires a task mirror (claim authority).
+            mirror_conn = initialize(db_path)
+            upsert_task_mirror(
+                mirror_conn,
+                workspace_id="demo",
+                task_id="task-1",
+                phase="active",
+                owner="mac-codex",
+                branch=None,
+                pr=None,
+                payload={},
+            )
+            mirror_conn.close()
+            # policy-set revision 1
+            code, payload = self.run_cli(
+                "--db", db_path, "runtime", "usage", "policy-set", "demo",
+                "--task-id", "task-1", "--revision", "1",
+                "--warn-observed-tokens", "100",
+            )
+            self.assertEqual(code, 0)
+            self.assertEqual(payload["policy"]["revision"], 1)
+            self.assertEqual(payload["policy"]["observed_tokens_threshold"], 100)
+            # same revision + same body → idempotent
+            code, _ = self.run_cli(
+                "--db", db_path, "runtime", "usage", "policy-set", "demo",
+                "--task-id", "task-1", "--revision", "1",
+                "--warn-observed-tokens", "100",
+            )
+            self.assertEqual(code, 0)
+            # conflicting body at same revision → fail closed
+            code, _, stderr = self.run_cli_raw(
+                "--db", db_path, "runtime", "usage", "policy-set", "demo",
+                "--task-id", "task-1", "--revision", "1",
+                "--warn-observed-tokens", "200",
+            )
+            self.assertNotEqual(code, 0)
+            self.assertIn("conflicting", stderr)
+
+            # One managed attempt reporting 160 observed tokens → warning.
+            _, request_payload = self.run_cli(
+                "--db", db_path, "runtime", "request", "submit", "demo",
+                "--target-agent", "mac-codex", "--prompt", "x",
+                "--task-id", "task-1",
+                "--origin-json", '{"platform":"discord","destination":"ch","message_id":"m1","session_scope_id":"discord:ch"}',
+                "--reply-json", '{"platform":"discord","destination":"ch"}',
+            )
+            job_id = request_payload["result"]["job"]["id"]
+            self.run_cli("--db", db_path, "runtime", "job", "claim", "--agent-id", "mac-codex")
+            self.run_cli(
+                "--db", db_path, "runtime", "job", "report", job_id,
+                "--agent-id", "mac-codex", "--status", "done",
+                "--result-json", json.dumps({
+                    "response_text": "done",
+                    "usage_evidence": {
+                        "contract_version": 1,
+                        "records": [{
+                            "provider": "qoder", "model": "lite",
+                            "input_tokens": 100, "output_tokens": 50,
+                            "cache_read_tokens": 10, "cache_write_tokens": 0,
+                            "provider_cost_microusd": 1234,
+                            "source": "provider_reported", "completeness": "complete",
+                        }],
+                    },
+                }),
+            )
+
+            status_code, status = self.run_cli(
+                "--db", db_path, "runtime", "usage", "status", "demo",
+                "--task-id", "task-1",
+            )
+            self.assertEqual(status_code, 0)
+            self.assertEqual(status["policy"]["revision"], 1)
+            self.assertEqual(status["aggregate"]["attempt_count"], 1)
+            self.assertEqual(status["aggregate"]["observed_tokens"], 160)
+            self.assertEqual(status["aggregate"]["provider_cost_microusd"], 1234)
+            self.assertEqual(len(status["attempts"]), 1)
+            self.assertEqual(status["attempts"][0]["observed_tokens"], 160)
+            self.assertEqual(status["attempts"][0]["completeness"], "complete")
+            self.assertEqual(len(status["warnings"]), 1)
+            self.assertEqual(status["warnings"][0]["observed_tokens"], 160)
+            self.assertEqual(status["warnings"][0]["revision"], 1)
+
+            # Unknown workspace fails closed.
+            code, _, stderr = self.run_cli_raw(
+                "--db", db_path, "runtime", "usage", "status", "nope",
+                "--task-id", "task-1",
+            )
+            self.assertNotEqual(code, 0)
+            self.assertIn("unknown workspace", stderr)
+
     def test_state_no_refresh_reads_registered_harness_state(self):
         with tempfile.TemporaryDirectory() as tmp:
             db_path = str(Path(tmp) / "coordinator.sqlite3")
@@ -862,6 +967,12 @@ class CliTests(unittest.TestCase):
 
             self.assertEqual(code, 1)
             self.assertEqual(payload["error"]["reason"], "legacy_unbound_item")
+            message = payload["error"]["message"]
+            self.assertIn("refusing to adopt a legacy unbound item", message)
+            self.assertIn("Legacy first-adoption is not available here", message)
+            self.assertNotIn("Reconcile", message)
+            self.assertNotIn("reconcile", message)
+            self.assertNotIn("--task-id", message)
             # Zero DB writes: no plan.ready event.
             _, events_payload = self.run_cli(
                 "--db", db_path, "event", "list", "--workspace-id", "demo"
@@ -6246,4 +6357,298 @@ class CombinedCreateFaultMatrixTests(unittest.TestCase):
             self.assertEqual(
                 payload["result"]["event"]["payload"].get("verification"),
                 "explicit evidence",
+            )
+
+
+class LegacyTaskAdoptionCliTests(unittest.TestCase):
+    """Explicit legacy first-adoption (`task adopt`) CLI behavior."""
+
+    def run_cli(self, *args):
+        stdout = io.StringIO()
+        stderr = io.StringIO()
+        with contextlib.redirect_stdout(stdout), contextlib.redirect_stderr(stderr):
+            code = main(list(args))
+        return code, json.loads(stdout.getvalue()) if stdout.getvalue().strip() else {}
+
+    def _setup(self, tmp, *, checklist_name="mvp-checklist.json", task_id="legacy-1",
+               title="Legacy one", phase="todo", status="todo", dependencies=None,
+               plan_rel=None):
+        db_path = str(Path(tmp) / "coordinator.sqlite3")
+        plan_rel = plan_rel or f"docs/plans/{task_id}.md"
+        plan = Path(tmp) / plan_rel
+        plan.parent.mkdir(parents=True, exist_ok=True)
+        plan.write_text(f"# Plan {task_id}\n", encoding="utf-8")
+
+        def make_item(item_id, item_title, item_status, item_phase, deps):
+            return {
+                "id": item_id,
+                "title": item_title,
+                "status": item_status,
+                "phase": item_phase,
+                "priority": "p1",
+                "owner": None,
+                "selected_in_session": None,
+                "updated_at": "2026-07-13T00:00:00Z",
+                "dependencies": deps,
+                "blocked_by": [],
+                "blocked_reason": "",
+                "acceptance": "legacy acceptance",
+                "verification": "",
+                "handoff": {"from": None, "to": None, "reason": None},
+                "plan_path": plan_rel,
+                "artifact_path": plan_rel,
+                "artifacts": {"plan": plan_rel},
+                "workflow": {"status": "todo", "branch": None,
+                             "updated_at": "2026-07-13T00:00:00Z"},
+            }
+
+        items = [make_item(task_id, title, status, phase,
+                           dependencies if dependencies is not None else [])]
+        referenced = set()
+        for dep in (dependencies or []):
+            referenced.add(dep)
+        for dep in sorted(referenced):
+            dep_item = make_item(dep, f"Dependency {dep}", "done", "done", [])
+            dep_item["verification"] = "dependency already completed"
+            items.append(dep_item)
+        (Path(tmp) / checklist_name).write_text(
+            json.dumps({"project": "demo", "harness_root": ".", "version": 1,
+                        "updated_at": "2026-07-13", "items": items}, indent=2) + "\n",
+            encoding="utf-8",
+        )
+        self.run_cli("--db", db_path, "workspace", "add", "demo",
+                     "--path", tmp, "--harness-root", tmp)
+        return db_path
+
+    def _adopt(self, db_path, task_id="legacy-1", plan_doc="docs/plans/legacy-1.md", **extra):
+        argv = ["--db", db_path, "task", "adopt", "demo",
+                "--task-id", task_id, "--plan-doc", plan_doc]
+        for key, value in extra.items():
+            flag = "--operation-id" if key == "operation_id" else f"--{key}"
+            argv += [flag, str(value)]
+        return self.run_cli(*argv)
+
+    def _plan_ready_count(self, db_path):
+        _, payload = self.run_cli("--db", db_path, "event", "list", "--workspace-id", "demo")
+        return sum(1 for e in payload.get("events", []) if e["event_type"] == "plan.ready")
+
+    def test_adopt_prepare_only_is_readonly(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            db_path = self._setup(tmp)
+            checklist_path = Path(tmp) / "mvp-checklist.json"
+            before_bytes = checklist_path.read_bytes()
+            before_stat = checklist_path.stat()
+
+            code, payload = self.run_cli(
+                "--db", db_path, "task", "adopt", "demo",
+                "--task-id", "legacy-1", "--plan-doc", "docs/plans/legacy-1.md",
+                "--prepare-only",
+            )
+
+            self.assertEqual(code, 0, payload)
+            prepare = payload["result"]
+            self.assertIn("item_fingerprint", prepare)
+            self.assertIn("plan_sha256", prepare)
+            self.assertIn("operation_id", prepare)
+            self.assertFalse(prepare["already_adopted"])
+            # Strictly read-only: checklist bytes/mtime untouched, no events.
+            self.assertEqual(checklist_path.read_bytes(), before_bytes)
+            self.assertEqual(checklist_path.stat().st_mtime_ns, before_stat.st_mtime_ns)
+            self.assertEqual(self._plan_ready_count(db_path), 0)
+
+    def test_adopt_happy_path_new_name_checklist(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            db_path = self._setup(tmp, checklist_name="harness-checklist.json")
+            code, payload = self._adopt(db_path)
+            self.assertEqual(code, 0, payload)
+            self.assertEqual(payload["result"]["operation"]["operation_kind"], "task.adopt")
+            item = json.loads(
+                (Path(tmp) / "harness-checklist.json").read_text(encoding="utf-8")
+            )["items"][0]
+            self.assertEqual(item["split_operation"]["operation_kind"], "task.adopt")
+
+    def test_adopt_exact_replay_preserves_bytes_mtime_and_db(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            db_path = self._setup(tmp)
+            first_code, first = self._adopt(db_path)
+            self.assertEqual(first_code, 0)
+            op_id = first["result"]["operation"]["operation_id"]
+            checklist_path = Path(tmp) / "mvp-checklist.json"
+            bytes_before = checklist_path.read_bytes()
+            mtime_before = checklist_path.stat().st_mtime_ns
+
+            second_code, second = self._adopt(db_path, operation_id=op_id)
+
+            self.assertEqual(second_code, 0)
+            self.assertEqual(second["result"]["operation"]["operation_id"], op_id)
+            self.assertFalse(second["result"]["event_created"])
+            self.assertFalse(second["result"]["files"]["checklist_changed"])
+            self.assertEqual(checklist_path.read_bytes(), bytes_before)
+            self.assertEqual(checklist_path.stat().st_mtime_ns, mtime_before)
+            self.assertEqual(self._plan_ready_count(db_path), 1)
+
+    def test_adopt_split_host_files_then_record_flow(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            db_path = self._setup(tmp)
+            # 1. read-only prepare
+            _, prepare = self.run_cli(
+                "--db", db_path, "task", "adopt", "demo",
+                "--task-id", "legacy-1", "--plan-doc", "docs/plans/legacy-1.md",
+                "--prepare-only",
+            )
+            p = prepare["result"]
+            # 2. coding-host file half (no DB write)
+            files_code, files = self.run_cli(
+                "--db", db_path, "task", "adopt-files",
+                "--workspace-path", tmp,
+                "--harness-root", tmp,
+                "--workspace-id", "demo",
+                "--operation-id", p["operation_id"],
+                "--task-id", "legacy-1",
+                "--plan-doc", "docs/plans/legacy-1.md",
+                "--expected-item-fingerprint", p["item_fingerprint"],
+                "--expected-plan-sha256", p["plan_sha256"],
+            )
+            self.assertEqual(files_code, 0, files)
+            self.assertTrue(files["result"]["checklist_changed"])
+            self.assertEqual(self._plan_ready_count(db_path), 0)
+            # 3. server record half after commit/deploy
+            record_code, record = self.run_cli(
+                "--db", db_path, "task", "adopt-record", "demo",
+                "--operation-id", p["operation_id"],
+                "--input-fingerprint", files["result"]["input_fingerprint"],
+                "--before-fingerprint", files["result"]["before_fingerprint"],
+                "--after-fingerprint", files["result"]["after_fingerprint"],
+                "--task-id", "legacy-1",
+                "--plan-doc", "docs/plans/legacy-1.md",
+            )
+            self.assertEqual(record_code, 0, record)
+            self.assertEqual(
+                record["result"]["operation"]["operation_kind"], "task.adopt"
+            )
+            self.assertEqual(self._plan_ready_count(db_path), 1)
+
+    def test_adopt_record_failure_returns_same_operation_recovery(self):
+        import shlex
+        from unittest.mock import patch as mock_patch
+
+        with tempfile.TemporaryDirectory() as tmp:
+            db_path = self._setup(tmp)
+            with mock_patch(
+                "coordinate.onboarding.apply_task_adopt_record",
+                side_effect=RuntimeError("injected record failure"),
+            ):
+                code, payload = self._adopt(db_path)
+            self.assertEqual(code, 1)
+            error = payload["error"]
+            self.assertTrue(error["recovery_required"])
+            self.assertIn("adopt-record", error["recovery_command"])
+            # The file half committed: envelope present, no DB record yet.
+            item = json.loads(
+                (Path(tmp) / "mvp-checklist.json").read_text(encoding="utf-8")
+            )["items"][0]
+            self.assertEqual(
+                item["split_operation"]["operation_id"], error["operation_id"]
+            )
+            self.assertEqual(self._plan_ready_count(db_path), 0)
+
+            # Recovery argv converges to the SAME operation idempotently.
+            argv = [a for a in shlex.split(error["recovery_command"])][1:]
+            argv = ["--db", db_path] + argv
+            recovery_code, recovery_payload = self.run_cli(*argv)
+            self.assertEqual(recovery_code, 0, recovery_payload)
+            self.assertEqual(
+                recovery_payload["result"]["operation"]["operation_id"],
+                error["operation_id"],
+            )
+            self.assertTrue(recovery_payload["result"]["event_created"])
+            self.assertEqual(self._plan_ready_count(db_path), 1)
+
+    def test_adopt_absent_item_fail_closed(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            db_path = self._setup(tmp)
+            code, payload = self._adopt(db_path, task_id="no-such-item")
+            self.assertEqual(code, 1)
+            self.assertEqual(payload["error"]["reason"], "item_not_found")
+
+    def test_adopt_dual_checklist_fail_closed(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            db_path = self._setup(tmp)
+            (Path(tmp) / "harness-checklist.json").write_text("{}\n", encoding="utf-8")
+            code, payload = self._adopt(db_path)
+            self.assertEqual(code, 1)
+            self.assertEqual(payload["error"]["reason"], "dual_authority")
+
+    def test_adopt_malformed_envelope_fail_closed(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            db_path = self._setup(tmp)
+            checklist_path = Path(tmp) / "mvp-checklist.json"
+            checklist = json.loads(checklist_path.read_text())
+            checklist["items"][0]["split_operation"] = "garbage"
+            checklist_path.write_text(json.dumps(checklist, indent=2) + "\n")
+            code, payload = self._adopt(db_path)
+            self.assertEqual(code, 1)
+            self.assertEqual(payload["error"]["reason"], "operation_conflict")
+
+    def test_create_still_rejects_legacy_unbound_item(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            db_path = self._setup(tmp)
+            code, payload = self.run_cli(
+                "--db", db_path, "task", "create", "demo",
+                "--task-id", "legacy-1",
+                "--plan-doc", "docs/plans/legacy-1.md",
+            )
+            self.assertEqual(code, 1)
+            self.assertEqual(payload["error"]["reason"], "legacy_unbound_item")
+
+    def test_targeted_reconcile_cannot_adopt(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            db_path = self._setup(tmp)
+            self.run_cli(
+                "--db", db_path, "reconcile", "demo",
+                "--task-id", "legacy-1", "--no-refresh",
+            )
+            # Reconcile must not have adopted: no ledger, no plan.ready, and
+            # the checklist item still has no envelope.
+            _, events = self.run_cli(
+                "--db", db_path, "event", "list", "--workspace-id", "demo"
+            )
+            self.assertEqual(self._plan_ready_count(db_path), 0)
+            item = json.loads(
+                (Path(tmp) / "mvp-checklist.json").read_text(encoding="utf-8")
+            )["items"][0]
+            self.assertNotIn("split_operation", item)
+
+    def test_adopt_happy_path_legacy_checklist(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            db_path = self._setup(tmp, dependencies=["other-task"])
+            code, payload = self._adopt(db_path)
+            self.assertEqual(code, 0, payload)
+            result = payload["result"]
+            self.assertEqual(result["operation"]["operation_kind"], "task.adopt")
+            self.assertTrue(result["event_created"])
+            self.assertEqual(result["files"]["checklist_changed"], True)
+            self.assertEqual(self._plan_ready_count(db_path), 1)
+
+            checklist = json.loads(
+                (Path(tmp) / "mvp-checklist.json").read_text(encoding="utf-8")
+            )
+            item = checklist["items"][0]
+            # Business fields preserved exactly.
+            self.assertEqual(item["title"], "Legacy one")
+            self.assertEqual(item["phase"], "todo")
+            self.assertEqual(item["status"], "todo")
+            self.assertEqual(item["priority"], "p1")
+            self.assertEqual(item["dependencies"], ["other-task"])
+            self.assertEqual(item["plan_path"], "docs/plans/legacy-1.md")
+            envelope = item["split_operation"]
+            self.assertEqual(envelope["operation_kind"], "task.adopt")
+            self.assertEqual(envelope["operation_id"], result["operation"]["operation_id"])
+            self.assertEqual(envelope["workspace_id"], "demo")
+            # Mirror reflects the preserved projection.
+            self.assertEqual(result["task"]["task_id"], "legacy-1")
+            self.assertEqual(result["task"]["payload"]["dependencies"], ["other-task"])
+            self.assertEqual(
+                result["task"]["payload"]["split_operation"]["operation_kind"],
+                "task.adopt",
             )
