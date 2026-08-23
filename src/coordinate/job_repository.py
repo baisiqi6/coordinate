@@ -29,7 +29,16 @@ def create_job(
     payload: dict[str, Any] | None = None,
     job_id: str | None = None,
     commit: bool = True,
+    authoritative_worktree_path: bool = False,
 ) -> sqlite3.Row:
+    """Create one pending job row.
+
+    ``authoritative_worktree_path=True`` persists ``worktree_path`` verbatim
+    (the caller already normalized it against the host-native allowlist) and
+    skips the control-host ``_absolute_path`` resolution. It is used ONLY by
+    managed runtime sibling submits and ``retry_job``; every control-plane
+    caller keeps the default control-host resolve.
+    """
     workspace_row = conn.execute(
         "SELECT path FROM workspaces WHERE id = ?", (workspace_id,)
     ).fetchone()
@@ -65,7 +74,13 @@ def create_job(
             "pending",
             _absolute_path(prompt_path, base=workspace_path) if prompt_path else None,
             branch,
-            _absolute_path(worktree_path, base=workspace_path) if worktree_path else None,
+            (
+                worktree_path
+                if authoritative_worktree_path
+                else _absolute_path(worktree_path, base=workspace_path)
+            )
+            if worktree_path
+            else None,
             terminal_session_id,
             _absolute_path(logs_path, base=workspace_path) if logs_path else None,
             0,

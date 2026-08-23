@@ -58,7 +58,7 @@ def _write_toml(content: str) -> Path:
 class SchemaV12Tests(unittest.TestCase):
     def test_fresh_initialize_is_v14(self):
         conn = initialize(":memory:")
-        self.assertEqual(conn.execute("PRAGMA user_version").fetchone()[0], 14)
+        self.assertEqual(conn.execute("PRAGMA user_version").fetchone()[0], 16)
         tables = {
             row["name"]
             for row in conn.execute(
@@ -93,7 +93,7 @@ class SchemaV12Tests(unittest.TestCase):
         conn.execute("PRAGMA user_version = 11")
         conn.commit()
         migrate(conn)
-        self.assertEqual(conn.execute("PRAGMA user_version").fetchone()[0], 14)
+        self.assertEqual(conn.execute("PRAGMA user_version").fetchone()[0], 16)
         indexes = {
             row["name"]
             for row in conn.execute(
@@ -137,7 +137,7 @@ class SchemaV12Tests(unittest.TestCase):
         self.assertFalse(conn.in_transaction)
 
     def test_schema_version_constant_matches_migration(self):
-        self.assertEqual(SCHEMA_VERSION, 14)
+        self.assertEqual(SCHEMA_VERSION, 16)
 
 
 class CanonicalBytesTests(unittest.TestCase):

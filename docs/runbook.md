@@ -10,6 +10,15 @@ scripts/harness/harnessctl doctor
 scripts/harness/harnessctl session-init
 ```
 
+## Task/Job 只读 Trace（Issue #11 R1）
+
+- `coordinate trace task WORKSPACE_ID TASK_ID [--history-limit N]`（默认 20、最大 100）
+- `coordinate trace job JOB_ID [--workspace-id WORKSPACE_ID]`
+- stdout 只有 `{"trace": <TraceProjectionV1>}`；字段带六种 evidence state
+  （present/missing/unknown/unavailable/stale/failed）。纯只读投影：不刷新 forge
+  或 task mirror，不联网。契约以 `coordinate trace --help` 与
+  `src/coordinate/trace_projection.py` 为准。
+
 ## 本地 fresh install
 
 标准安装步骤：
@@ -143,6 +152,24 @@ Worker bootstrap（`task handoff`）向 worker 暴露两个值：它渲染
 host profile 重新映射 — 因此 coding host 上的 worker 永远不会被告知把服务器
 `/opt/*` 部署副本当作其工作树。
 
+## Registry 查询是严格只读（strict read-only）
+
+`workspace list` 与 `workspace host-profile list` 是纯查询命令，以严格只读方式打开
+**existing-only** 的数据库连接（SQLite URI `mode=ro` + `PRAGMA query_only=ON`，并在任何
+查询前做精确 schema 兼容性门）：
+
+- 绝不创建或 migrate 数据库：缺失 DB、旧 schema（`user_version < 16`）、未知 schema
+  （`> 16`）一律 fail closed——stderr 输出 `error: ...` 且 exit 1，数据库文件与
+  `-journal`/`-wal`/`-shm` sidecar 零变化。
+- 行为变更：此前的「查询时静默创建空 DB 并返回空列表」不再成立；需要建库时使用
+  显式 writable 命令（如 `workspace add`）。
+- 只读路径复用同一套 registry domain 函数（`list_workspaces` /
+  `list_workspace_host_profiles`），不建立第二套 registry/domain store；writable
+  composition 与 mutation 命令行为不变。
+- 权威边界：`reconcile`（含 `--task-id`）是 completion 后 scoped mirror recovery，不是
+  legacy first-adoption 入口；无 split-operation envelope 的 legacy item 在显式
+  adoption entry 出现前保持 untouched。
+
 ## Managed Dependency 更新
 
 checklist item 的 `dependencies` 字段是依赖的唯一权威。更新已登记 task 的依赖时
@@ -181,6 +208,55 @@ coordinate task update-dependencies-files \
 - `/opt` runtime-copy guard 保持 fail closed；`--allow-runtime-copy` 仅用于显式
   repair。split-host 后半程复用既有 `reconcile WORKSPACE --task-id TASK`，不新增
   `update-dependencies-record`。
+
+## Legacy Item 显式首 Adoption（task adopt）
+
+canonical checklist 中已存在、但没有 `split_operation` envelope 的 legacy item，
+用 `task adopt` 首次纳入 managed lifecycle。它与 `task create`（创建新 item，
+before-state 是 absent）和 `reconcile`（仅 completion repair / mirror 刷新）互不
+替代：create 会拒绝 legacy unbound item（`legacy_unbound_item`），reconcile 永远
+不会补 envelope 或 ledger。
+
+```bash
+# same-host combined：只读 prepare + stale gate → checklist envelope →
+# 已部署 readback 复核 → 单一事务内 ledger + task mirror + plan.ready
+coordinate task adopt WORKSPACE --task-id TASK --plan-doc PLAN
+
+# 只读 prepare：输出 expected item fingerprint / plan sha256 / operation id，
+# 不改任何文件与 DB（split-host 第一步，或人工核对用）
+coordinate task adopt WORKSPACE --task-id TASK --plan-doc PLAN --prepare-only
+
+# split-host：coding host 只写 checklist envelope（要求传入 prepare 输出的
+# expected fingerprints，stale gate 在写入前校验）
+coordinate task adopt-files --workspace-path P --harness-root H \
+  --workspace-id WORKSPACE --operation-id OP --task-id TASK --plan-doc PLAN \
+  --expected-item-fingerprint FP --expected-plan-sha256 SHA
+
+# split-host 后半程：commit/push/deploy 之后在 control plane 运行
+coordinate task adopt-record WORKSPACE --operation-id OP \
+  --input-fingerprint IN --before-fingerprint BE --after-fingerprint AF \
+  --task-id TASK --plan-doc PLAN
+```
+
+exact argv 以各子命令 `--help` 为准。规则：
+
+- file half 只给既有 unbound item 追加 `task.adopt` envelope：`id`、title、
+  status/workflow、priority、dependencies、plan locator 等业务字段与
+  checklist authority 一律不变，不创建第二个 item；DB 侧只是 mirror。
+- lifecycle mirror 与 reconcile 一样使用 `workflow.status`，缺失时回退到 `status`；
+  合法 legacy item 不要求顶层 `phase`。
+- 旧 reconcile 已创建的 DB mirror 只有在 file-owned payload 与当前 legacy item
+  完全一致时才可升级；保留既有 owner/branch/PR/publish evidence。任何不一致或
+  operation identity 冲突继续 fail closed，不做宽松覆盖。
+- record 失败时按返回的 **同一 operation id / fingerprint** 运行 `task
+  adopt-record` recovery（幂等收敛）；**不得**用 `reconcile --task-id` 代替
+  首 adoption 或 record recovery。
+- fail closed 语义：item 不存在（`item_not_found`）、已绑定其他 operation、
+  malformed envelope、双 checklist authority、缺 checklist/plan、非法相对路径、
+  prepare 之后 item/dependency/plan bytes 漂移（`fingerprint_drift`）均零写入
+  拒绝；exact same operation replay 不改 checklist bytes/mtime、不重复
+  ledger/mirror/event。
+- 无 DB schema migration；projection doctor 已识别 `task.adopt`。
 
 ## Phase 8.4: Worker Push → PR Publish
 

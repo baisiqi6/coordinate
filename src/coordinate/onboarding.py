@@ -42,10 +42,13 @@ from .split_operations import (
     REASON_OPERATION_CONFLICT,
     TARGET_KIND_CHECKLIST_TASK,
     SplitOperationError,
+    apply_task_adopt_files,
+    apply_task_adopt_record,
     apply_task_create_files,
     apply_task_create_record,
     build_task_create_input_fingerprint,
     compute_plan_sha256,
+    prepare_task_adoption,
     validate_task_create_contract,
     validate_task_mirror_split_operation,
     validate_uuid,
@@ -346,6 +349,313 @@ class TaskCreateRecoveryError(ValueError):
         self.recovery = recovery
 
 
+# ---------------------------------------------------------------------------
+# Legacy task adoption (task.adopt): explicit first-adoption entry
+# ---------------------------------------------------------------------------
+
+
+@dataclass(frozen=True)
+class TaskAdoptResult:
+    workspace: Workspace
+    task: dict[str, Any]
+    event: dict[str, Any]
+    event_created: bool
+    operation: dict[str, Any] | None = None
+    files: dict[str, Any] | None = None
+
+    def to_dict(self) -> dict[str, Any]:
+        payload = {
+            "workspace": self.workspace.to_dict(),
+            "task": self.task,
+            "event": self.event,
+            "event_created": self.event_created,
+        }
+        if self.operation is not None:
+            payload["operation"] = self.operation
+        if self.files is not None:
+            payload["files"] = self.files
+        return payload
+
+
+@dataclass(frozen=True)
+class TaskAdoptRecovery:
+    """Structured recovery material for an adoption record-half failure.
+
+    The file half (adoption envelope) already committed; ``recovery_argv``
+    re-runs ``task adopt-record`` with the same operation id and fingerprints
+    to complete the DB half idempotently.
+    """
+
+    workspace_id: str
+    task_id: str
+    plan_doc: str
+    actor: str
+    target: str | None
+    operation_id: str
+    input_fingerprint: str
+    before_fingerprint: str
+    after_fingerprint: str
+    owner: str | None = None
+    branch: str | None = None
+    payload: dict[str, Any] | None = None
+    idempotency_key: str | None = None
+    error_message: str = ""
+
+    def recovery_argv(self) -> list[str]:
+        argv = [
+            "coordinate",
+            "task",
+            "adopt-record",
+            self.workspace_id,
+            "--operation-id",
+            self.operation_id,
+            "--input-fingerprint",
+            self.input_fingerprint,
+            "--before-fingerprint",
+            self.before_fingerprint,
+            "--after-fingerprint",
+            self.after_fingerprint,
+            "--task-id",
+            self.task_id,
+            "--plan-doc",
+            self.plan_doc,
+            "--actor",
+            self.actor,
+            "--target",
+            self.target or "worker",
+            "--payload-json",
+            json.dumps(self.payload or {}, ensure_ascii=False, sort_keys=True),
+        ]
+        if self.owner:
+            argv += ["--owner", self.owner]
+        if self.branch:
+            argv += ["--branch", self.branch]
+        if self.idempotency_key:
+            argv += ["--idempotency-key", self.idempotency_key]
+        return argv
+
+    def to_dict(self) -> dict[str, Any]:
+        argv = self.recovery_argv()
+        return {
+            "recovery_required": True,
+            "operation_id": self.operation_id,
+            "input_fingerprint": self.input_fingerprint,
+            "before_fingerprint": self.before_fingerprint,
+            "after_fingerprint": self.after_fingerprint,
+            "recovery_argv": argv,
+            "recovery_command": shlex.join(argv),
+            "error": self.error_message,
+        }
+
+
+class TaskAdoptRecoveryError(ValueError):
+    """The adoption record half failed after the file half committed."""
+
+    def __init__(self, message: str, recovery: TaskAdoptRecovery):
+        super().__init__(message)
+        self.recovery = recovery
+
+
+def adopt_plan_task(
+    conn: sqlite3.Connection,
+    *,
+    workspace_id: str,
+    task_id: str,
+    plan_doc: str,
+    owner: str | None = None,
+    branch: str | None = None,
+    actor: str = "operator",
+    target: str | None = "worker",
+    payload: dict[str, Any] | None = None,
+    idempotency_key: str | None = None,
+    operation_id: str | None = None,
+    allow_runtime_copy: bool = False,
+    prepare_only: bool = False,
+) -> TaskAdoptResult | dict[str, Any]:
+    """Combined legacy first-adoption: prepare, file half, record half.
+
+    The read-only prepare derives the expected item fingerprint and plan bytes
+    digest; the file half re-verifies both before any mutation (explicit
+    stale-input gate); the record half verifies the deployed readback and
+    commits ledger + mirror + plan.ready in one transaction. A record-half
+    failure keeps the committed envelope and raises
+    ``TaskAdoptRecoveryError`` with same-operation recovery argv.
+    """
+    workspace = get_workspace(conn, workspace_id)
+    if workspace is None:
+        raise ValueError(f"unknown workspace: {workspace_id}")
+    _refuse_runtime_copy(workspace, allow_runtime_copy=allow_runtime_copy)
+    if not task_id:
+        raise ValueError("task_id is required")
+    if not plan_doc:
+        raise ValueError("plan_doc is required")
+    plan_doc = _normalize_plan_doc(workspace, plan_doc)
+
+    prepare = prepare_task_adoption(
+        workspace_path=workspace.path,
+        harness_root=workspace.harness_root,
+        workspace_id=workspace_id,
+        task_id=task_id,
+        plan_doc=plan_doc,
+        operation_id=operation_id,
+    )
+    if prepare_only:
+        return prepare.to_dict()
+
+    try:
+        files = apply_task_adopt_files(
+            workspace_path=workspace.path,
+            harness_root=workspace.harness_root,
+            task_id=task_id,
+            plan_doc=plan_doc,
+            operation_id=prepare.operation_id,
+            workspace_id=workspace_id,
+            expected_item_fingerprint=prepare.item_fingerprint,
+            expected_plan_sha256=prepare.plan_sha256,
+        )
+    except SplitOperationError:
+        # File half refused: zero DB writes by construction.
+        raise
+
+    try:
+        record = apply_task_adopt_record(
+            conn,
+            workspace_id=workspace_id,
+            task_id=task_id,
+            plan_doc=plan_doc,
+            operation_id=prepare.operation_id,
+            input_fingerprint=files.input_fingerprint,
+            before_fingerprint=files.before_fingerprint,
+            after_fingerprint=files.after_fingerprint,
+            owner=owner,
+            branch=branch,
+            actor=actor,
+            target=target,
+            payload=payload,
+            idempotency_key=idempotency_key,
+        )
+    except Exception as exc:
+        recovery = TaskAdoptRecovery(
+            workspace_id=workspace_id,
+            task_id=task_id,
+            plan_doc=plan_doc,
+            actor=actor,
+            target=target,
+            owner=owner,
+            branch=branch,
+            payload=payload,
+            idempotency_key=idempotency_key,
+            operation_id=prepare.operation_id,
+            input_fingerprint=files.input_fingerprint,
+            before_fingerprint=files.before_fingerprint,
+            after_fingerprint=files.after_fingerprint,
+            error_message=str(exc),
+        )
+        raise TaskAdoptRecoveryError(
+            f"adoption envelope committed but the DB record half failed; "
+            f"complete the operation with `task adopt-record` using the same "
+            f"operation id ({prepare.operation_id})",
+            recovery=recovery,
+        ) from exc
+
+    return TaskAdoptResult(
+        workspace=record.workspace,
+        task=record.task,
+        event=record.event,
+        event_created=record.event_created,
+        operation=record.operation,
+        files=files.to_dict(),
+    )
+
+
+def adopt_plan_task_files(
+    *,
+    workspace_path: str,
+    harness_root: str,
+    task_id: str,
+    plan_doc: str,
+    operation_id: str,
+    workspace_id: str,
+    expected_item_fingerprint: str,
+    expected_plan_sha256: str,
+    allow_runtime_copy: bool = False,
+):
+    """Coding-host half of host-aware adoption: checklist envelope only (no DB)."""
+    if not task_id:
+        raise ValueError("task_id is required for task adopt-files")
+    if not plan_doc:
+        raise ValueError("plan_doc is required for task adopt-files")
+    if not operation_id:
+        raise ValueError("operation_id is required for task adopt-files")
+    if not workspace_id:
+        raise ValueError("workspace_id is required for task adopt-files")
+    if not expected_item_fingerprint:
+        raise ValueError("expected_item_fingerprint is required for task adopt-files")
+    if not expected_plan_sha256:
+        raise ValueError("expected_plan_sha256 is required for task adopt-files")
+
+    workspace = Workspace(
+        id=workspace_id,
+        name=workspace_id,
+        path=str(workspace_path),
+        harness_root=str(harness_root),
+    )
+    _refuse_runtime_copy(workspace, allow_runtime_copy=allow_runtime_copy)
+    return apply_task_adopt_files(
+        workspace_path=workspace_path,
+        harness_root=harness_root,
+        task_id=task_id,
+        plan_doc=plan_doc,
+        operation_id=operation_id,
+        workspace_id=workspace_id,
+        expected_item_fingerprint=expected_item_fingerprint,
+        expected_plan_sha256=expected_plan_sha256,
+    )
+
+
+def adopt_plan_task_record(
+    conn: sqlite3.Connection,
+    *,
+    workspace_id: str,
+    task_id: str,
+    plan_doc: str,
+    operation_id: str,
+    input_fingerprint: str,
+    before_fingerprint: str,
+    after_fingerprint: str,
+    owner: str | None = None,
+    branch: str | None = None,
+    actor: str = "operator",
+    target: str | None = "worker",
+    payload: dict[str, Any] | None = None,
+    idempotency_key: str | None = None,
+) -> TaskAdoptResult:
+    """Server half of host-aware adoption: DB ledger + mirror + plan.ready only."""
+    record = apply_task_adopt_record(
+        conn,
+        workspace_id=workspace_id,
+        task_id=task_id,
+        plan_doc=plan_doc,
+        operation_id=operation_id,
+        input_fingerprint=input_fingerprint,
+        before_fingerprint=before_fingerprint,
+        after_fingerprint=after_fingerprint,
+        owner=owner,
+        branch=branch,
+        actor=actor,
+        target=target,
+        payload=payload,
+        idempotency_key=idempotency_key,
+    )
+    return TaskAdoptResult(
+        workspace=record.workspace,
+        task=record.task,
+        event=record.event,
+        event_created=record.event_created,
+        operation=record.operation,
+    )
+
+
 def _resolve_task_create_operation(
     conn: sqlite3.Connection,
     workspace: Workspace,
@@ -430,7 +740,8 @@ def _resolve_task_create_operation(
         raise SplitOperationError(
             f"task {task_id} already exists in the checklist without a "
             "split-operation envelope; refusing to adopt a legacy unbound item. "
-            "Reconcile it explicitly instead.",
+            "Legacy first-adoption is not available here: leave the item "
+            "untouched until the explicit adoption entry exists.",
             REASON_LEGACY_UNBOUND_ITEM,
         )
     if envelope.get("operation_kind") != OPERATION_KIND_TASK_CREATE:

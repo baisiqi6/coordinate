@@ -39,7 +39,12 @@ from .execution_leases import (
     _validate_stored_resource,
     _validate_ttl,
 )
-from .execution_resources import build_worktree_resource, compute_resource_key
+from .execution_resources import (
+    ResourceIdentityError,
+    build_worktree_resource,
+    check_worktree_containment_policy,
+    compute_resource_key,
+)
 from .executor_identity import (
     executor_binding_claim_evidence,
     resolve_exact_executor_binding,
@@ -855,7 +860,7 @@ def _resolve_claim_context(
 
     if snapshot is None:
         try:
-            return resolve_execution_context_v1(
+            ctx = resolve_execution_context_v1(
                 job_id=job["id"],
                 workspace=workspace,
                 task=task,
@@ -869,18 +874,34 @@ def _resolve_claim_context(
             )
         except ContextError as exc:
             raise RuntimeLeaseError(f"cannot backfill execution context: {exc}") from exc
+    else:
+        try:
+            ctx = validate_execution_context_snapshot(
+                snapshot,
+                job_id=job["id"],
+                workspace_id=job["workspace_id"],
+                task_id=job["task_id"],
+                assigned_agent=agent_id,
+                host_id=host_id,
+            )
+        except ContextError as exc:
+            raise RuntimeLeaseError(f"invalid stored execution context: {exc}") from exc
 
+    # Pending->claimed policy gate: the stored normalized worktree path must be
+    # contained in the CURRENT canonical checkout or an allowlisted root. Pure
+    # lexical check of the stored path; never re-derives the snapshot/digest.
+    # Revocation therefore only gates pending->claimed and never interrupts a
+    # running job through renew/release/expire.
     try:
-        return validate_execution_context_snapshot(
-            snapshot,
-            job_id=job["id"],
-            workspace_id=job["workspace_id"],
-            task_id=job["task_id"],
-            assigned_agent=agent_id,
-            host_id=host_id,
+        check_worktree_containment_policy(
+            worktree_path=ctx.worktree_path,
+            canonical_workspace_path=profile.workspace_path,
+            worktree_roots=profile.worktree_roots,
         )
-    except ContextError as exc:
-        raise RuntimeLeaseError(f"invalid stored execution context: {exc}") from exc
+    except ResourceIdentityError as exc:
+        raise RuntimeLeaseError(f"worktree containment policy rejected claim: {exc}") from exc
+
+    return ctx
 
 
 def _validate_binding_snapshot(

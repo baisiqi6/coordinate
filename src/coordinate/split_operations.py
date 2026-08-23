@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
 import re
 import sqlite3
 import uuid
@@ -21,6 +22,7 @@ from .checklist_io import (
     ChecklistError,
     ChecklistLock,
     initial_projection,
+    item_plan_locator_fields,
     load_checklist,
     mutate_checklist,
     read_checklist_bytes,
@@ -37,10 +39,12 @@ from .db import (
     upsert_task_mirror,
     utc_now,
 )
+from .task_projection import task_mirror_from_item
 
 CONTRACT_VERSION = 1
 OPERATION_KIND_TASK_CREATE = "task.create"
 OPERATION_KIND_ISSUE_MATERIALIZE = "issue.materialize"
+OPERATION_KIND_TASK_ADOPT = "task.adopt"
 TARGET_KIND_CHECKLIST_TASK = "checklist_task"
 SOURCE_KIND_ISSUE_TRIAGED_EVENT = "issue_triaged_event"
 STATUS_RECORD_APPLIED = "record_applied"
@@ -51,6 +55,7 @@ REASON_FINGERPRINT_DRIFT = "fingerprint_drift"
 REASON_LOCK_TIMEOUT = "lock_timeout"
 REASON_VALIDATION_ERROR = "validation_error"
 REASON_LEGACY_UNBOUND_ITEM = "legacy_unbound_item"
+REASON_ITEM_NOT_FOUND = "item_not_found"
 
 
 def _require_creatable_phase(phase: str) -> None:
@@ -223,6 +228,7 @@ SPLIT_OPERATION_ENVELOPE_KEYS = frozenset({
 _KNOWN_OPERATION_KINDS = frozenset({
     OPERATION_KIND_TASK_CREATE,
     OPERATION_KIND_ISSUE_MATERIALIZE,
+    OPERATION_KIND_TASK_ADOPT,
 })
 
 
@@ -475,6 +481,507 @@ def build_issue_materialize_envelope(
         "after_fingerprint": after_fingerprint,
         "files_applied_at": files_applied_at,
     }
+
+
+# ---------------------------------------------------------------------------
+# Legacy task adoption (task.adopt)
+# ---------------------------------------------------------------------------
+
+
+def build_task_adopt_input_fingerprint(
+    *,
+    workspace_id: str,
+    task_id: str,
+    plan_doc: str,
+    plan_sha256: str,
+    item_fingerprint: str,
+) -> str:
+    """Compute the canonical v1 task.adopt input fingerprint.
+
+    Unlike create/materialize, adoption takes NO caller-supplied business
+    fields: the fingerprint binds the exact current checklist-item projection
+    (including title/phase/status/priority/dependencies) plus the plan locator
+    and plan bytes digest, so a caller can never adopt a forged projection.
+    """
+    return _canonical_hash({
+        "contract_version": CONTRACT_VERSION,
+        "operation_kind": OPERATION_KIND_TASK_ADOPT,
+        "workspace_id": workspace_id,
+        "target": {"kind": TARGET_KIND_CHECKLIST_TASK, "id": task_id},
+        "source": None,
+        "plan_doc": validate_workspace_relative_path(plan_doc),
+        "plan_sha256": validate_sha256(plan_sha256),
+        "item_fingerprint": validate_sha256(item_fingerprint),
+    })
+
+
+def build_task_adopt_envelope(
+    *,
+    operation_id: str,
+    workspace_id: str,
+    task_id: str,
+    input_fingerprint: str,
+    before_fingerprint: str,
+    after_fingerprint: str,
+    files_applied_at: str,
+) -> dict[str, Any]:
+    """Build the v1 task.adopt checklist envelope (no source: adoption of an
+    already-deployed legacy item, whose before-state is the item itself)."""
+    return {
+        "contract_version": CONTRACT_VERSION,
+        "operation_id": operation_id,
+        "operation_kind": OPERATION_KIND_TASK_ADOPT,
+        "workspace_id": workspace_id,
+        "target_kind": TARGET_KIND_CHECKLIST_TASK,
+        "target_id": task_id,
+        "source_kind": None,
+        "source_id": None,
+        "input_fingerprint": input_fingerprint,
+        "before_fingerprint": before_fingerprint,
+        "after_fingerprint": after_fingerprint,
+        "files_applied_at": files_applied_at,
+    }
+
+
+def _verify_item_plan_locator(item: dict[str, Any], task_id: str, plan_doc: str) -> None:
+    """Fail closed unless every non-empty plan locator on the item agrees with
+    *plan_doc* and at least one locator exists."""
+    fields = item_plan_locator_fields(item)
+    if not fields:
+        raise SplitOperationError(
+            f"legacy item {task_id} has no plan locator (plan_path/artifacts.plan/"
+            "artifact_path); cannot adopt without an authoritative plan locator",
+            REASON_VALIDATION_ERROR,
+        )
+    norms = {os.path.normpath(raw) for _, raw in fields}
+    if norms != {os.path.normpath(plan_doc)}:
+        details = "; ".join(f"{key}={raw!r}" for key, raw in fields)
+        raise SplitOperationError(
+            f"legacy item {task_id} plan locators ({details}) do not match the "
+            f"requested plan_doc {plan_doc!r}; adoption preserves the deployed "
+            "locator",
+            REASON_VALIDATION_ERROR,
+        )
+
+
+def _task_adopt_business_projection(
+    item: dict[str, Any], task_id: str, plan_doc: str
+) -> dict[str, Any]:
+    """Validate and return the existing item projection adoption will mirror.
+
+    Legacy EXharness items do not require a top-level ``phase``. Coordinate's
+    existing reconcile contract derives the mirror lifecycle from
+    ``workflow.status`` and then ``status``; adoption must use that same rule.
+    """
+    title = item.get("title")
+    priority = item.get("priority")
+    status = item.get("status")
+    dependencies = item.get("dependencies", [])
+    mirror = task_mirror_from_item(item)
+    phase = mirror["phase"]
+    if not isinstance(title, str) or not title:
+        raise SplitOperationError(
+            "deployed checklist item has no title",
+            REASON_FINGERPRINT_DRIFT,
+        )
+    if not isinstance(phase, str) or not phase:
+        raise SplitOperationError(
+            "deployed checklist item has no workflow.status or status",
+            REASON_VALIDATION_ERROR,
+        )
+    if not isinstance(priority, str) or not priority:
+        raise SplitOperationError(
+            "deployed checklist item has no priority",
+            REASON_FINGERPRINT_DRIFT,
+        )
+    if not isinstance(status, str) or not status:
+        raise SplitOperationError(
+            "deployed checklist item has no status",
+            REASON_FINGERPRINT_DRIFT,
+        )
+    if not isinstance(dependencies, list):
+        raise SplitOperationError(
+            "deployed checklist item dependencies must be a list",
+            REASON_VALIDATION_ERROR,
+        )
+    _verify_item_plan_locator(item, task_id, plan_doc)
+    return {
+        "title": title,
+        "phase": phase,
+        "priority": priority,
+        "status": status,
+        "dependencies": dependencies,
+        "owner": mirror["owner"],
+        "branch": mirror["branch"],
+        "pr": mirror["pr"],
+    }
+
+
+@dataclass(frozen=True)
+class TaskAdoptionPrepareResult:
+    """Read-only adoption prepare output: the expected fingerprints that the
+    file half must verify (stale-input gate) before any mutation."""
+
+    workspace_id: str
+    task_id: str
+    plan_doc: str
+    plan_sha256: str
+    item_fingerprint: str
+    before_fingerprint: str
+    input_fingerprint: str
+    operation_id: str
+    already_adopted: bool
+    files_applied_at: str | None = None
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "workspace_id": self.workspace_id,
+            "task_id": self.task_id,
+            "plan_doc": self.plan_doc,
+            "plan_sha256": self.plan_sha256,
+            "item_fingerprint": self.item_fingerprint,
+            "before_fingerprint": self.before_fingerprint,
+            "input_fingerprint": self.input_fingerprint,
+            "operation_id": self.operation_id,
+            "already_adopted": self.already_adopted,
+            "files_applied_at": self.files_applied_at,
+        }
+
+
+def prepare_task_adoption(
+    *,
+    workspace_path: str | Path,
+    harness_root: str | Path,
+    workspace_id: str,
+    task_id: str,
+    plan_doc: str,
+    operation_id: str | None = None,
+) -> TaskAdoptionPrepareResult:
+    """Read-only prepare for legacy first-adoption.
+
+    Loads the single checklist authority, finds the existing item, and derives
+    the expected item fingerprint, plan bytes digest, and input fingerprint the
+    caller must pass back to the file half. No mutation, no lock, no DB.
+    """
+    explicit = validate_uuid(operation_id) if operation_id is not None else None
+    if not workspace_id:
+        raise SplitOperationError("workspace_id is required", REASON_VALIDATION_ERROR)
+    if not task_id:
+        raise SplitOperationError("task_id is required", REASON_VALIDATION_ERROR)
+    plan_doc = validate_workspace_relative_path(plan_doc)
+    workspace_path = Path(workspace_path)
+    plan_abs = workspace_path / plan_doc
+    if not plan_abs.is_file():
+        raise SplitOperationError(
+            f"plan_doc does not exist: {plan_abs}",
+            REASON_FILES_NOT_DEPLOYED,
+        )
+    plan_sha256 = compute_plan_sha256(plan_abs)
+
+    try:
+        checklist, _ = load_checklist(harness_root, purpose="read")
+    except ChecklistError as exc:
+        raise SplitOperationError(str(exc), exc.reason) from exc
+    item = _find_checklist_item(checklist, task_id)
+    if item is None:
+        raise SplitOperationError(
+            f"task {task_id} not found in the checklist; adoption only accepts "
+            "an existing legacy item",
+            REASON_ITEM_NOT_FOUND,
+        )
+    _task_adopt_business_projection(item, task_id, plan_doc)
+    envelope = item.get("split_operation")
+    if envelope is not None:
+        if not isinstance(envelope, dict):
+            raise SplitOperationError(
+                f"task {task_id} has a malformed split_operation envelope; "
+                "refusing to adopt",
+                REASON_OPERATION_CONFLICT,
+            )
+        if set(envelope.keys()) != SPLIT_OPERATION_ENVELOPE_KEYS:
+            raise SplitOperationError(
+                f"task {task_id} has a malformed envelope (unexpected keys); "
+                "refusing to adopt",
+                REASON_OPERATION_CONFLICT,
+            )
+        if envelope.get("operation_kind") != OPERATION_KIND_TASK_ADOPT:
+            raise SplitOperationError(
+                f"task {task_id} is already bound to operation kind "
+                f"{envelope.get('operation_kind')!r}; refusing to adopt",
+                REASON_OPERATION_CONFLICT,
+            )
+        bound_operation_id = envelope.get("operation_id")
+        if explicit is None:
+            raise SplitOperationError(
+                f"task {task_id} is already adopted under operation "
+                f"{bound_operation_id!r}; pass --operation-id to replay it "
+                "idempotently",
+                REASON_OPERATION_CONFLICT,
+            )
+        if explicit != bound_operation_id:
+            raise SplitOperationError(
+                f"task {task_id} is already adopted under operation "
+                f"{bound_operation_id!r}; explicit --operation-id {explicit} "
+                "does not match",
+                REASON_OPERATION_CONFLICT,
+            )
+        item_fingerprint = compute_task_item_fingerprint(item=item, task_id=task_id)
+        input_fingerprint = build_task_adopt_input_fingerprint(
+            workspace_id=workspace_id,
+            task_id=task_id,
+            plan_doc=plan_doc,
+            plan_sha256=plan_sha256,
+            item_fingerprint=item_fingerprint,
+        )
+        if envelope.get("input_fingerprint") != input_fingerprint:
+            raise SplitOperationError(
+                f"task {task_id} has operation {explicit} but the item or plan "
+                "bytes have drifted since adoption",
+                REASON_FINGERPRINT_DRIFT,
+            )
+        return TaskAdoptionPrepareResult(
+            workspace_id=workspace_id,
+            task_id=task_id,
+            plan_doc=plan_doc,
+            plan_sha256=plan_sha256,
+            item_fingerprint=item_fingerprint,
+            before_fingerprint=item_fingerprint,
+            input_fingerprint=input_fingerprint,
+            operation_id=explicit,
+            already_adopted=True,
+            files_applied_at=envelope.get("files_applied_at"),
+        )
+
+    _verify_item_plan_locator(item, task_id, plan_doc)
+    item_fingerprint = compute_task_item_fingerprint(item=item, task_id=task_id)
+    input_fingerprint = build_task_adopt_input_fingerprint(
+        workspace_id=workspace_id,
+        task_id=task_id,
+        plan_doc=plan_doc,
+        plan_sha256=plan_sha256,
+        item_fingerprint=item_fingerprint,
+    )
+    return TaskAdoptionPrepareResult(
+        workspace_id=workspace_id,
+        task_id=task_id,
+        plan_doc=plan_doc,
+        plan_sha256=plan_sha256,
+        item_fingerprint=item_fingerprint,
+        before_fingerprint=item_fingerprint,
+        input_fingerprint=input_fingerprint,
+        operation_id=explicit or str(uuid.uuid4()),
+        already_adopted=False,
+    )
+
+
+@dataclass(frozen=True)
+class TaskAdoptFilesOperationResult:
+    workspace_id: str
+    workspace_path: str
+    harness_root: str
+    task_id: str
+    plan_doc: str
+    operation_id: str
+    operation_kind: str
+    contract_version: int
+    input_fingerprint: str
+    before_fingerprint: str
+    after_fingerprint: str
+    files_applied_at: str
+    checklist_changed: bool
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "workspace_id": self.workspace_id,
+            "workspace_path": self.workspace_path,
+            "harness_root": self.harness_root,
+            "task_id": self.task_id,
+            "plan_doc": self.plan_doc,
+            "operation_id": self.operation_id,
+            "operation_kind": self.operation_kind,
+            "contract_version": self.contract_version,
+            "input_fingerprint": self.input_fingerprint,
+            "before_fingerprint": self.before_fingerprint,
+            "after_fingerprint": self.after_fingerprint,
+            "files_applied_at": self.files_applied_at,
+            "checklist_changed": self.checklist_changed,
+        }
+
+
+def apply_task_adopt_files(
+    *,
+    workspace_path: str | Path,
+    harness_root: str | Path,
+    task_id: str,
+    plan_doc: str,
+    operation_id: str,
+    workspace_id: str,
+    expected_item_fingerprint: str,
+    expected_plan_sha256: str,
+    now: str | None = None,
+    _lock_timeout: float = 30.0,
+    _lock: ChecklistLock | None = None,
+) -> TaskAdoptFilesOperationResult:
+    """Apply the file half of a task.adopt split operation.
+
+    Accepts ONLY an existing checklist item without a split-operation envelope.
+    The caller must supply the expected item fingerprint and plan bytes digest
+    (from ``prepare_task_adoption``); both are re-verified before any mutation
+    (the plan digest before the lock, the item projection inside the lock) so
+    stale item/status/dependency/plan-byte inputs fail closed with zero writes.
+    Idempotent when the exact same adoption envelope is already deployed (file
+    bytes and mtime preserved).
+    """
+    operation_id = validate_uuid(operation_id)
+    if not workspace_id:
+        raise SplitOperationError("workspace_id is required", REASON_VALIDATION_ERROR)
+    if not task_id:
+        raise SplitOperationError("task_id is required", REASON_VALIDATION_ERROR)
+    plan_doc = validate_workspace_relative_path(plan_doc)
+    expected_item_fingerprint = validate_sha256(expected_item_fingerprint)
+    expected_plan_sha256 = validate_sha256(expected_plan_sha256)
+    workspace_path = Path(workspace_path)
+    harness_root = Path(harness_root)
+    plan_abs = workspace_path / plan_doc
+    if not plan_abs.is_file():
+        raise SplitOperationError(
+            f"plan_doc does not exist: {plan_abs}",
+            REASON_FILES_NOT_DEPLOYED,
+        )
+    plan_sha256 = compute_plan_sha256(plan_abs)
+    if plan_sha256 != expected_plan_sha256:
+        raise SplitOperationError(
+            f"plan bytes drifted before file mutation: expected sha256 "
+            f"{expected_plan_sha256}, current {plan_sha256}",
+            REASON_FINGERPRINT_DRIFT,
+        )
+    files_applied_at = now or _utc_now()
+    input_fingerprint = build_task_adopt_input_fingerprint(
+        workspace_id=workspace_id,
+        task_id=task_id,
+        plan_doc=plan_doc,
+        plan_sha256=plan_sha256,
+        item_fingerprint=expected_item_fingerprint,
+    )
+    before_fingerprint = expected_item_fingerprint
+    # Adoption adds only the envelope; the business projection is unchanged,
+    # so the after fingerprint equals the before fingerprint by construction.
+    after_fingerprint = expected_item_fingerprint
+    envelope = build_task_adopt_envelope(
+        operation_id=operation_id,
+        workspace_id=workspace_id,
+        task_id=task_id,
+        input_fingerprint=input_fingerprint,
+        before_fingerprint=before_fingerprint,
+        after_fingerprint=after_fingerprint,
+        files_applied_at=files_applied_at,
+    )
+
+    def callback(candidate: dict[str, Any]) -> bool:
+        existing = _find_checklist_item(candidate, task_id)
+        if existing is None:
+            raise SplitOperationError(
+                f"task {task_id} not found in the checklist; adoption only "
+                "accepts an existing legacy item",
+                REASON_ITEM_NOT_FOUND,
+            )
+        existing_envelope = existing.get("split_operation")
+        if isinstance(existing_envelope, dict):
+            if existing_envelope.get("operation_id") == operation_id:
+                if set(existing_envelope.keys()) != SPLIT_OPERATION_ENVELOPE_KEYS:
+                    raise SplitOperationError(
+                        f"task {task_id} has a malformed envelope for operation "
+                        f"{operation_id}",
+                        REASON_OPERATION_CONFLICT,
+                    )
+                if existing_envelope.get("operation_kind") != OPERATION_KIND_TASK_ADOPT:
+                    raise SplitOperationError(
+                        f"task {task_id} has operation {operation_id} but it is "
+                        f"not a task.adopt envelope",
+                        REASON_OPERATION_CONFLICT,
+                    )
+                for key in SPLIT_OPERATION_ENVELOPE_KEYS:
+                    if key == "files_applied_at":
+                        # Exact retry across different apply timestamps keeps
+                        # the original envelope time.
+                        continue
+                    if existing_envelope.get(key) != envelope.get(key):
+                        raise SplitOperationError(
+                            f"task {task_id} has operation {operation_id} but "
+                            f"envelope field {key} differs",
+                            REASON_OPERATION_CONFLICT,
+                        )
+                current_fingerprint = compute_task_item_fingerprint(
+                    item=existing, task_id=task_id
+                )
+                if current_fingerprint != after_fingerprint:
+                    raise SplitOperationError(
+                        f"task {task_id} has operation {operation_id} but the "
+                        "current projection has drifted",
+                        REASON_FINGERPRINT_DRIFT,
+                    )
+                # Idempotent success: no rewrite; the original envelope time wins.
+                return False
+            if set(existing_envelope.keys()) != SPLIT_OPERATION_ENVELOPE_KEYS:
+                raise SplitOperationError(
+                    f"task {task_id} already has a malformed split_operation "
+                    "envelope; refusing to adopt",
+                    REASON_OPERATION_CONFLICT,
+                )
+            raise SplitOperationError(
+                f"task {task_id} already exists in checklist with a different "
+                "operation",
+                REASON_OPERATION_CONFLICT,
+            )
+        if existing_envelope is not None:
+            raise SplitOperationError(
+                f"task {task_id} already has a malformed (non-dict) "
+                "split_operation envelope; refusing to adopt",
+                REASON_OPERATION_CONFLICT,
+            )
+        # Explicit stale-input gate: the current item projection must still
+        # match the fingerprint the caller prepared from.
+        current_fingerprint = compute_task_item_fingerprint(item=existing, task_id=task_id)
+        if current_fingerprint != expected_item_fingerprint:
+            raise SplitOperationError(
+                f"task {task_id} projection drifted before file mutation "
+                "(status/dependency/title/phase changed since prepare)",
+                REASON_FINGERPRINT_DRIFT,
+            )
+        _task_adopt_business_projection(existing, task_id, plan_doc)
+        existing["split_operation"] = envelope
+        return True
+
+    try:
+        checklist, changed = mutate_checklist(
+            harness_root,
+            callback,
+            lock_timeout=_lock_timeout,
+            _lock=_lock,
+        )
+    except ChecklistError as exc:
+        raise SplitOperationError(str(exc), exc.reason) from exc
+    if changed:
+        applied_at = files_applied_at
+    else:
+        existing = _find_checklist_item(checklist, task_id)
+        applied_at = existing["split_operation"]["files_applied_at"]
+
+    return TaskAdoptFilesOperationResult(
+        workspace_id=workspace_id,
+        workspace_path=str(workspace_path),
+        harness_root=str(harness_root),
+        task_id=task_id,
+        plan_doc=plan_doc,
+        operation_id=operation_id,
+        operation_kind=OPERATION_KIND_TASK_ADOPT,
+        contract_version=CONTRACT_VERSION,
+        input_fingerprint=input_fingerprint,
+        before_fingerprint=before_fingerprint,
+        after_fingerprint=after_fingerprint,
+        files_applied_at=applied_at,
+        checklist_changed=changed,
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -831,7 +1338,9 @@ def apply_task_create_files(
                 raise SplitOperationError(
                     f"task {task_id} already exists in the checklist without a "
                     "split-operation envelope; refusing to adopt a legacy "
-                    "unbound item. Reconcile it explicitly instead.",
+                    "unbound item. Legacy first-adoption is not available here: "
+                    "leave the item untouched until the explicit adoption "
+                    "entry exists.",
                     REASON_LEGACY_UNBOUND_ITEM,
                 )
             # Bound to another operation.
@@ -1107,7 +1616,9 @@ def apply_issue_materialize_files(
                 raise SplitOperationError(
                     f"task {task_id} already exists in the checklist without a "
                     "split-operation envelope; refusing to adopt a legacy "
-                    "unbound item. Reconcile it explicitly instead.",
+                    "unbound item. Legacy first-adoption is not available here: "
+                    "leave the item untouched until the explicit adoption "
+                    "entry exists.",
                     REASON_LEGACY_UNBOUND_ITEM,
                 )
             # Bound to another operation/source.
@@ -1661,6 +2172,32 @@ def verify_task_create_fingerprints_readonly(
         return [str(exc)], None
 
 
+def verify_task_adopt_envelope_readonly(
+    *,
+    envelope: dict[str, Any],
+    workspace_id: str,
+    task_id: str,
+    operation_id: str,
+    input_fingerprint: str,
+    before_fingerprint: str,
+    after_fingerprint: str,
+) -> list[str]:
+    """Read-only task.adopt shape verifier returning a list of mismatches."""
+    try:
+        _verify_task_adopt_envelope_shape(
+            envelope=envelope,
+            workspace_id=workspace_id,
+            task_id=task_id,
+            operation_id=operation_id,
+            input_fingerprint=input_fingerprint,
+            before_fingerprint=before_fingerprint,
+            after_fingerprint=after_fingerprint,
+        )
+        return []
+    except SplitOperationError as exc:
+        return [str(exc)]
+
+
 def verify_issue_materialize_envelope_readonly(
     *,
     envelope: dict[str, Any],
@@ -1977,6 +2514,8 @@ def _check_ledger_idempotency(
     ready_key: str,
     actor: str,
     target: str | None,
+    operation_kind: str = OPERATION_KIND_TASK_CREATE,
+    expected_pr: str | None = None,
 ) -> dict[str, Any] | None:
     """Return the existing ledger row if the operation is already applied exactly.
 
@@ -1991,7 +2530,7 @@ def _check_ledger_idempotency(
     so = existing
     checks = [
         (so.contract_version == CONTRACT_VERSION, "contract_version"),
-        (so.operation_kind == OPERATION_KIND_TASK_CREATE, "operation_kind"),
+        (so.operation_kind == operation_kind, "operation_kind"),
         (so.workspace_id == workspace_id, "workspace_id"),
         (so.target_kind == TARGET_KIND_CHECKLIST_TASK, "target_kind"),
         (so.target_id == task_id, "target_id"),
@@ -2080,7 +2619,7 @@ def _check_ledger_idempotency(
         or task["owner"] != (expected_task_payload.get("owner") if "owner" in expected_task_payload else None)
         or task["branch"] != (expected_task_payload.get("branch") if "branch" in expected_task_payload else None)
         or task["last_event_id"] != so.record_event_id
-        or task["pr"] is not None
+        or task["pr"] != expected_pr
     ):
         raise SplitOperationError(
             "task mirror record columns differ from expected record intent",
@@ -2377,6 +2916,510 @@ def apply_task_create_record(
         (operation_id,),
     ).fetchone()
     return TaskCreateRecordResult(
+        workspace=workspace,
+        task=row_to_dict(task_row),
+        event=row_to_dict(event_result.row),
+        event_created=event_result.created,
+        operation=row_to_dict(ledger_row),
+    )
+
+
+# ---------------------------------------------------------------------------
+# Legacy task adoption record-half
+# ---------------------------------------------------------------------------
+
+
+def _verify_task_adopt_envelope_shape(
+    *,
+    envelope: dict[str, Any],
+    workspace_id: str,
+    task_id: str,
+    operation_id: str,
+    input_fingerprint: str,
+    before_fingerprint: str,
+    after_fingerprint: str,
+) -> None:
+    """Fail closed if the deployed task.adopt envelope is not the exact shape."""
+    if set(envelope.keys()) != SPLIT_OPERATION_ENVELOPE_KEYS:
+        raise SplitOperationError(
+            "deployed envelope has unexpected keys",
+            REASON_FINGERPRINT_DRIFT,
+        )
+    checks: list[tuple[Any, Any, str]] = [
+        (envelope["contract_version"], CONTRACT_VERSION, "contract_version"),
+        (envelope["operation_id"], operation_id, "operation_id"),
+        (envelope["operation_kind"], OPERATION_KIND_TASK_ADOPT, "operation_kind"),
+        (envelope["workspace_id"], workspace_id, "workspace_id"),
+        (envelope["target_kind"], TARGET_KIND_CHECKLIST_TASK, "target_kind"),
+        (envelope["target_id"], task_id, "target_id"),
+        (envelope["source_kind"], None, "source_kind"),
+        (envelope["source_id"], None, "source_id"),
+        (envelope["input_fingerprint"], input_fingerprint, "input_fingerprint"),
+        (envelope["before_fingerprint"], before_fingerprint, "before_fingerprint"),
+        (envelope["after_fingerprint"], after_fingerprint, "after_fingerprint"),
+    ]
+    for actual, expected, field in checks:
+        if actual != expected:
+            raise SplitOperationError(
+                f"deployed envelope field {field} mismatch: {actual!r} != {expected!r}",
+                REASON_FINGERPRINT_DRIFT,
+            )
+    validate_files_applied_at(envelope["files_applied_at"])
+
+
+def _verify_task_adopt_envelope_fingerprints(
+    *,
+    item: dict[str, Any],
+    envelope: dict[str, Any],
+    workspace_id: str,
+    task_id: str,
+    plan_doc: str,
+    plan_sha256: str,
+    input_fingerprint: str,
+    before_fingerprint: str,
+    after_fingerprint: str,
+) -> dict[str, Any]:
+    """Derive the deployed legacy projection and compare every fingerprint.
+
+    Returns the deployed projection triple ``(title, phase, priority)`` plus
+    the coarse status and dependencies. The input fingerprint is recomputed
+    from the deployed item projection and the on-disk plan bytes, so an
+    undeployed/different plan or a drifted item fails closed.
+    """
+    deployed = _task_adopt_business_projection(item, task_id, plan_doc)
+
+    item_fingerprint = compute_task_item_fingerprint(item=item, task_id=task_id)
+    expected_input = build_task_adopt_input_fingerprint(
+        workspace_id=workspace_id,
+        task_id=task_id,
+        plan_doc=plan_doc,
+        plan_sha256=plan_sha256,
+        item_fingerprint=item_fingerprint,
+    )
+
+    if envelope.get("input_fingerprint") != expected_input:
+        raise SplitOperationError(
+            "deployed input fingerprint does not match the recomputed "
+            "adoption input fingerprint (item projection or plan bytes differ "
+            "from the file half)",
+            REASON_FINGERPRINT_DRIFT,
+        )
+    if envelope.get("before_fingerprint") != item_fingerprint:
+        raise SplitOperationError(
+            "deployed before fingerprint does not match the deployed item "
+            "projection",
+            REASON_FINGERPRINT_DRIFT,
+        )
+    if envelope.get("after_fingerprint") != item_fingerprint:
+        raise SplitOperationError(
+            "deployed after fingerprint does not match the deployed item "
+            "projection",
+            REASON_FINGERPRINT_DRIFT,
+        )
+    if input_fingerprint != expected_input:
+        raise SplitOperationError(
+            "supplied input fingerprint does not match the deployed input "
+            "fingerprint",
+            REASON_FINGERPRINT_DRIFT,
+        )
+    if before_fingerprint != item_fingerprint:
+        raise SplitOperationError(
+            "supplied before fingerprint does not match the deployed item "
+            "projection",
+            REASON_FINGERPRINT_DRIFT,
+        )
+    if after_fingerprint != item_fingerprint:
+        raise SplitOperationError(
+            "supplied after fingerprint does not match the deployed item "
+            "projection",
+            REASON_FINGERPRINT_DRIFT,
+        )
+    return deployed
+
+
+@dataclass(frozen=True)
+class TaskAdoptRecordResult:
+    workspace: Workspace
+    task: dict[str, Any]
+    event: dict[str, Any]
+    event_created: bool
+    operation: dict[str, Any]
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "workspace": self.workspace.to_dict(),
+            "task": self.task,
+            "event": self.event,
+            "event_created": self.event_created,
+            "operation": self.operation,
+        }
+
+
+def apply_task_adopt_record(
+    conn: sqlite3.Connection,
+    *,
+    workspace_id: str,
+    task_id: str,
+    plan_doc: str,
+    operation_id: str,
+    input_fingerprint: str,
+    before_fingerprint: str,
+    after_fingerprint: str,
+    owner: str | None = None,
+    branch: str | None = None,
+    actor: str = "operator",
+    target: str | None = "worker",
+    payload: dict[str, Any] | None = None,
+    idempotency_key: str | None = None,
+    _inject_after_step: Callable[[str], None] | None = None,
+) -> TaskAdoptRecordResult:
+    """Apply the record half of a task.adopt split operation in one transaction.
+
+    Verifies the deployed checklist envelope and every fingerprint from the
+    deployed readback (item projection + plan bytes) before any DB write, then
+    commits the ``split_operations`` ledger row, the task mirror and the
+    ``plan.ready`` event under a single SAVEPOINT. An injected failure after
+    any step rolls back all effects.
+    """
+    (
+        operation_id,
+        workspace_id,
+        input_fingerprint,
+        before_fingerprint,
+        after_fingerprint,
+        task_id,
+        plan_doc,
+    ) = _validate_record_inputs(
+        workspace_id=workspace_id,
+        operation_id=operation_id,
+        input_fingerprint=input_fingerprint,
+        before_fingerprint=before_fingerprint,
+        after_fingerprint=after_fingerprint,
+        task_id=task_id,
+        plan_doc=plan_doc,
+    )
+
+    workspace_row = conn.execute(
+        "SELECT * FROM workspaces WHERE id = ?", (workspace_id,)
+    ).fetchone()
+    if workspace_row is None:
+        raise ValueError(f"unknown workspace: {workspace_id}")
+    workspace = Workspace.from_row(workspace_row)
+
+    plan_abs = _resolve_workspace_path(workspace, plan_doc)
+    if not plan_abs.is_file():
+        raise SplitOperationError(
+            f"plan_doc does not exist at {plan_abs}",
+            REASON_FILES_NOT_DEPLOYED,
+        )
+    plan_sha256 = compute_plan_sha256(plan_abs)
+
+    item = _load_deployed_envelope(
+        workspace=workspace,
+        task_id=task_id,
+        operation_id=operation_id,
+    )
+    envelope = item["split_operation"]
+
+    _verify_task_adopt_envelope_shape(
+        envelope=envelope,
+        workspace_id=workspace_id,
+        task_id=task_id,
+        operation_id=operation_id,
+        input_fingerprint=input_fingerprint,
+        before_fingerprint=before_fingerprint,
+        after_fingerprint=after_fingerprint,
+    )
+
+    # A different operation already bound to this checklist target is a hard
+    # conflict; adoption must not create a second ledger row for the target.
+    for existing_op in list_split_operations(
+        conn,
+        workspace_id=workspace_id,
+        target_kind=TARGET_KIND_CHECKLIST_TASK,
+        target_id=task_id,
+    ):
+        if existing_op.operation_id != operation_id:
+            raise SplitOperationError(
+                f"task {task_id} already has operation {existing_op.operation_id} "
+                "in the ledger",
+                REASON_OPERATION_CONFLICT,
+            )
+
+    deployed = _verify_task_adopt_envelope_fingerprints(
+        item=item,
+        envelope=envelope,
+        workspace_id=workspace_id,
+        task_id=task_id,
+        plan_doc=plan_doc,
+        plan_sha256=plan_sha256,
+        input_fingerprint=input_fingerprint,
+        before_fingerprint=before_fingerprint,
+        after_fingerprint=after_fingerprint,
+    )
+
+    # Owner/branch/PR default to the deployed file projection. A pre-existing
+    # matching legacy mirror may carry Coordinator-owned runtime bindings that
+    # reconcile intentionally preserves when the file projection omits them.
+    effective_owner = owner if owner is not None else deployed["owner"]
+    effective_branch = branch if branch is not None else deployed["branch"]
+    effective_pr = deployed["pr"]
+    preserved_payload: dict[str, Any] = {}
+
+    # Pre-existing mirror gate (before any DB write). Exact adopted metadata is
+    # the replay path. Missing metadata is accepted only for a mirror whose
+    # file-owned payload still matches the deployed legacy item byte-for-value;
+    # otherwise an explicit adoption must never overwrite unknown DB state.
+    existing_mirror = conn.execute(
+        "SELECT * FROM tasks WHERE workspace_id = ? AND task_id = ?",
+        (workspace_id, task_id),
+    ).fetchone()
+    if existing_mirror is not None:
+        try:
+            mirror_payload = json.loads(existing_mirror["payload_json"])
+        except (json.JSONDecodeError, TypeError):
+            mirror_payload = None
+        if not isinstance(mirror_payload, dict):
+            raise SplitOperationError(
+                f"task {task_id} has a malformed task mirror payload",
+                REASON_OPERATION_CONFLICT,
+            )
+        preserved_payload = dict(mirror_payload)
+        expected_meta = {
+            "contract_version": CONTRACT_VERSION,
+            "operation_id": operation_id,
+            "operation_kind": OPERATION_KIND_TASK_ADOPT,
+            "input_fingerprint": input_fingerprint,
+            "before_fingerprint": before_fingerprint,
+            "after_fingerprint": after_fingerprint,
+        }
+        if "split_operation" in mirror_payload:
+            if mirror_payload["split_operation"] != expected_meta:
+                raise SplitOperationError(
+                    f"task {task_id} already has a task mirror with different "
+                    "split-operation metadata",
+                    REASON_OPERATION_CONFLICT,
+                )
+        else:
+            legacy_item = dict(item)
+            legacy_item.pop("split_operation", None)
+            for key, value in legacy_item.items():
+                if key not in mirror_payload or mirror_payload[key] != value:
+                    raise SplitOperationError(
+                        f"task {task_id} legacy mirror payload differs from the "
+                        f"deployed checklist field {key!r}",
+                        REASON_OPERATION_CONFLICT,
+                    )
+            projected = task_mirror_from_item(legacy_item)
+            if existing_mirror["phase"] != projected["phase"]:
+                raise SplitOperationError(
+                    f"task {task_id} legacy mirror phase differs from the "
+                    "deployed checklist projection",
+                    REASON_OPERATION_CONFLICT,
+                )
+            for field in ("owner", "branch", "pr"):
+                projected_value = projected[field]
+                existing_value = existing_mirror[field]
+                if projected_value is not None and existing_value != projected_value:
+                    raise SplitOperationError(
+                        f"task {task_id} legacy mirror {field} conflicts with "
+                        "the deployed checklist projection",
+                        REASON_OPERATION_CONFLICT,
+                    )
+
+        for field, requested in (
+            ("owner", effective_owner),
+            ("branch", effective_branch),
+        ):
+            existing_value = existing_mirror[field]
+            if requested is not None and existing_value is not None and requested != existing_value:
+                raise SplitOperationError(
+                    f"task {task_id} requested {field} conflicts with the "
+                    "existing Coordinate mirror",
+                    REASON_OPERATION_CONFLICT,
+                )
+        if effective_owner is None:
+            effective_owner = existing_mirror["owner"]
+        if effective_branch is None:
+            effective_branch = existing_mirror["branch"]
+        if effective_pr is None:
+            effective_pr = existing_mirror["pr"]
+
+    operation_meta = {
+        "contract_version": CONTRACT_VERSION,
+        "operation_id": operation_id,
+        "operation_kind": OPERATION_KIND_TASK_ADOPT,
+        "input_fingerprint": input_fingerprint,
+        "before_fingerprint": before_fingerprint,
+        "after_fingerprint": after_fingerprint,
+    }
+    extra_payload = dict(payload or {})
+    task_payload = {
+        **extra_payload,
+        **preserved_payload,
+        "task_id": task_id,
+        "title": deployed["title"],
+        "plan_doc": plan_doc,
+        "absolute_plan_doc": str(plan_abs),
+        "phase": deployed["phase"],
+        "status": deployed["status"],
+        "priority": deployed["priority"],
+        "dependencies": deployed["dependencies"],
+        "adopted": True,
+        "split_operation": operation_meta,
+    }
+    if effective_branch:
+        task_payload["branch"] = effective_branch
+    if effective_owner:
+        task_payload["owner"] = effective_owner
+
+    plan_content_hash = plan_sha256[:16]
+    supersedes_plan_ready_event_id = _latest_prior_plan_ready_id(
+        conn, workspace_id=workspace_id, task_id=task_id, exclude_operation_id=operation_id
+    )
+    event_payload = {
+        **task_payload,
+        "workspace_path": workspace.path,
+        "current_branch": workspace.base_branch,
+        "allocated_branch": effective_branch,
+        "status": "ready_for_worker" if deployed["phase"] in {"ready", "planned"} else deployed["status"],
+        "plan_content_hash": plan_content_hash,
+        "plan_sha256": plan_sha256,
+        "supersedes_plan_ready_event_id": supersedes_plan_ready_event_id,
+    }
+    ready_key = (
+        f"{workspace_id}:{task_id}:plan.ready:{operation_id}:"
+        f"{idempotency_key or (plan_content_hash or 'nohash')}"
+    )
+
+    existing_ledger = _check_ledger_idempotency(
+        conn,
+        operation_id=operation_id,
+        workspace_id=workspace_id,
+        task_id=task_id,
+        input_fingerprint=input_fingerprint,
+        before_fingerprint=before_fingerprint,
+        after_fingerprint=after_fingerprint,
+        envelope=envelope,
+        expected_task_payload=task_payload,
+        expected_event_payload=event_payload,
+        ready_key=ready_key,
+        actor=actor,
+        target=target,
+        operation_kind=OPERATION_KIND_TASK_ADOPT,
+        expected_pr=effective_pr,
+    )
+    if existing_ledger is not None:
+        event = conn.execute(
+            "SELECT * FROM events WHERE id = ?",
+            (existing_ledger["record_event_id"],),
+        ).fetchone()
+        task = conn.execute(
+            "SELECT * FROM tasks WHERE workspace_id = ? AND task_id = ?",
+            (workspace_id, task_id),
+        ).fetchone()
+        return TaskAdoptRecordResult(
+            workspace=workspace,
+            task=row_to_dict(task),
+            event=row_to_dict(event),
+            event_created=False,
+            operation=existing_ledger,
+        )
+
+    now = utc_now()
+    conn.execute("SAVEPOINT task_adopt_apply")
+    record_event_id: str | None = None
+    try:
+        insert_split_operation(
+            conn,
+            operation_id=operation_id,
+            contract_version=CONTRACT_VERSION,
+            operation_kind=OPERATION_KIND_TASK_ADOPT,
+            workspace_id=workspace_id,
+            target_kind=TARGET_KIND_CHECKLIST_TASK,
+            target_id=task_id,
+            source_kind=None,
+            source_id=None,
+            input_fingerprint=input_fingerprint,
+            before_fingerprint=before_fingerprint,
+            after_fingerprint=after_fingerprint,
+            status=STATUS_RECORD_APPLIED,
+            created_at=now,
+            updated_at=now,
+        )
+        if _inject_after_step:
+            _inject_after_step("insert_ledger")
+
+        task_row, _ = upsert_task_mirror(
+            conn,
+            workspace_id=workspace_id,
+            task_id=task_id,
+            phase=deployed["phase"],
+            owner=effective_owner,
+            branch=effective_branch,
+            pr=effective_pr,
+            payload=task_payload,
+            commit=False,
+        )
+        if _inject_after_step:
+            _inject_after_step("upsert_mirror_initial")
+
+        event_result = append_event(
+            conn,
+            workspace_id=workspace_id,
+            event_type="plan.ready",
+            actor=actor,
+            target=target,
+            task_id=task_id,
+            idempotency_key=ready_key,
+            payload=event_payload,
+            commit=False,
+        )
+        if not event_result.created:
+            raise SplitOperationError(
+                f"plan.ready idempotency key {ready_key!r} already exists; "
+                "refusing to link a pre-existing event to a new split operation",
+                REASON_OPERATION_CONFLICT,
+            )
+        record_event_id = event_result.row["id"]
+        if _inject_after_step:
+            _inject_after_step("append_event")
+
+        task_row, _ = upsert_task_mirror(
+            conn,
+            workspace_id=workspace_id,
+            task_id=task_id,
+            phase=deployed["phase"],
+            owner=effective_owner,
+            branch=effective_branch,
+            pr=effective_pr,
+            payload=task_payload,
+            last_event_id=record_event_id,
+            commit=False,
+        )
+        if _inject_after_step:
+            _inject_after_step("upsert_mirror_final")
+
+        update_split_operation_event(
+            conn,
+            operation_id=operation_id,
+            event_id=record_event_id,
+        )
+        if _inject_after_step:
+            _inject_after_step("link_ledger_event")
+
+        conn.execute("RELEASE SAVEPOINT task_adopt_apply")
+        conn.commit()
+    except Exception:
+        conn.execute("ROLLBACK TO SAVEPOINT task_adopt_apply")
+        conn.execute("RELEASE SAVEPOINT task_adopt_apply")
+        raise
+
+    ledger_row = conn.execute(
+        "SELECT * FROM split_operations WHERE operation_id = ?",
+        (operation_id,),
+    ).fetchone()
+    return TaskAdoptRecordResult(
         workspace=workspace,
         task=row_to_dict(task_row),
         event=row_to_dict(event_result.row),

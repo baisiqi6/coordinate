@@ -22,6 +22,7 @@ from unittest.mock import Mock, patch
 
 from coordinate.db import append_event, get_job, initialize, list_deliveries, list_events, mark_job_cancelled, row_to_dict, set_workspace_agent, upsert_workspace, upsert_workspace_host_profile
 from coordinate.execution_leases import LEASE_DEFAULT_TTL_SECONDS, get_attempt_lease
+from coordinate.execution_resources import build_worktree_resource, compute_resource_key
 from coordinate.lease_envelope import validate_execution_lease
 from coordinate.executor_capacity import (
     CapacityCatalog,
@@ -43,7 +44,7 @@ from coordinate.execution_cli import (
     handle_runtime_job_report,
 )
 from coordinate.executor_routing import build_routing_request
-from coordinate.jobs import cancel_job
+from coordinate.jobs import cancel_job, retry_job
 from coordinate.runtime import (
     RuntimeError as CoordinateRuntimeError,
     claim_job,
@@ -3260,6 +3261,208 @@ class RuntimeClaimDeactivateRaceTests(unittest.TestCase):
         finally:
             conn.close()
 
+
+
+
+class WorktreeRootsLeaseTests(unittest.TestCase):
+    """Issue #18: allowlisted sibling worktrees through typed claim and retry.
+
+    The allowlist gates job creation and pending->claimed only; a revoked root
+    never interrupts an already-running job through renew/release/expire.
+    """
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.sibling = tempfile.TemporaryDirectory()
+        self.addCleanup(self.sibling.cleanup)
+        self.conn = initialize(":memory:")
+        self.addCleanup(self.conn.close)
+        self.control_root = str(Path(self.tmp.name).resolve())
+        self.sibling_root = str(Path(self.sibling.name).resolve())
+        upsert_workspace(
+            self.conn,
+            workspace_id="demo",
+            name="Demo",
+            path=self.tmp.name,
+            harness_root=self.tmp.name,
+        )
+        upsert_workspace_host_profile(
+            self.conn,
+            workspace_id="demo",
+            host_id="mac",
+            workspace_path=self.control_root,
+            harness_root=self.control_root,
+            worktree_roots=[self.sibling_root],
+        )
+        register_agent(self.conn, agent_id="mac-omp", host_id="mac", capabilities={})
+        _sync_catalog(self.conn, ["mac-omp"])
+
+    def _origin(self, message_id="m1"):
+        return {
+            "platform": "discord",
+            "destination": "ch",
+            "message_id": message_id,
+            "session_scope_id": f"discord:{message_id}",
+        }
+
+    def _reply(self):
+        return {"platform": "discord", "destination": "ch"}
+
+    def _submit_sibling(self, message_id="m1", path=None):
+        return submit_request(
+            self.conn,
+            workspace_id="demo",
+            target_agent="mac-omp",
+            prompt="hello",
+            origin=self._origin(message_id),
+            reply=self._reply(),
+            worktree_path=path or f"{self.sibling_root}/issue-18",
+        )
+
+    def _revoke_roots(self):
+        upsert_workspace_host_profile(
+            self.conn,
+            workspace_id="demo",
+            host_id="mac",
+            workspace_path=self.control_root,
+            harness_root=self.control_root,
+            worktree_roots=[],
+        )
+
+    def test_sibling_submit_claim_uses_same_resource(self):
+        request = self._submit_sibling()
+        result = claim_job(self.conn, agent_id="mac-omp")
+        self.assertTrue(result.claimed)
+        self.assertEqual(
+            result.execution_context["worktree_path"],
+            f"{self.sibling_root}/issue-18",
+        )
+        expected_key = compute_resource_key(
+            build_worktree_resource("mac", f"{self.sibling_root}/issue-18")
+        )
+        self.assertEqual(result.execution_lease["resource_key"], expected_key)
+
+    def test_revoked_root_gates_pending_claim_fail_closed(self):
+        self._submit_sibling("m1")
+        self._submit_sibling("m2", path=f"{self.sibling_root}/issue-19")
+        self._revoke_roots()
+        # claim_job surfaces the lease gate as RuntimeError with the
+        # RuntimeLeaseError reason.
+        with self.assertRaisesRegex(
+            CoordinateRuntimeError, "worktree containment policy rejected claim"
+        ):
+            claim_job(self.conn, agent_id="mac-omp")
+        # Nothing was mutated: the gated job stays pending.
+        row = self.conn.execute(
+            "SELECT status, attempt_count FROM jobs WHERE task_id IS NULL ORDER BY created_at"
+        ).fetchall()
+        self.assertEqual([r["status"] for r in row], ["pending", "pending"])
+
+    def test_revoked_root_does_not_interrupt_running_job(self):
+        self._submit_sibling("m1")
+        claimed = claim_job(self.conn, agent_id="mac-omp")
+        self.assertTrue(claimed.claimed)
+        self._revoke_roots()
+        # Renewal and release of the already-running job keep working: the
+        # revocation gate only ever runs on the pending->claimed transition.
+        self.conn.execute(
+            """
+            UPDATE execution_attempt_leases
+            SET acquired_at = ?, renewed_at = ?, expires_at = ?
+            WHERE lease_id = ?
+            """,
+            (
+                "2030-01-01T00:00:00Z",
+                "2030-01-01T00:00:00Z",
+                "2030-01-01T00:01:00Z",
+                claimed.execution_lease["lease_id"],
+            ),
+        )
+        self.conn.commit()
+        with patch(
+            "coordinate.execution_leases._utc_now",
+            return_value="2030-01-01T00:00:30Z",
+        ):
+            renewed = renew_managed_lease(
+                self.conn,
+                lease_id=claimed.execution_lease["lease_id"],
+                job_id=claimed.job["id"],
+                attempt_token=claimed.attempt_token,
+                agent_id="mac-omp",
+            )
+        self.assertEqual(renewed["status"], "active")
+        row = get_job(self.conn, claimed.job["id"])
+        self.assertEqual(row["status"], "running")
+
+    def test_canonical_jobs_claim_with_roots_configured(self):
+        request = submit_request(
+            self.conn,
+            workspace_id="demo",
+            target_agent="mac-omp",
+            prompt="hello",
+            origin=self._origin("m-canonical"),
+            reply=self._reply(),
+        )
+        result = claim_job(self.conn, agent_id="mac-omp")
+        self.assertTrue(result.claimed)
+        self.assertEqual(
+            result.execution_context["worktree_path"], self.control_root
+        )
+        self.assertEqual(result.job["id"], request.job["id"])
+
+    def test_retry_of_sibling_job_backfills_fresh_context(self):
+        request = self._submit_sibling("m-retry")
+        source = get_job(self.conn, request.job["id"])
+        cancel_job(self.conn, source["id"], reason="test cancel")
+        retried = retry_job(self.conn, source["id"], reason="test retry")
+
+        retry = retried.retry_job
+        self.assertNotEqual(retry["id"], source["id"])
+        # Durable sibling path is copied verbatim (no control-host resolve).
+        self.assertEqual(retry["worktree_path"], source["worktree_path"])
+        # The stale job_id-bound snapshot must never be copied.
+        self.assertNotIn("execution_context", retry["payload"])
+        self.assertEqual(retry["payload"]["retry_of_job_id"], source["id"])
+
+        # Claim backfills a fresh snapshot bound to the NEW job id and uses
+        # the same worktree resource identity.
+        claimed = claim_job(self.conn, agent_id="mac-omp")
+        self.assertTrue(claimed.claimed)
+        self.assertEqual(claimed.job["id"], retry["id"])
+        self.assertEqual(claimed.execution_context["job_id"], retry["id"])
+        self.assertEqual(
+            claimed.execution_context["worktree_path"],
+            f"{self.sibling_root}/issue-18",
+        )
+        expected_key = compute_resource_key(
+            build_worktree_resource("mac", f"{self.sibling_root}/issue-18")
+        )
+        self.assertEqual(claimed.execution_lease["resource_key"], expected_key)
+
+    def test_retry_of_control_path_job_keeps_control_resolve(self):
+        control_path = str(Path(self.control_root) / "feature")
+        request = submit_request(
+            self.conn,
+            workspace_id="demo",
+            target_agent="mac-omp",
+            prompt="hello",
+            origin=self._origin("m-retry-control"),
+            reply=self._reply(),
+            worktree_path=control_path,
+        )
+        source = get_job(self.conn, request.job["id"])
+        cancel_job(self.conn, source["id"], reason="test cancel")
+        retried = retry_job(self.conn, source["id"], reason="test retry")
+        self.assertEqual(retried.retry_job["worktree_path"], source["worktree_path"])
+        self.assertNotIn("execution_context", retried.retry_job["payload"])
+        claimed = claim_job(self.conn, agent_id="mac-omp")
+        self.assertTrue(claimed.claimed)
+        self.assertEqual(
+            claimed.execution_context["worktree_path"],
+            f"{self.control_root}/feature",
+        )
+        self.assertEqual(claimed.execution_context["job_id"], retried.retry_job["id"])
 
 if __name__ == "__main__":
     unittest.main()

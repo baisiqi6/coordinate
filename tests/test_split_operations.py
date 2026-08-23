@@ -12,18 +12,31 @@ import uuid
 from pathlib import Path
 from unittest.mock import patch
 
+from coordinate.checklist_contract import validate_checklist as contract_validate
 from coordinate.checklist_io import (
+    CHECKLIST_NEW_NAME,
+    REASON_CHECKLIST_MISSING,
+    REASON_DUAL_AUTHORITY,
     ChecklistError,
     atomic_write_json,
     checklist_runtime_problems,
 )
-from coordinate.db import initialize, row_to_dict, upsert_workspace
+from coordinate.db import (
+    append_event,
+    initialize,
+    row_to_dict,
+    upsert_task_mirror,
+    upsert_workspace,
+)
+from coordinate.reconcile import reconcile_workspace
 from coordinate.split_operations import (
     CONTRACT_VERSION,
     OPERATION_KIND_ISSUE_MATERIALIZE,
+    OPERATION_KIND_TASK_ADOPT,
     OPERATION_KIND_TASK_CREATE,
     REASON_FILES_NOT_DEPLOYED,
     REASON_FINGERPRINT_DRIFT,
+    REASON_ITEM_NOT_FOUND,
     REASON_LEGACY_UNBOUND_ITEM,
     REASON_LOCK_TIMEOUT,
     REASON_OPERATION_CONFLICT,
@@ -35,14 +48,18 @@ from coordinate.split_operations import (
     SplitOperationError,
     apply_issue_materialize_files,
     apply_issue_materialize_record,
+    apply_task_adopt_files,
+    apply_task_adopt_record,
     apply_task_create_files,
     apply_task_create_record,
     build_issue_materialize_envelope,
     build_issue_materialize_input_fingerprint,
+    build_task_adopt_input_fingerprint,
     build_task_create_envelope,
     build_task_create_input_fingerprint,
     compute_plan_sha256,
     compute_task_item_fingerprint,
+    prepare_task_adoption,
     project_checklist_item_for_fingerprint,
     validate_sha256,
     validate_uuid,
@@ -417,6 +434,31 @@ class FileHalfTests(unittest.TestCase):
         self.assertEqual(envelope["before_fingerprint"], result["before_fingerprint"])
         self.assertEqual(envelope["after_fingerprint"], result["after_fingerprint"])
 
+    def test_created_item_keeps_missing_mode_effective_high_risk(self) -> None:
+        # Issue #14 regression: managed task create must keep producing items
+        # without workflow.mode (effective high-risk, fail-closed), the item
+        # must still pass the EXharness-parity validator, and the fingerprint
+        # contract must not drift.
+        result = self._apply_files()
+
+        checklist_path = self.harness_root / "mvp-checklist.json"
+        checklist = json.loads(checklist_path.read_text())
+        item = checklist["items"][0]
+        self.assertEqual(item["workflow"]["status"], "todo")
+        self.assertNotIn("mode", item["workflow"])
+        self.assertNotIn("mode", item)
+
+        errors, warnings = contract_validate(checklist)
+        self.assertEqual(errors, [])
+        self.assertEqual(warnings, [])
+
+        # Idempotent replay: same envelope must not rewrite the checklist and
+        # must return the identical fingerprints.
+        retry = self._apply_files()
+        self.assertFalse(retry["checklist_changed"])
+        self.assertEqual(retry["input_fingerprint"], result["input_fingerprint"])
+        self.assertEqual(retry["after_fingerprint"], result["after_fingerprint"])
+
     def test_idempotent_retry_ignores_new_timestamp(self) -> None:
         # Explicit cross-second now values: retry must return the original
         # files_applied_at and must not rewrite the checklist.
@@ -478,6 +520,12 @@ class FileHalfTests(unittest.TestCase):
         with self.assertRaises(SplitOperationError) as ctx:
             self._apply_files()
         self.assertEqual(ctx.exception.reason, REASON_LEGACY_UNBOUND_ITEM)
+        message = str(ctx.exception)
+        self.assertIn("refusing to adopt a legacy unbound item", message)
+        self.assertIn("Legacy first-adoption is not available here", message)
+        self.assertNotIn("Reconcile", message)
+        self.assertNotIn("reconcile", message)
+        self.assertNotIn("--task-id", message)
 
     def test_same_id_drift_is_conflict(self) -> None:
         self._apply_files()
@@ -1447,6 +1495,12 @@ class IssueMaterializeOperationTests(unittest.TestCase):
         with self.assertRaises(SplitOperationError) as ctx:
             self._apply_files()
         self.assertEqual(ctx.exception.reason, REASON_LEGACY_UNBOUND_ITEM)
+        message = str(ctx.exception)
+        self.assertIn("refusing to adopt a legacy unbound item", message)
+        self.assertIn("Legacy first-adoption is not available here", message)
+        self.assertNotIn("Reconcile", message)
+        self.assertNotIn("reconcile", message)
+        self.assertNotIn("--task-id", message)
 
     def test_files_different_operation_conflicts(self) -> None:
         self._apply_files()
@@ -2646,6 +2700,513 @@ class IssueMaterializeOperationTests(unittest.TestCase):
         second = self._apply_record(conn, triage_id, files_result)
         self.assertFalse(second.event_created)
         self.assertEqual(second.plan_ready_event["id"], ready_id)
+
+
+def _legacy_item(task_id: str = "legacy-1", title: str = "Legacy One",
+                 plan_rel: str = "plans/legacy.md") -> dict:
+    return {
+        "id": task_id,
+        "title": title,
+        "status": "todo",
+        "phase": "todo",
+        "priority": "p1",
+        "owner": None,
+        "selected_in_session": None,
+        "updated_at": "2026-07-13T00:00:00Z",
+        "dependencies": [],
+        "blocked_by": [],
+        "blocked_reason": "",
+        "acceptance": "legacy acceptance",
+        "verification": "",
+        "handoff": {"from": None, "to": None, "reason": None},
+        "plan_path": plan_rel,
+        "artifact_path": plan_rel,
+        "artifacts": {"plan": plan_rel},
+        "workflow": {"status": "todo", "branch": None, "updated_at": "2026-07-13T00:00:00Z"},
+    }
+
+
+class TaskAdoptOperationTests(unittest.TestCase):
+    """task.adopt prepare/file/record halves: fail-closed, drift, replay, rollback."""
+
+    def setUp(self) -> None:
+        self.tmp = Path(tempfile.mkdtemp())
+        self.workspace_path = self.tmp / "workspace"
+        self.workspace_path.mkdir()
+        self.harness_root = self.tmp / "docs"
+        self.harness_root.mkdir()
+        self.checklist_path = self.harness_root / "mvp-checklist.json"
+        self.checklist_path.write_text(
+            json.dumps({
+                "project": "demo",
+                "harness_root": ".",
+                "version": 1,
+                "updated_at": "2026-07-13",
+                "items": [_legacy_item()],
+            }, ensure_ascii=False, indent=2) + "\n",
+            encoding="utf-8",
+        )
+        self.plan = self.workspace_path / "plans" / "legacy.md"
+        _make_plan(self.plan)
+        self.conn = initialize(":memory:")
+        self.workspace = upsert_workspace(
+            self.conn,
+            workspace_id="demo",
+            name="Demo",
+            path=str(self.workspace_path),
+            harness_root=str(self.harness_root),
+        )
+        self.operation_id = str(uuid.uuid4())
+
+    def tearDown(self) -> None:
+        self.conn.close()
+        import shutil
+
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+    def _prepare(self, **overrides):
+        kwargs = dict(
+            workspace_path=self.workspace_path,
+            harness_root=self.harness_root,
+            workspace_id="demo",
+            task_id="legacy-1",
+            plan_doc="plans/legacy.md",
+            operation_id=self.operation_id,
+        )
+        kwargs.update(overrides)
+        return prepare_task_adoption(**kwargs)
+
+    def _files(self, prepare=None, **overrides):
+        p = prepare or self._prepare()
+        kwargs = dict(
+            workspace_path=self.workspace_path,
+            harness_root=self.harness_root,
+            workspace_id="demo",
+            task_id="legacy-1",
+            plan_doc="plans/legacy.md",
+            operation_id=p.operation_id,
+            expected_item_fingerprint=p.item_fingerprint,
+            expected_plan_sha256=p.plan_sha256,
+        )
+        kwargs.update(overrides)
+        return apply_task_adopt_files(**kwargs)
+
+    def _record(self, files_result=None, conn=None, **overrides):
+        f = files_result or self._files()
+        kwargs = dict(
+            workspace_id="demo",
+            task_id="legacy-1",
+            plan_doc="plans/legacy.md",
+            operation_id=f.operation_id,
+            input_fingerprint=f.input_fingerprint,
+            before_fingerprint=f.before_fingerprint,
+            after_fingerprint=f.after_fingerprint,
+            actor="operator",
+            target="worker",
+        )
+        kwargs.update(overrides)
+        return apply_task_adopt_record(conn or self.conn, **kwargs)
+
+    def _rewrite_item(self, mutate) -> None:
+        checklist = json.loads(self.checklist_path.read_text())
+        mutate(checklist["items"][0])
+        self.checklist_path.write_text(
+            json.dumps(checklist, ensure_ascii=False, indent=2) + "\n", encoding="utf-8"
+        )
+
+    def _db_counts(self) -> tuple[int, int, int]:
+        ledger = self.conn.execute("SELECT COUNT(*) FROM split_operations").fetchone()[0]
+        mirror = self.conn.execute(
+            "SELECT COUNT(*) FROM tasks WHERE workspace_id = 'demo' AND task_id = 'legacy-1'"
+        ).fetchone()[0]
+        events = self.conn.execute(
+            "SELECT COUNT(*) FROM events WHERE workspace_id = 'demo' AND task_id = 'legacy-1' "
+            "AND event_type = 'plan.ready'"
+        ).fetchone()[0]
+        return ledger, mirror, events
+
+    # -- prepare -----------------------------------------------------------
+
+    def test_prepare_returns_expected_fingerprints_and_is_readonly(self) -> None:
+        before = self.checklist_path.read_bytes()
+        prepare = self._prepare()
+        self.assertEqual(prepare.operation_id, self.operation_id)
+        self.assertFalse(prepare.already_adopted)
+        self.assertEqual(prepare.before_fingerprint, prepare.item_fingerprint)
+        self.assertEqual(
+            prepare.input_fingerprint,
+            build_task_adopt_input_fingerprint(
+                workspace_id="demo",
+                task_id="legacy-1",
+                plan_doc="plans/legacy.md",
+                plan_sha256=prepare.plan_sha256,
+                item_fingerprint=prepare.item_fingerprint,
+            ),
+        )
+        self.assertEqual(self.checklist_path.read_bytes(), before)
+        self.assertEqual(self._db_counts(), (0, 0, 0))
+
+    def test_prepare_absent_item_fail_closed(self) -> None:
+        with self.assertRaises(SplitOperationError) as ctx:
+            self._prepare(task_id="missing-task")
+        self.assertEqual(ctx.exception.reason, REASON_ITEM_NOT_FOUND)
+
+    def test_prepare_rejects_operation_id_mismatch_on_already_adopted(self) -> None:
+        self._record()
+        with self.assertRaises(SplitOperationError) as ctx:
+            self._prepare(operation_id=str(uuid.uuid4()))
+        self.assertEqual(ctx.exception.reason, REASON_OPERATION_CONFLICT)
+        # Replaying with the same id reports already_adopted.
+        prepare = self._prepare()
+        self.assertTrue(prepare.already_adopted)
+
+    # -- file half ---------------------------------------------------------
+
+    def test_files_happy_path_adds_envelope_only(self) -> None:
+        result = self._files()
+        self.assertTrue(result.checklist_changed)
+        self.assertEqual(result.operation_kind, OPERATION_KIND_TASK_ADOPT)
+        self.assertEqual(result.before_fingerprint, result.after_fingerprint)
+        item = json.loads(self.checklist_path.read_text())["items"][0]
+        self.assertEqual(item["title"], "Legacy One")
+        self.assertEqual(item["status"], "todo")
+        self.assertEqual(item["dependencies"], [])
+        self.assertEqual(item["plan_path"], "plans/legacy.md")
+        self.assertEqual(item["split_operation"]["operation_kind"], OPERATION_KIND_TASK_ADOPT)
+        self.assertEqual(item["split_operation"]["operation_id"], self.operation_id)
+        # The mutated checklist still passes the shared validator.
+        errors, _ = contract_validate(json.loads(self.checklist_path.read_text()))
+        self.assertEqual(errors, [])
+
+    def test_files_exact_replay_preserves_bytes_and_mtime(self) -> None:
+        first = self._files()
+        stat_before = self.checklist_path.stat()
+        bytes_before = self.checklist_path.read_bytes()
+        second = self._files()
+        self.assertFalse(second.checklist_changed)
+        self.assertEqual(second.files_applied_at, first.files_applied_at)
+        self.assertEqual(self.checklist_path.read_bytes(), bytes_before)
+        self.assertEqual(self.checklist_path.stat().st_mtime_ns, stat_before.st_mtime_ns)
+
+    def test_files_absent_item_fail_closed_untouched(self) -> None:
+        before = self.checklist_path.read_bytes()
+        with self.assertRaises(SplitOperationError) as ctx:
+            self._prepare(task_id="missing-task", operation_id=None)
+        self.assertEqual(ctx.exception.reason, REASON_ITEM_NOT_FOUND)
+        self.assertEqual(self.checklist_path.read_bytes(), before)
+
+    def test_files_already_bound_other_operation_fail_closed(self) -> None:
+        self._record()
+        before = self.checklist_path.read_bytes()
+        prepare = self._prepare()
+        with self.assertRaises(SplitOperationError) as ctx:
+            self._files(
+                prepare=prepare,
+                operation_id=str(uuid.uuid4()),
+            )
+        self.assertEqual(ctx.exception.reason, REASON_OPERATION_CONFLICT)
+        self.assertEqual(self.checklist_path.read_bytes(), before)
+
+    def test_files_malformed_envelope_fail_closed(self) -> None:
+        for malformed in ("garbage", {"operation_id": "x"}, 42):
+            with self.subTest(malformed=malformed):
+                self._rewrite_item(lambda item: item.__setitem__("split_operation", malformed))
+                # Prepare fails closed on the malformed envelope before any
+                # mutation; the checklist still carries the malformed value.
+                with self.assertRaises(SplitOperationError) as ctx:
+                    self._prepare()
+                self.assertEqual(ctx.exception.reason, REASON_OPERATION_CONFLICT)
+                # restore a clean legacy item for the next subTest
+                self._rewrite_item(lambda item: item.pop("split_operation", None))
+
+    def test_files_missing_checklist_fail_closed(self) -> None:
+        self.checklist_path.unlink()
+        with self.assertRaises(SplitOperationError) as ctx:
+            self._prepare()
+        self.assertEqual(ctx.exception.reason, REASON_CHECKLIST_MISSING)
+
+    def test_files_dual_authority_fail_closed(self) -> None:
+        (self.harness_root / CHECKLIST_NEW_NAME).write_text("{}\n", encoding="utf-8")
+        with self.assertRaises(SplitOperationError) as ctx:
+            self._prepare()
+        self.assertEqual(ctx.exception.reason, REASON_DUAL_AUTHORITY)
+
+    def _assert_no_envelope_written(self) -> None:
+        item = json.loads(self.checklist_path.read_text())["items"][0]
+        self.assertNotIn("split_operation", item)
+
+    def test_files_item_drift_fail_closed_before_write(self) -> None:
+        prepare = self._prepare()
+        self._rewrite_item(lambda item: item.__setitem__("title", "Drifted Title"))
+        with self.assertRaises(SplitOperationError) as ctx:
+            self._files(prepare=prepare)
+        self.assertEqual(ctx.exception.reason, REASON_FINGERPRINT_DRIFT)
+        self.assertIn("drifted", str(ctx.exception))
+        self._assert_no_envelope_written()
+
+    def test_files_dependency_drift_fail_closed_before_write(self) -> None:
+        # Add a second item so a dependency reference stays validator-legal.
+        checklist = json.loads(self.checklist_path.read_text())
+        checklist["items"].append(_legacy_item(task_id="dep-1"))
+        self.checklist_path.write_text(
+            json.dumps(checklist, ensure_ascii=False, indent=2) + "\n", encoding="utf-8"
+        )
+        prepare = self._prepare()
+        self._rewrite_item(lambda item: item.__setitem__("dependencies", ["dep-1"]))
+        with self.assertRaises(SplitOperationError) as ctx:
+            self._files(prepare=prepare)
+        self.assertEqual(ctx.exception.reason, REASON_FINGERPRINT_DRIFT)
+        self._assert_no_envelope_written()
+
+    def test_files_plan_byte_drift_fail_closed_before_write(self) -> None:
+        prepare = self._prepare()
+        checklist_before = self.checklist_path.read_bytes()
+        self.plan.write_bytes(b"# tampered\n")
+        with self.assertRaises(SplitOperationError) as ctx:
+            self._files(prepare=prepare)
+        self.assertEqual(ctx.exception.reason, REASON_FINGERPRINT_DRIFT)
+        self.assertEqual(self.checklist_path.read_bytes(), checklist_before)
+
+    def test_files_missing_plan_fail_closed(self) -> None:
+        self.plan.unlink()
+        with self.assertRaises(SplitOperationError) as ctx:
+            self._prepare()
+        self.assertEqual(ctx.exception.reason, REASON_FILES_NOT_DEPLOYED)
+
+    def test_files_rejects_illegal_relative_path(self) -> None:
+        with self.assertRaises(SplitOperationError) as ctx:
+            self._prepare(plan_doc="../outside.md")
+        self.assertEqual(ctx.exception.reason, REASON_VALIDATION_ERROR)
+
+    def test_files_rejects_plan_doc_not_matching_item_locator(self) -> None:
+        other_plan = self.workspace_path / "plans" / "other.md"
+        _make_plan(other_plan)
+        with self.assertRaises(SplitOperationError) as ctx:
+            self._prepare(plan_doc="plans/other.md")
+        self.assertEqual(ctx.exception.reason, REASON_VALIDATION_ERROR)
+
+    # -- record half -------------------------------------------------------
+
+    def test_record_happy_path_creates_ledger_mirror_event(self) -> None:
+        result = self._record()
+        self.assertTrue(result.event_created)
+        self.assertEqual(result.operation["operation_kind"], OPERATION_KIND_TASK_ADOPT)
+        self.assertEqual(result.operation["status"], STATUS_RECORD_APPLIED)
+        task = self.conn.execute(
+            "SELECT * FROM tasks WHERE workspace_id = 'demo' AND task_id = 'legacy-1'"
+        ).fetchone()
+        payload = json.loads(task["payload_json"])
+        self.assertEqual(payload["title"], "Legacy One")
+        self.assertEqual(payload["phase"], "todo")
+        self.assertEqual(payload["split_operation"]["operation_kind"], OPERATION_KIND_TASK_ADOPT)
+        event = self.conn.execute(
+            "SELECT * FROM events WHERE id = ?", (result.operation["record_event_id"],)
+        ).fetchone()
+        self.assertEqual(event["event_type"], "plan.ready")
+        self.assertEqual(json.loads(event["payload_json"])["title"], "Legacy One")
+
+    def test_record_accepts_real_exharness_item_without_top_level_phase(self) -> None:
+        """EXharness lifecycle authority is status/workflow.status, not phase."""
+        self._rewrite_item(
+            lambda item: (
+                item.pop("phase", None),
+                item.__setitem__("workflow", {"mode": "high-risk"}),
+            )
+        )
+
+        result = self._record()
+
+        task = self.conn.execute(
+            "SELECT * FROM tasks WHERE workspace_id = 'demo' AND task_id = 'legacy-1'"
+        ).fetchone()
+        payload = json.loads(task["payload_json"])
+        self.assertEqual(task["phase"], "todo")
+        self.assertEqual(payload["phase"], "todo")
+        self.assertEqual(payload["status"], "todo")
+        self.assertEqual(result.operation["operation_kind"], OPERATION_KIND_TASK_ADOPT)
+
+    def test_record_upgrades_matching_mirror_created_by_legacy_reconcile(self) -> None:
+        """A normal pre-adoption reconcile must not make adoption impossible."""
+        checklist = json.loads(self.checklist_path.read_text())
+
+        class StaticHarnessAdapter:
+            def read_state(self):
+                return {"project": "demo"}
+
+            def read_checklist(self):
+                return checklist
+
+        reconciled = reconcile_workspace(
+            self.conn,
+            self.workspace,
+            adapter=StaticHarnessAdapter(),
+            refresh=False,
+            task_id="legacy-1",
+        )
+        self.assertEqual(reconciled.created, 1)
+        legacy_mirror = self.conn.execute(
+            "SELECT * FROM tasks WHERE workspace_id = 'demo' AND task_id = 'legacy-1'"
+        ).fetchone()
+        legacy_payload = json.loads(legacy_mirror["payload_json"])
+        legacy_payload["publish_metadata"] = {"reported_commit": "a" * 40}
+        upsert_task_mirror(
+            self.conn,
+            workspace_id="demo",
+            task_id="legacy-1",
+            phase=legacy_mirror["phase"],
+            owner="legacy-owner",
+            branch="agents/legacy-1",
+            pr="https://github.example/pr/1",
+            payload=legacy_payload,
+            last_event_id=legacy_mirror["last_event_id"],
+            commit=True,
+        )
+        prior_event_id = self.conn.execute(
+            "SELECT id FROM events WHERE workspace_id = 'demo' AND task_id = 'legacy-1' "
+            "AND event_type = 'task_mirror.created'"
+        ).fetchone()["id"]
+
+        files_result = self._files()
+        result = self._record(files_result=files_result)
+        replay = self._record(files_result=files_result)
+
+        self.assertTrue(result.event_created)
+        self.assertFalse(replay.event_created)
+        self.assertEqual(self._db_counts(), (1, 1, 1))
+        self.assertEqual(result.task["owner"], "legacy-owner")
+        self.assertEqual(result.task["branch"], "agents/legacy-1")
+        self.assertEqual(result.task["pr"], "https://github.example/pr/1")
+        payload = result.task["payload"]
+        self.assertEqual(payload["publish_metadata"], {"reported_commit": "a" * 40})
+        self.assertEqual(
+            payload["split_operation"]["operation_kind"],
+            OPERATION_KIND_TASK_ADOPT,
+        )
+        self.assertIsNotNone(
+            self.conn.execute("SELECT id FROM events WHERE id = ?", (prior_event_id,)).fetchone()
+        )
+
+    def test_record_idempotent_retry_no_duplicates(self) -> None:
+        files_result = self._files()
+        first = self._record(files_result=files_result)
+        second = self._record(files_result=files_result)
+        self.assertFalse(second.event_created)
+        self.assertEqual(first.event["id"], second.event["id"])
+        self.assertEqual(first.operation["operation_id"], second.operation["operation_id"])
+        self.assertEqual(self._db_counts(), (1, 1, 1))
+
+    def test_record_undeployed_plan_fail_closed(self) -> None:
+        files_result = self._files()
+        self.plan.unlink()
+        with self.assertRaises(SplitOperationError) as ctx:
+            self._record(files_result=files_result)
+        self.assertEqual(ctx.exception.reason, REASON_FILES_NOT_DEPLOYED)
+        self.assertEqual(self._db_counts(), (0, 0, 0))
+
+    def test_record_different_plan_bytes_fail_closed(self) -> None:
+        files_result = self._files()
+        self.plan.write_bytes(b"# different bytes\n")
+        with self.assertRaises(SplitOperationError) as ctx:
+            self._record(files_result=files_result)
+        self.assertEqual(ctx.exception.reason, REASON_FINGERPRINT_DRIFT)
+        self.assertEqual(self._db_counts(), (0, 0, 0))
+
+    def test_record_wrong_input_fingerprint_fail_closed(self) -> None:
+        files_result = self._files()
+        with self.assertRaises(SplitOperationError) as ctx:
+            self._record(files_result=files_result, input_fingerprint="a" * 64)
+        self.assertEqual(ctx.exception.reason, REASON_FINGERPRINT_DRIFT)
+        self.assertEqual(self._db_counts(), (0, 0, 0))
+
+    def test_record_wrong_operation_id_fail_closed(self) -> None:
+        files_result = self._files()
+        with self.assertRaises(SplitOperationError) as ctx:
+            self._record(files_result=files_result, operation_id=str(uuid.uuid4()))
+        self.assertEqual(ctx.exception.reason, REASON_OPERATION_CONFLICT)
+
+    def test_record_preexisting_conflicting_mirror_fail_closed(self) -> None:
+        files_result = self._files()
+        # A mirror already exists carrying different (create-style) metadata.
+        from coordinate.db import upsert_task_mirror
+
+        upsert_task_mirror(
+            self.conn,
+            workspace_id="demo",
+            task_id="legacy-1",
+            phase="todo",
+            owner=None,
+            branch=None,
+            pr=None,
+            payload={"task_id": "legacy-1", "title": "Legacy One"},
+            commit=True,
+        )
+        with self.assertRaises(SplitOperationError) as ctx:
+            self._record(files_result=files_result)
+        self.assertEqual(ctx.exception.reason, REASON_OPERATION_CONFLICT)
+        # Only the pre-existing mirror row remains; no ledger/event added.
+        ledger, mirror, events = self._db_counts()
+        self.assertEqual((ledger, events), (0, 0))
+        self.assertEqual(mirror, 1)
+
+    def test_record_preexisting_conflicting_event_fail_closed(self) -> None:
+        files_result = self._files()
+        plan_content_hash = compute_plan_sha256(self.plan)[:16]
+        ready_key = (
+            f"demo:legacy-1:plan.ready:{files_result.operation_id}:{plan_content_hash}"
+        )
+        append_event(
+            self.conn,
+            workspace_id="demo",
+            event_type="plan.ready",
+            actor="operator",
+            target="worker",
+            task_id="legacy-1",
+            idempotency_key=ready_key,
+            payload={"unexpected": True},
+        )
+        self.conn.commit()
+        with self.assertRaises(SplitOperationError) as ctx:
+            self._record(files_result=files_result)
+        self.assertEqual(ctx.exception.reason, REASON_OPERATION_CONFLICT)
+        ledger, mirror, events = self._db_counts()
+        self.assertEqual((ledger, mirror), (0, 0))
+        self.assertEqual(events, 1)  # only the pre-existing event
+
+    def test_record_injected_failure_rolls_back_every_step(self) -> None:
+        for step in (
+            "insert_ledger",
+            "upsert_mirror_initial",
+            "append_event",
+            "upsert_mirror_final",
+            "link_ledger_event",
+        ):
+            with self.subTest(step=step):
+                conn = initialize(":memory:")
+                self.addCleanup(conn.close)
+                upsert_workspace(
+                    conn,
+                    workspace_id="demo",
+                    name="Demo",
+                    path=str(self.workspace_path),
+                    harness_root=str(self.harness_root),
+                )
+                files_result = self._files()
+
+                def boom(s):
+                    if s == step:
+                        raise RuntimeError(f"injected {s}")
+
+                with self.assertRaises(RuntimeError):
+                    self._record(files_result=files_result, conn=conn, _inject_after_step=boom)
+                ledger = conn.execute("SELECT COUNT(*) FROM split_operations").fetchone()[0]
+                mirror = conn.execute(
+                    "SELECT COUNT(*) FROM tasks WHERE workspace_id = 'demo' AND task_id = 'legacy-1'"
+                ).fetchone()[0]
+                events = conn.execute(
+                    "SELECT COUNT(*) FROM events WHERE workspace_id = 'demo' "
+                    "AND task_id = 'legacy-1'"
+                ).fetchone()[0]
+                self.assertEqual((ledger, mirror, events), (0, 0, 0))
 
 
 if __name__ == "__main__":

@@ -272,6 +272,7 @@ class WorkflowCLIRegistrationTests(unittest.TestCase):
                 "operator",
                 "mcp",
                 "runtime-http",
+                "trace",
                 "serve",
             ],
         )

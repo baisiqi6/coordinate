@@ -12,7 +12,7 @@ import re
 import unicodedata
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any
+from typing import Any, Iterable
 
 
 RESOURCE_CONTRACT_VERSION = 1
@@ -77,6 +77,239 @@ def _is_windows_unc(path: str) -> bool:
 
 def _has_trailing_slash(path: str) -> bool:
     return len(path) > 1 and path[-1] in ("/", "\\")
+
+
+def _has_traversal_segments(path: str) -> bool:
+    """True when any ``/`` or ``\\`` separated segment is ``.`` or ``..``."""
+    return any(seg in {".", ".."} for seg in path.replace("\\", "/").split("/"))
+
+
+def _path_flavour(normalized: str) -> str:
+    """Classify a normalized host-native path flavour: ``posix``/``drive``/``unc``."""
+    if normalized.startswith("\\\\"):
+        return "unc"
+    if len(normalized) >= 2 and normalized[1] == ":":
+        return "drive"
+    return "posix"
+
+
+def _is_filesystem_root(normalized: str) -> bool:
+    """True when a normalized path is a POSIX root, drive root, or UNC share root."""
+    if normalized == "/":
+        return True
+    if len(normalized) == 3 and normalized[1] == ":" and normalized[2] == "\\":
+        return True
+    if normalized.startswith("\\\\"):
+        non_empty = [part for part in normalized.split("\\") if part]
+        return len(non_empty) <= 2
+    return False
+
+
+def normalize_control_path_separators(path: str) -> str:
+    """Canonicalize control-plane separators to ``/`` for lexical comparison.
+
+    Control roots and submitted paths may use either separator regardless of
+    the control host; every control-root/raw comparison must go through this
+    so the classification in ``classify_worktree_raw_path`` and the mapping in
+    ``execution_context._map_foreign_path`` cannot drift.
+    """
+    return path.replace("\\", "/")
+
+
+def classify_worktree_raw_path(control_root: str, raw_path: str) -> str:
+    """Lexically classify a submitted worktree path as ``control`` or ``host_native``.
+
+    Paths equal to or under the control workspace root keep the legacy control
+    branch (resolved on the control host and mapped onto the canonical host
+    workspace); every other path is a host-native sibling candidate. The prefix
+    test is segment-aware and separator-symmetric (``/`` and ``\\`` compare
+    equal), so a sibling directory sharing the control-root prefix
+    (``/a/b-other`` vs ``/a/b``) is never misclassified.
+    """
+    control = normalize_control_path_separators(control_root).rstrip("/")
+    raw = normalize_control_path_separators(raw_path)
+    if raw == control:
+        return "control"
+    prefix = control + "/"
+    if raw.startswith(prefix):
+        return "control"
+    return "host_native"
+
+
+def is_strict_descendant(candidate: str, root: str) -> bool:
+    """Pure lexical strict-descendant test on normalized host-native paths.
+
+    Both inputs MUST already be normalized via ``normalize_worktree_path``.
+    The root itself is never its own descendant, and different path flavours
+    never compare as contained because the separator-aware prefix differs.
+    """
+    if candidate == root:
+        return False
+    sep = "\\" if _path_flavour(root) in {"drive", "unc"} else "/"
+    return candidate.startswith(root.rstrip(sep) + sep)
+
+
+def normalize_host_native_worktree_path(path: str) -> str:
+    """Reject relative/empty/control/traversal forms, then normalize.
+
+    The host-native branch of worktree resolution rejects ``.``/``..``
+    segments outright (``normalize_worktree_path`` would silently collapse
+    them) before applying the shared resource identity normalization.
+    Raises ``ResourceIdentityError`` on any invalid form.
+    """
+    if not isinstance(path, str) or not path:
+        raise ResourceIdentityError("path is required")
+    if _CONTROL_RE.search(path):
+        raise ResourceIdentityError("path contains control characters")
+    if _has_traversal_segments(path):
+        raise ResourceIdentityError("path contains traversal components")
+    return normalize_worktree_path(path)
+
+
+def validate_worktree_root(root: str, *, workspace_path: str) -> str:
+    """Validate and normalize one allowlisted sibling worktree root.
+
+    Rejects relative, control/NUL/newline, traversal-bearing, and
+    filesystem/drive/share-root paths; roots whose path flavour differs from
+    the profile's canonical ``workspace_path``; and roots that equal the
+    canonical workspace or are an ancestor of it (only canonical descendants
+    and true siblings are allowed). Returns the normalized root; raises
+    ``ResourceIdentityError`` otherwise.
+    """
+    normalized = normalize_host_native_worktree_path(root)
+    if _is_filesystem_root(normalized):
+        raise ResourceIdentityError(
+            f"root must not be a filesystem/drive/share root: {root!r}"
+        )
+    normalized_workspace = normalize_worktree_path(workspace_path)
+    if _path_flavour(normalized) != _path_flavour(normalized_workspace):
+        raise ResourceIdentityError(
+            f"root path flavour must match workspace_path: {root!r}"
+        )
+    if normalized == normalized_workspace or is_strict_descendant(
+        normalized_workspace, normalized
+    ):
+        raise ResourceIdentityError(
+            f"root must not be the canonical workspace_path or an ancestor: {root!r}"
+        )
+    return normalized
+
+
+def resolve_allowlisted_worktree_path(path: str, roots: Iterable[str]) -> str:
+    """Normalize a host-native worktree candidate and require containment.
+
+    Returns the normalized path only when it is a strict descendant of at
+    least one allowlisted root; raises ``ResourceIdentityError`` otherwise.
+    ``roots`` must already be normalized and validated.
+    """
+    normalized = normalize_host_native_worktree_path(path)
+    for root in roots:
+        if is_strict_descendant(normalized, root):
+            return normalized
+    raise ResourceIdentityError(
+        f"path is outside every configured worktree root: {path!r}"
+    )
+
+
+def normalize_worktree_root_list(
+    items: Iterable[Any],
+    *,
+    workspace_path: str,
+    entry_label: str,
+    dedupe: bool,
+) -> list[str]:
+    """Validate and normalize a worktree-root list with a SINGLE shared loop.
+
+    Used by both the profile write path (raw input) and the stored-read path.
+    Every item goes through the same ``validate_worktree_root``; the ``dedupe``
+    parameter expresses the asymmetry:
+    - ``dedupe=True`` (write input): silently keeps the first occurrence,
+      order-stable, non-canonical spellings are normalized away;
+    - ``dedupe=False`` (stored-canonical read): every entry must already be
+      canonical and duplicates fail closed.
+    Raises ``ValueError`` on any invalid entry.
+    """
+    seen: set[str] = set()
+    out: list[str] = []
+    for item in items:
+        if not isinstance(item, str):
+            raise ValueError(f"{entry_label} entries must be strings")
+        try:
+            normalized = validate_worktree_root(item, workspace_path=workspace_path)
+        except ResourceIdentityError as exc:
+            raise ValueError(f"invalid {entry_label}: {exc}") from exc
+        if not dedupe and normalized != item:
+            raise ValueError(
+                f"{entry_label} entry is not canonical: {item!r} != {normalized!r}"
+            )
+        if normalized in seen:
+            if not dedupe:
+                raise ValueError(f"{entry_label} contains duplicate: {item!r}")
+            continue
+        seen.add(normalized)
+        out.append(normalized)
+    return out
+
+
+def parse_normalized_worktree_roots(
+    raw: str | None,
+    *,
+    workspace_path: str,
+) -> tuple[str, ...]:
+    """Parse stored ``worktree_roots_json``; fail closed on malformed state.
+
+    The stored value must be a JSON array of already-canonical, deduplicated,
+    non-root host-native path strings whose path flavour matches the row's
+    ``workspace_path``. Stored roots are re-validated through the same
+    ``validate_worktree_root`` used at write time, so corruption or manual
+    mutation that produces a cross-flavour or over-wide profile fails closed on
+    read. Raises ``ValueError`` otherwise.
+    """
+    if raw is None:
+        return ()
+    try:
+        decoded = json.loads(raw)
+    except json.JSONDecodeError as exc:
+        raise ValueError(f"worktree_roots_json is invalid JSON: {exc}") from exc
+    if not isinstance(decoded, list):
+        raise ValueError("worktree_roots_json must be a JSON array of strings")
+    return tuple(
+        normalize_worktree_root_list(
+            decoded,
+            workspace_path=workspace_path,
+            entry_label="worktree_roots_json",
+            dedupe=False,
+        )
+    )
+
+
+def check_worktree_containment_policy(
+    *,
+    worktree_path: str,
+    canonical_workspace_path: str,
+    worktree_roots: Iterable[str],
+) -> str:
+    """Claim-time policy gate: stored path must be canonical-or-roots contained.
+
+    Pure lexical check of an already-stored normalized worktree path against
+    the CURRENT canonical workspace checkout and allowlisted roots. The
+    canonical checkout accepts equality or any strict descendant (the control
+    branch maps control-root paths onto canonical descendants); allowlisted
+    roots accept strict descendants only. Fails closed by raising
+    ``ResourceIdentityError``; never probes the filesystem and never
+    re-derives the snapshot/digest.
+    """
+    normalized = normalize_worktree_path(worktree_path)
+    canonical = normalize_worktree_path(canonical_workspace_path)
+    if normalized == canonical or is_strict_descendant(normalized, canonical):
+        return normalized
+    for root in worktree_roots:
+        if is_strict_descendant(normalized, root):
+            return normalized
+    raise ResourceIdentityError(
+        f"worktree path {worktree_path!r} is not contained in the current "
+        "canonical checkout or any allowlisted worktree root"
+    )
 
 
 def normalize_worktree_path(path: str) -> str:

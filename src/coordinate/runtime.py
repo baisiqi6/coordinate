@@ -12,13 +12,20 @@ from .db import (
     append_event,
     create_delivery,
     create_job,
+    get_attempt_usage,
     get_job,
     get_runner_profile,
     get_workspace,
     get_workspace_host_profile,
     row_to_dict,
+    insert_attempt_usage,
     upsert_runner_profile,
     utc_now,
+)
+from .execution_resources import (
+    ResourceIdentityError,
+    check_worktree_containment_policy,
+    classify_worktree_raw_path,
 )
 from .executor_identity import (
     _binding_snapshot_canonical_dict,
@@ -60,6 +67,8 @@ from .runtime_lease import (
     release_lease_for_terminal_report,
     require_mutation_authority,
 )
+from .usage_evidence import UsageEvidence, parse_usage_evidence, split_usage_evidence
+from .usage_policy import evaluate_task_usage_warning
 
 
 def _lease_from_result(result: dict[str, Any] | None) -> tuple[str | None, int | None]:
@@ -840,7 +849,8 @@ def _submit_exact_request(
     # Resolve and validate all authority inputs before the first durable write.
     # Use a placeholder job_id for preflight validation; the real job_id depends
     # on the request event id, which we only obtain after the validated insert.
-    _resolve_submit_context(
+    workspace = get_workspace(conn, workspace_id)
+    _ctx = _resolve_submit_context(
         conn,
         workspace_id=workspace_id,
         target_agent=target_agent,
@@ -849,20 +859,34 @@ def _submit_exact_request(
         job_id="request:preflight",
         job_worktree_path=worktree_path,
     )
+    # Authoritative durable path flag for create_job: True only for the
+    # host-native sibling branch (the path is already normalized and must
+    # never be re-resolved through the control host).
+    authoritative_worktree = False
     if worktree_path is not None:
-        worktree_path = _absolute_path(worktree_path)
-        # ``create_job`` persists this same control-plane canonical form.  Run
-        # the authority check again after resolution so a symlink cannot turn
-        # an in-workspace lexical path into an out-of-workspace durable path.
-        _resolve_submit_context(
-            conn,
-            workspace_id=workspace_id,
-            target_agent=target_agent,
-            task_id=task_id,
-            origin=origin,
-            job_id="request:preflight",
-            job_worktree_path=worktree_path,
-        )
+        if classify_worktree_raw_path(workspace.path, worktree_path) == "control":
+            worktree_path = _absolute_path(worktree_path)
+            # ``create_job`` persists this same control-plane canonical form.
+            # Run the authority check again after resolution so a symlink
+            # cannot turn an in-workspace lexical path into an out-of-workspace
+            # durable path.
+            _ctx = _resolve_submit_context(
+                conn,
+                workspace_id=workspace_id,
+                target_agent=target_agent,
+                task_id=task_id,
+                origin=origin,
+                job_id="request:preflight",
+                job_worktree_path=worktree_path,
+            )
+        else:
+            # Host-native sibling branch: the preflight already normalized the
+            # raw path against the allowlisted roots, so reuse that exact
+            # value. The request event, the job row, and the execution context
+            # all persist the SAME normalized string, and the path is never
+            # resolved through the control host's filesystem.
+            worktree_path = _ctx.worktree_path
+            authoritative_worktree = True
 
     # Replay must detect explicit idempotency-key conflicts before any durable
     # write, including exact/routed mode collisions.
@@ -948,6 +972,7 @@ def _submit_exact_request(
                 payload=job_payload,
                 job_id=job_id,
                 commit=False,
+                authoritative_worktree_path=authoritative_worktree,
             )
             created = True
         else:
@@ -1081,7 +1106,7 @@ def _submit_routed_request(
     runner_profile_id = selected.runner_profile_id
 
     # Preflight context validation before any durable write.
-    _resolve_submit_context(
+    _ctx = _resolve_submit_context(
         conn,
         workspace_id=workspace_id,
         target_agent=target_agent,
@@ -1475,6 +1500,29 @@ def claim_job(
     now = utc_now()
     conn.execute("BEGIN IMMEDIATE")
     try:
+        # Pending->claimed policy gate, inside the write transaction: re-read
+        # the CURRENT profile so a root mutation can never land between the
+        # gate and the CAS, and the gate rolls back with the transaction on
+        # any failure. Pure lexical check of the stored normalized path;
+        # never re-derives the snapshot/digest.
+        current_profile = get_workspace_host_profile(
+            conn, workspace_id=candidate["workspace_id"], host_id=host_id
+        )
+        if current_profile is None:
+            raise RuntimeError(
+                f"workspace {candidate['workspace_id']} has no host profile for host {host_id}"
+            )
+        try:
+            check_worktree_containment_policy(
+                worktree_path=ctx.worktree_path,
+                canonical_workspace_path=current_profile.workspace_path,
+                worktree_roots=current_profile.worktree_roots,
+            )
+        except ResourceIdentityError as exc:
+            raise RuntimeError(
+                f"worktree containment policy rejected claim: {exc}"
+            ) from exc
+
         previous_status = candidate["status"]
         cursor = conn.execute(
             """
@@ -1556,6 +1604,12 @@ def report_job_result(
     lease_id: str | None = None,
 ) -> RuntimeReportResult:
     _validate_report_status(status)
+    # Issue #12: centralized split BEFORE any terminal state branch. Validates
+    # and strips the full usage_evidence from the submitted result so running,
+    # terminal replay, late-result and every later **result spread only ever
+    # see the sanitized result or the bounded locator/summary. Invalid
+    # evidence raises here — before any write, lease release or event.
+    result, usage = split_usage_evidence(result)
     job = get_job(conn, job_id)
     if job["assigned_agent"] != agent_id:
         raise RuntimeError(f"job {job_id} is assigned to {job['assigned_agent']}")
@@ -1571,6 +1625,7 @@ def report_job_result(
         return _accept_late_result(
             conn, job=job, agent_id=agent_id, status=status, result=result,
             actor=actor, attempt_token=attempt_token, lease_id=lease_id,
+            usage=usage,
         )
     # R2B P1: an exact timed_out terminal report for an already timed_out job
     # is an immutable replay — the same-body retry after a lost response must
@@ -1640,6 +1695,18 @@ def report_job_result(
             result=result,
             actor=actor,
         )
+        # Issue #12: accepted current attempt — usage row, terminal event
+        # locator and optional usage.warning land in the SAME transaction.
+        _persist_attempt_usage_and_warning(
+            conn,
+            usage=usage,
+            job=current,
+            attempt_token=current["attempt_count"],
+            terminal_event=terminal_outcome["event"],
+            terminal_event_created=terminal_outcome["event_created"],
+            recorded_at=now,
+            actor=actor,
+        )
         conn.commit()
     except Exception:
         if conn.in_transaction:
@@ -1703,6 +1770,65 @@ def _replay_terminal_result(
         delivery=None,
         delivery_created=False,
     )
+
+
+def _persist_attempt_usage_and_warning(
+    conn: sqlite3.Connection,
+    *,
+    usage: UsageEvidence | None,
+    job: sqlite3.Row,
+    attempt_token: int,
+    terminal_event: dict[str, Any],
+    terminal_event_created: bool,
+    recorded_at: str,
+    actor: str | None,
+) -> bool:
+    """Write the canonical attempt usage row and evaluate the warning.
+
+    Must be called inside the terminal report transaction (commit=False
+    everywhere). ``(job_id, attempt_token)`` is the usage authority: a repeat
+    of an already-recorded attempt is a no-op that neither re-accumulates nor
+    re-warns. ``task_id IS NULL`` evidence is persisted but excluded from the
+    task-scoped warning policy. Warning evaluation is skipped when nothing was
+    observed (``observed_tokens`` None).
+    """
+    if usage is None:
+        return False
+    created = insert_attempt_usage(
+        conn,
+        job_id=job["id"],
+        attempt_token=attempt_token,
+        workspace_id=job["workspace_id"],
+        task_id=job["task_id"],
+        evidence=usage.canonical_dict,
+        evidence_digest=usage.digest,
+        observed_tokens=usage.observed_tokens,
+        provider_cost_microusd=usage.provider_cost_microusd,
+        completeness=usage.completeness,
+        terminal_event_id=terminal_event.get("id"),
+        event_created=terminal_event_created,
+        recorded_at=recorded_at,
+        commit=False,
+    )
+    if not created:
+        return False
+    if job["task_id"] is None or usage.observed_tokens is None:
+        return created
+    evaluate_task_usage_warning(
+        conn,
+        workspace_id=job["workspace_id"],
+        task_id=job["task_id"],
+        job_id=job["id"],
+        attempt_token=attempt_token,
+        observed_tokens=usage.observed_tokens,
+        completeness=usage.completeness,
+        terminal_event_id=terminal_event.get("id"),
+        terminal_event_created=terminal_event_created,
+        actor=actor or "runtime",
+        agent_id=job["assigned_agent"],
+        commit=False,
+    )
+    return created
 
 
 def _apply_terminal_job_update(
@@ -1995,9 +2121,9 @@ def _accept_late_result(
     actor: str | None,
     attempt_token: int | None = None,
     lease_id: str | None = None,
+    usage: UsageEvidence | None = None,
 ) -> RuntimeReportResult:
     now = utc_now()
-    normalized = _normalize_result(status=status, result=result, job=job, now=now)
 
     conn.execute("BEGIN IMMEDIATE")
     try:
@@ -2018,6 +2144,28 @@ def _accept_late_result(
             raise RuntimeLeaseError(
                 f"job {job['id']} late-result rejected: current attempt is managed"
             )
+
+        # A recoverable timeout may already own the canonical usage row for
+        # this attempt. First accepted evidence wins: late provider evidence
+        # is still validated by the centralized split, but the job result and
+        # late-result event must point back to the existing canonical summary
+        # instead of advertising a different digest from the ledger.
+        existing_usage = get_attempt_usage(
+            conn,
+            job_id=job["id"],
+            attempt_token=current["attempt_count"],
+        )
+        if existing_usage is not None:
+            canonical_usage = parse_usage_evidence(
+                json.loads(existing_usage["evidence_json"])
+            )
+            if canonical_usage is None:  # pragma: no cover - DB invariant guard
+                raise RuntimeError("stored attempt usage is unexpectedly empty")
+            result = dict(result)
+            result["usage_evidence"] = canonical_usage.to_summary_dict()
+            usage = canonical_usage
+
+        normalized = _normalize_result(status=status, result=result, job=job, now=now)
 
         # 8.4.3 P1 #2: SQL CAS. When attempt_token is supplied, gate on attempt_count
         # too — a late result from attempt N must not overwrite a job reclaimed as N+1.
@@ -2094,6 +2242,21 @@ def _accept_late_result(
                 **normalized,
             },
             commit=False,
+        )
+        # Issue #12: late result never duplicates the attempt usage row (the
+        # timed_out terminal already owns (job_id, attempt_token) when it
+        # carried evidence); if that report had none, the late evidence fills
+        # the row once. Warning evaluation only happens when this late report
+        # actually creates the row — the timed_out report already evaluated.
+        _persist_attempt_usage_and_warning(
+            conn,
+            usage=usage,
+            job=current,
+            attempt_token=current["attempt_count"],
+            terminal_event={"id": event.row["id"]},
+            terminal_event_created=event.created,
+            recorded_at=now,
+            actor=actor,
         )
         delivery, delivery_created = _create_response_delivery(
             conn,

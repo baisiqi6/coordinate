@@ -7,8 +7,10 @@ import sqlite3
 import tempfile
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 from coordinate.db import (
+    get_workspace_host_profile,
     initialize,
     row_to_dict,
     upsert_runner_profile,
@@ -1046,6 +1048,968 @@ class StrictMutationMatrixTests(unittest.TestCase):
         with self.assertRaisesRegex(ContextError, "digest mismatch"):
             validate_execution_context_snapshot(data)
 
+
+
+
+class WorktreeRootsAuthorityTests(unittest.TestCase):
+    """Issue #18: allowlisted host-native sibling worktree roots.
+
+    The allowlist is the job-creation authority for paths outside the control
+    workspace root. Resolution is pure lexical: no control-host
+    ``Path.resolve()``/``realpath``/stat ever runs on the host-native branch.
+    """
+
+    SIBLING_ROOT = "/host/worktrees"
+
+    def setUp(self) -> None:
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.conn = initialize(":memory:")
+        # upsert_workspace stores the control root control-host-resolved; raw
+        # sibling tests must use the same resolved spelling for classification.
+        self.control_root = str(Path(self.tmp.name).resolve())
+        upsert_workspace(
+            self.conn,
+            workspace_id="ws",
+            name="WS",
+            path=self.tmp.name,
+            harness_root="harness",
+            base_branch="main",
+        )
+        upsert_workspace_host_profile(
+            self.conn,
+            workspace_id="ws",
+            host_id="host1",
+            workspace_path="/host/ws",
+            harness_root="/host/harness",
+            worktree_roots=[self.SIBLING_ROOT],
+        )
+        register_agent(self.conn, agent_id="agent1", host_id="host1", capabilities={})
+
+    def _resolve(self, worktree_path: str, **overrides):
+        from coordinate.db import get_workspace, get_workspace_host_profile
+
+        workspace = get_workspace(self.conn, "ws")
+        profile = get_workspace_host_profile(
+            self.conn, workspace_id="ws", host_id="host1"
+        )
+        return resolve_execution_context_v1(
+            job_id="request:e1",
+            workspace=workspace,
+            task=None,
+            assigned_agent="agent1",
+            host_id="host1",
+            profile=profile,
+            origin={"session_scope_id": "discord:ch"},
+            job_worktree_path=worktree_path,
+            **overrides,
+        )
+
+    def test_allowlisted_sibling_resolves_to_normalized_host_path(self) -> None:
+        ctx = self._resolve(f"{self.SIBLING_ROOT}/issue-18/feature")
+        self.assertEqual(ctx.worktree_path, f"{self.SIBLING_ROOT}/issue-18/feature")
+
+    def test_sibling_trailing_slash_is_canonicalized(self) -> None:
+        ctx = self._resolve(f"{self.SIBLING_ROOT}/issue-18/feature/")
+        self.assertEqual(ctx.worktree_path, f"{self.SIBLING_ROOT}/issue-18/feature")
+
+    def test_sibling_root_itself_rejected(self) -> None:
+        with self.assertRaisesRegex(ContextError, "worktree_path is invalid"):
+            self._resolve(self.SIBLING_ROOT)
+
+    def test_similar_prefix_sibling_rejected(self) -> None:
+        with self.assertRaisesRegex(ContextError, "worktree_path is invalid"):
+            self._resolve(f"{self.SIBLING_ROOT}-other/issue-18")
+
+    def test_sibling_traversal_rejected(self) -> None:
+        with self.assertRaisesRegex(ContextError, "traversal"):
+            self._resolve(f"{self.SIBLING_ROOT}/issue-18/../escape")
+
+    def test_sibling_dot_segment_rejected(self) -> None:
+        with self.assertRaisesRegex(ContextError, "traversal"):
+            self._resolve(f"{self.SIBLING_ROOT}/./issue-18")
+
+    def test_relative_sibling_rejected(self) -> None:
+        with self.assertRaisesRegex(ContextError, "worktree_path is invalid"):
+            self._resolve("worktrees/issue-18")
+
+    def test_outside_allowlist_rejected(self) -> None:
+        with self.assertRaisesRegex(ContextError, "worktree_path is invalid"):
+            self._resolve("/other/worktrees/issue-18")
+
+    def test_control_branch_still_maps_under_control_root(self) -> None:
+        # Classification is control-root-first: a path under the control
+        # workspace root keeps the legacy mapping even when roots exist.
+        ctx = self._resolve(f"{self.control_root}/feature")
+        self.assertEqual(ctx.worktree_path, "/host/ws/feature")
+
+    def test_canonical_checkout_with_roots_configured(self) -> None:
+        workspace, profile = self._profile()
+        ctx = resolve_execution_context_v1(
+            job_id="request:e1",
+            workspace=workspace,
+            task=None,
+            assigned_agent="agent1",
+            host_id="host1",
+            profile=profile,
+            origin={"session_scope_id": "discord:ch"},
+        )
+        self.assertEqual(ctx.worktree_path, "/host/ws")
+
+    def _profile(self):
+        from coordinate.db import get_workspace, get_workspace_host_profile
+
+        return (
+            get_workspace(self.conn, "ws"),
+            get_workspace_host_profile(self.conn, workspace_id="ws", host_id="host1"),
+        )
+
+    def test_windows_sibling_child_is_allowlisted(self) -> None:
+        upsert_workspace_host_profile(
+            self.conn,
+            workspace_id="ws",
+            host_id="host1",
+            workspace_path="C:\\Users\\ADMIN\\projects\\multinexus",
+            harness_root="C:\\Users\\ADMIN\\projects\\multinexus\\harness",
+            worktree_roots=["C:\\Users\\Admin\\projects\\WorkTrees"],
+        )
+        ctx = self._resolve("C:\\Users\\Admin\\projects\\WorkTrees\\issue-18")
+        self.assertEqual(
+            ctx.worktree_path,
+            "c:\\users\\admin\\projects\\worktrees\\issue-18",
+        )
+        from coordinate.execution_resources import build_worktree_resource
+
+        self.assertEqual(
+            build_worktree_resource(ctx.host_id, ctx.worktree_path).normalized_path,
+            ctx.worktree_path,
+        )
+
+    def test_windows_sibling_never_mapped_through_control_root(self) -> None:
+        # A Windows host path must not be treated as a control-path candidate
+        # even when the control root is a POSIX prefix of nothing.
+        upsert_workspace_host_profile(
+            self.conn,
+            workspace_id="ws",
+            host_id="host1",
+            workspace_path="C:\\Users\\ADMIN\\projects\\multinexus",
+            harness_root="C:\\Users\\ADMIN\\projects\\multinexus\\harness",
+            worktree_roots=["C:\\Users\\Admin\\projects\\WorkTrees"],
+        )
+        ctx = self._resolve("C:/Users/Admin/projects/WorkTrees/issue-18/feature")
+        self.assertEqual(
+            ctx.worktree_path,
+            "c:\\users\\admin\\projects\\worktrees\\issue-18\\feature",
+        )
+
+    def test_digest_and_resource_identity_use_normalized_sibling_path(self) -> None:
+        ctx = self._resolve(f"{self.SIBLING_ROOT}/issue-18/feature")
+        resource = build_worktree_resource(ctx.host_id, ctx.worktree_path)
+        self.assertEqual(resource.normalized_path, ctx.worktree_path)
+        key = compute_resource_key(resource)
+        self.assertTrue(key.startswith("sha256:"))
+        # Same lexical path with a trailing slash must bind the same identity.
+        ctx2 = self._resolve(f"{self.SIBLING_ROOT}/issue-18/feature/")
+        self.assertEqual(ctx2.worktree_path, ctx.worktree_path)
+        self.assertEqual(ctx2.context_id, ctx.context_id)
+
+
+class WorktreeRootsProfileValidationTests(unittest.TestCase):
+    """Issue #18: allowlist storage validation and fail-closed reads."""
+
+    def setUp(self) -> None:
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.conn = initialize(":memory:")
+        upsert_workspace(
+            self.conn,
+            workspace_id="ws",
+            name="WS",
+            path=self.tmp.name,
+            harness_root=self.tmp.name,
+        )
+
+    def test_explicit_roots_normalized_deduped_order_stable(self) -> None:
+        profile = upsert_workspace_host_profile(
+            self.conn,
+            workspace_id="ws",
+            host_id="mac",
+            workspace_path="/host/ws",
+            harness_root="/host/harness",
+            worktree_roots=[
+                "/host/worktrees/b",
+                "/host/worktrees/a",
+                "/host/worktrees/a/",
+                "/host/worktrees/b",
+            ],
+        )
+        self.assertEqual(
+            profile.worktree_roots,
+            ("/host/worktrees/b", "/host/worktrees/a"),
+        )
+        self.assertEqual(
+            json.loads(
+                self.conn.execute(
+                    "SELECT worktree_roots_json FROM workspace_host_profiles"
+                ).fetchone()[0]
+            ),
+            ["/host/worktrees/b", "/host/worktrees/a"],
+        )
+
+    def test_none_preserves_existing_roots(self) -> None:
+        upsert_workspace_host_profile(
+            self.conn,
+            workspace_id="ws",
+            host_id="mac",
+            workspace_path="/host/ws",
+            harness_root="/host/harness",
+            worktree_roots=["/host/worktrees/a"],
+        )
+        preserved = upsert_workspace_host_profile(
+            self.conn,
+            workspace_id="ws",
+            host_id="mac",
+            workspace_path="/host/ws",
+            harness_root="/host/harness",
+        )
+        self.assertEqual(preserved.worktree_roots, ("/host/worktrees/a",))
+
+    def test_none_on_new_row_writes_empty_allowlist(self) -> None:
+        profile = upsert_workspace_host_profile(
+            self.conn,
+            workspace_id="ws",
+            host_id="mac",
+            workspace_path="/host/ws",
+            harness_root="/host/harness",
+        )
+        self.assertEqual(profile.worktree_roots, ())
+
+    def test_explicit_list_replaces_whole_allowlist(self) -> None:
+        upsert_workspace_host_profile(
+            self.conn,
+            workspace_id="ws",
+            host_id="mac",
+            workspace_path="/host/ws",
+            harness_root="/host/harness",
+            worktree_roots=["/host/worktrees/a", "/host/worktrees/b"],
+        )
+        replaced = upsert_workspace_host_profile(
+            self.conn,
+            workspace_id="ws",
+            host_id="mac",
+            workspace_path="/host/ws",
+            harness_root="/host/harness",
+            worktree_roots=["/host/worktrees/c"],
+        )
+        self.assertEqual(replaced.worktree_roots, ("/host/worktrees/c",))
+
+    def test_explicit_empty_list_clears_allowlist(self) -> None:
+        upsert_workspace_host_profile(
+            self.conn,
+            workspace_id="ws",
+            host_id="mac",
+            workspace_path="/host/ws",
+            harness_root="/host/harness",
+            worktree_roots=["/host/worktrees/a"],
+        )
+        cleared = upsert_workspace_host_profile(
+            self.conn,
+            workspace_id="ws",
+            host_id="mac",
+            workspace_path="/host/ws",
+            harness_root="/host/harness",
+            worktree_roots=[],
+        )
+        self.assertEqual(cleared.worktree_roots, ())
+
+    def test_metadata_update_does_not_touch_roots(self) -> None:
+        upsert_workspace_host_profile(
+            self.conn,
+            workspace_id="ws",
+            host_id="mac",
+            workspace_path="/host/ws",
+            harness_root="/host/harness",
+            worktree_roots=["/host/worktrees/a"],
+        )
+        updated = upsert_workspace_host_profile(
+            self.conn,
+            workspace_id="ws",
+            host_id="mac",
+            workspace_path="/host/ws",
+            harness_root="/host/harness",
+            metadata={"note": "x"},
+        )
+        self.assertEqual(updated.worktree_roots, ("/host/worktrees/a",))
+        self.assertEqual(updated.metadata, {"note": "x"})
+
+    def test_invalid_roots_rejected(self) -> None:
+        for invalid in (
+            "relative/root",
+            "/",
+            "C:\\",
+            "/host/worktrees/..",
+            "/host/worktrees/.",
+            "C:\\Users\\x",  # cross-flavour against POSIX workspace_path
+        ):
+            with self.subTest(root=invalid):
+                with self.assertRaisesRegex(ValueError, "invalid worktree root"):
+                    upsert_workspace_host_profile(
+                        self.conn,
+                        workspace_id="ws",
+                        host_id="mac",
+                        workspace_path="/host/ws",
+                        harness_root="/host/harness",
+                        worktree_roots=[invalid],
+                    )
+
+    def test_unc_share_root_rejected(self) -> None:
+        with self.assertRaisesRegex(ValueError, "invalid worktree root"):
+            upsert_workspace_host_profile(
+                self.conn,
+                workspace_id="ws",
+                host_id="mac",
+                workspace_path="\\\\server\\share\\ws",
+                harness_root="\\\\server\\share\\ws\\harness",
+                worktree_roots=["\\\\server\\share"],
+            )
+
+    def test_non_string_root_rejected(self) -> None:
+        with self.assertRaisesRegex(ValueError, "entries must be strings"):
+            upsert_workspace_host_profile(
+                self.conn,
+                workspace_id="ws",
+                host_id="mac",
+                workspace_path="/host/ws",
+                harness_root="/host/harness",
+                worktree_roots=["/host/worktrees/a", 42],
+            )
+
+    def test_string_roots_argument_rejected(self) -> None:
+        with self.assertRaisesRegex(ValueError, "worktree_roots must be a list"):
+            upsert_workspace_host_profile(
+                self.conn,
+                workspace_id="ws",
+                host_id="mac",
+                workspace_path="/host/ws",
+                harness_root="/host/harness",
+                worktree_roots="/host/worktrees/a",
+            )
+
+    def test_malformed_stored_json_fails_closed_on_read(self) -> None:
+        upsert_workspace_host_profile(
+            self.conn,
+            workspace_id="ws",
+            host_id="mac",
+            workspace_path="/host/ws",
+            harness_root="/host/harness",
+        )
+        self.conn.execute(
+            "UPDATE workspace_host_profiles SET worktree_roots_json = 'not-json'"
+        )
+        self.conn.commit()
+        with self.assertRaisesRegex(ValueError, "invalid JSON"):
+            get_workspace_host_profile(self.conn, workspace_id="ws", host_id="mac")
+
+    def test_non_canonical_stored_json_fails_closed_on_read(self) -> None:
+        upsert_workspace_host_profile(
+            self.conn,
+            workspace_id="ws",
+            host_id="mac",
+            workspace_path="/host/ws",
+            harness_root="/host/harness",
+        )
+        self.conn.execute(
+            "UPDATE workspace_host_profiles SET worktree_roots_json = '[\"/host/worktrees/a/\"]'"
+        )
+        self.conn.commit()
+        with self.assertRaisesRegex(ValueError, "not canonical"):
+            get_workspace_host_profile(self.conn, workspace_id="ws", host_id="mac")
+
+    def test_duplicate_stored_json_fails_closed_on_read(self) -> None:
+        upsert_workspace_host_profile(
+            self.conn,
+            workspace_id="ws",
+            host_id="mac",
+            workspace_path="/host/ws",
+            harness_root="/host/harness",
+        )
+        self.conn.execute(
+            "UPDATE workspace_host_profiles SET worktree_roots_json = "
+            "'[\"/host/worktrees/a\", \"/host/worktrees/a\"]'"
+        )
+        self.conn.commit()
+        with self.assertRaisesRegex(ValueError, "duplicate"):
+            get_workspace_host_profile(self.conn, workspace_id="ws", host_id="mac")
+
+    def test_non_list_stored_json_fails_closed_on_read(self) -> None:
+        upsert_workspace_host_profile(
+            self.conn,
+            workspace_id="ws",
+            host_id="mac",
+            workspace_path="/host/ws",
+            harness_root="/host/harness",
+        )
+        self.conn.execute(
+            "UPDATE workspace_host_profiles SET worktree_roots_json = '{}'"
+        )
+        self.conn.commit()
+        with self.assertRaisesRegex(ValueError, "must be a JSON array"):
+            get_workspace_host_profile(self.conn, workspace_id="ws", host_id="mac")
+
+
+
+
+class SiblingSubmitIntegrationTests(unittest.TestCase):
+    """Issue #18: runtime submit of allowlisted host-native sibling worktrees."""
+
+    def setUp(self) -> None:
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.sibling = tempfile.TemporaryDirectory()
+        self.addCleanup(self.sibling.cleanup)
+        self.conn = initialize(":memory:")
+        self.control_root = str(Path(self.tmp.name).resolve())
+        self.sibling_root = str(Path(self.sibling.name).resolve())
+        upsert_workspace(
+            self.conn,
+            workspace_id="ws",
+            name="WS",
+            path=self.tmp.name,
+            harness_root="harness",
+            base_branch="main",
+        )
+        upsert_workspace_host_profile(
+            self.conn,
+            workspace_id="ws",
+            host_id="host1",
+            workspace_path="/host/ws",
+            harness_root="/host/harness",
+            worktree_roots=[self.sibling_root],
+        )
+        register_agent(self.conn, agent_id="agent1", host_id="host1", capabilities={})
+
+    def _submit(self, worktree_path: str | None, message_id: str, **overrides):
+        return submit_request(
+            self.conn,
+            workspace_id="ws",
+            target_agent="agent1",
+            prompt="quiet",
+            origin={
+                "platform": "discord",
+                "destination": "ch",
+                "message_id": message_id,
+                "session_scope_id": f"discord:{message_id}",
+            },
+            reply={"platform": "discord", "destination": "ch"},
+            worktree_path=worktree_path,
+            **overrides,
+        )
+
+    def _counts(self) -> tuple[int, int]:
+        return tuple(
+            self.conn.execute(f"SELECT count(*) FROM {table}").fetchone()[0]
+            for table in ("events", "jobs")
+        )
+
+    def test_sibling_submit_persists_same_normalized_path_everywhere(self) -> None:
+        raw = f"{self.sibling_root}/issue-18/feature/"
+        request = self._submit(raw, "m-sibling")
+        expected = f"{self.sibling_root}/issue-18/feature"
+        self.assertEqual(request.event["payload"]["worktree_path"], expected)
+        self.assertEqual(request.job["worktree_path"], expected)
+        self.assertEqual(
+            request.job["payload"]["execution_context"]["worktree_path"], expected
+        )
+
+    def test_sibling_submit_then_claim_uses_same_worktree(self) -> None:
+        request = self._submit(f"{self.sibling_root}/issue-18", "m-claim")
+        claim = claim_job(self.conn, agent_id="agent1")
+        self.assertTrue(claim.claimed)
+        self.assertEqual(claim.job["worktree_path"], request.job["worktree_path"])
+        self.assertEqual(
+            claim.execution_context["worktree_path"],
+            f"{self.sibling_root}/issue-18",
+        )
+        self.assertEqual(
+            claim.execution_context["context_id"],
+            request.job["payload"]["execution_context"]["context_id"],
+        )
+
+    def test_sibling_replay_normalizes_raw_before_comparison(self) -> None:
+        first = self._submit(f"{self.sibling_root}/issue-18", "m-replay")
+        before = self._counts()
+        replay = self._submit(f"{self.sibling_root}/issue-18/", "m-replay")
+        self.assertFalse(replay.event_created)
+        self.assertFalse(replay.job_created)
+        self.assertEqual(replay.job["id"], first.job["id"])
+        self.assertEqual(self._counts(), before)
+
+    def test_sibling_replay_different_path_conflicts(self) -> None:
+        self._submit(f"{self.sibling_root}/issue-18", "m-replay-diff")
+        before = self._counts()
+        with self.assertRaisesRegex(RuntimeError, "worktree_path conflicts"):
+            self._submit(f"{self.sibling_root}/issue-19", "m-replay-diff")
+        self.assertEqual(self._counts(), before)
+
+    def test_sibling_submit_without_allowlist_rejected_zero_mutation(self) -> None:
+        upsert_workspace_host_profile(
+            self.conn,
+            workspace_id="ws",
+            host_id="host1",
+            workspace_path="/host/ws",
+            harness_root="/host/harness",
+            worktree_roots=[],
+        )
+        before = self._counts()
+        with self.assertRaisesRegex(RuntimeError, "invalid execution context"):
+            self._submit(f"{self.sibling_root}/issue-18", "m-no-allowlist")
+        self.assertEqual(self._counts(), before)
+
+    def test_revoked_allowlist_rejects_new_submit_and_replay(self) -> None:
+        self._submit(f"{self.sibling_root}/issue-18", "m-revoked")
+        upsert_workspace_host_profile(
+            self.conn,
+            workspace_id="ws",
+            host_id="host1",
+            workspace_path="/host/ws",
+            harness_root="/host/harness",
+            worktree_roots=[],
+        )
+        before = self._counts()
+        with self.assertRaisesRegex(RuntimeError, "invalid execution context"):
+            self._submit(f"{self.sibling_root}/issue-19", "m-revoked-new")
+        # The same raw replay is rejected at the preflight (allowlist is the
+        # job-creation authority) before any replay comparison runs.
+        with self.assertRaisesRegex(RuntimeError, "invalid execution context"):
+            self._submit(f"{self.sibling_root}/issue-18", "m-revoked")
+        self.assertEqual(self._counts(), before)
+
+    def test_sibling_durable_path_ignores_control_host_symlink(self) -> None:
+        # The sibling path lexically contains a control-host symlink. The
+        # durable value must stay the normalized lexical path and must never
+        # be resolved through the control host (Path.resolve would follow the
+        # link to ``actual``).
+        target = Path(self.sibling_root) / "actual"
+        target.mkdir()
+        link = Path(self.sibling_root) / "linked"
+        link.symlink_to(target, target_is_directory=True)
+        raw = f"{link}/issue-18"
+        request = self._submit(raw, "m-symlink")
+        expected = f"{self.sibling_root}/linked/issue-18"
+        self.assertEqual(request.job["worktree_path"], expected)
+        self.assertEqual(request.event["payload"]["worktree_path"], expected)
+        self.assertEqual(
+            request.job["payload"]["execution_context"]["worktree_path"], expected
+        )
+
+    def test_windows_foreign_sibling_submit_skips_control_resolve(self) -> None:
+        upsert_workspace_host_profile(
+            self.conn,
+            workspace_id="ws",
+            host_id="host1",
+            workspace_path="C:\\Users\\ADMIN\\projects\\multinexus",
+            harness_root="C:\\Users\\ADMIN\\projects\\multinexus\\harness",
+            worktree_roots=["C:\\Users\\Admin\\projects\\WorkTrees"],
+        )
+        request = self._submit(
+            "C:\\Users\\Admin\\projects\\WorkTrees\\issue-18\\feature",
+            "m-windows",
+        )
+        expected = "c:\\users\\admin\\projects\\worktrees\\issue-18\\feature"
+        self.assertEqual(request.job["worktree_path"], expected)
+        self.assertEqual(request.event["payload"]["worktree_path"], expected)
+        self.assertEqual(
+            request.job["payload"]["execution_context"]["worktree_path"], expected
+        )
+        # Claim must derive the same worktree resource identity.
+        claim = claim_job(self.conn, agent_id="agent1")
+        self.assertTrue(claim.claimed)
+        self.assertEqual(claim.execution_context["worktree_path"], expected)
+        key = compute_resource_key(
+            build_worktree_resource("host1", claim.execution_context["worktree_path"])
+        )
+        self.assertTrue(key.startswith("sha256:"))
+
+    def test_canonical_submit_unaffected_by_allowlist(self) -> None:
+        request = self._submit(None, "m-canonical")
+        self.assertEqual(request.job["worktree_path"], None)
+        self.assertEqual(
+            request.job["payload"]["execution_context"]["worktree_path"], "/host/ws"
+        )
+        claim = claim_job(self.conn, agent_id="agent1")
+        self.assertTrue(claim.claimed)
+        self.assertEqual(claim.execution_context["worktree_path"], "/host/ws")
+
+
+
+
+class ControlPathSeparatorSymmetryTests(unittest.TestCase):
+    """R3: control-root/raw comparison must be separator-symmetric.
+
+    ``classify_worktree_raw_path`` and ``_map_foreign_path`` share one
+    separator canonicalization so a Windows-style control root with either
+    separator spelling never drifts between classification and mapping.
+    """
+
+    def test_classify_windows_control_root_backslash_child(self):
+        from coordinate.execution_resources import classify_worktree_raw_path
+
+        self.assertEqual(
+            classify_worktree_raw_path("C:\\ws", "C:\\ws\\feature"), "control"
+        )
+
+    def test_classify_windows_control_root_forward_slash_child(self):
+        from coordinate.execution_resources import classify_worktree_raw_path
+
+        self.assertEqual(
+            classify_worktree_raw_path("C:\\ws", "C:/ws/feature"), "control"
+        )
+
+    def test_classify_windows_control_root_itself(self):
+        from coordinate.execution_resources import classify_worktree_raw_path
+
+        self.assertEqual(classify_worktree_raw_path("C:\\ws", "C:\\ws"), "control")
+
+    def test_classify_windows_similar_prefix_is_host_native(self):
+        from coordinate.execution_resources import classify_worktree_raw_path
+
+        self.assertEqual(
+            classify_worktree_raw_path("C:\\ws", "C:\\wsx\\feature"),
+            "host_native",
+        )
+
+    def test_classify_posix_control_root_backslash_child_matches_map(self):
+        # _map_foreign_path has always canonicalized backslashes to slashes
+        # for the control-root comparison, so classify must agree: a
+        # backslash child of a POSIX control root is control-branch material
+        # (never drift between the two comparisons).
+        from coordinate.execution_resources import classify_worktree_raw_path
+
+        self.assertEqual(
+            classify_worktree_raw_path("/ws", "/ws\\\\feature"), "control"
+        )
+        self.assertEqual(
+            _map_foreign_path("/ws", "/host/ws", "/ws\\\\feature"),
+            "/host/ws/feature",
+        )
+
+    def test_map_foreign_path_windows_control_root_backslash_child(self):
+        self.assertEqual(
+            _map_foreign_path("C:\\ws", "/host/ws", "C:\\ws\\feature"),
+            "/host/ws/feature",
+        )
+
+    def test_map_foreign_path_windows_control_root_mixed_separators(self):
+        self.assertEqual(
+            _map_foreign_path("C:/ws", "/host/ws", "C:\\ws\\a\\b"),
+            "/host/ws/a/b",
+        )
+
+    def test_map_foreign_path_windows_control_root_similar_prefix_rejected(self):
+        with self.assertRaisesRegex(ContextError, "outside control workspace"):
+            _map_foreign_path("C:\\ws", "/host/ws", "C:\\wsx\\feature")
+
+
+class WorktreeRootWidthTests(unittest.TestCase):
+    """R3: allowlisted roots must not equal or contain the canonical checkout."""
+
+    def setUp(self) -> None:
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.conn = initialize(":memory:")
+        upsert_workspace(
+            self.conn,
+            workspace_id="ws",
+            name="WS",
+            path=self.tmp.name,
+            harness_root=self.tmp.name,
+        )
+
+    def _upsert(self, root: str):
+        return upsert_workspace_host_profile(
+            self.conn,
+            workspace_id="ws",
+            host_id="mac",
+            workspace_path="/host/ws",
+            harness_root="/host/harness",
+            worktree_roots=[root],
+        )
+
+    def test_root_equal_to_canonical_rejected(self):
+        with self.assertRaisesRegex(ValueError, "canonical workspace_path or an ancestor"):
+            self._upsert("/host/ws")
+
+    def test_root_ancestor_of_canonical_rejected(self):
+        with self.assertRaisesRegex(ValueError, "canonical workspace_path or an ancestor"):
+            self._upsert("/host")
+
+    def test_root_ancestor_of_canonical_rejected_with_windows_flavour(self):
+        with self.assertRaisesRegex(ValueError, "canonical workspace_path or an ancestor"):
+            upsert_workspace_host_profile(
+                self.conn,
+                workspace_id="ws",
+                host_id="mac",
+                workspace_path="C:\\\\Users\\\\Admin\\\\projects\\\\multinexus",
+                harness_root="C:\\\\Users\\\\Admin\\\\projects\\\\multinexus\\\\harness",
+                worktree_roots=["C:\\\\Users\\\\Admin\\\\projects"],
+            )
+
+    def test_root_descendant_of_canonical_allowed(self):
+        profile = self._upsert("/host/ws/worktrees")
+        self.assertEqual(profile.worktree_roots, ("/host/ws/worktrees",))
+
+    def test_root_true_sibling_of_canonical_allowed(self):
+        profile = self._upsert("/host/worktrees")
+        self.assertEqual(profile.worktree_roots, ("/host/worktrees",))
+
+    def test_root_ancestor_of_canonical_preserve_path_also_rejected(self):
+        """Preserve re-validation applies the same width rule against the NEW
+        workspace_path: a stored root that becomes the new canonical or its
+        ancestor fails before mutation."""
+        upsert_workspace_host_profile(
+            self.conn,
+            workspace_id="ws",
+            host_id="mac",
+            workspace_path="/host/ws",
+            harness_root="/host/harness",
+            worktree_roots=["/host/ws/worktrees"],
+        )
+        before = tuple(
+            self.conn.execute(
+                "SELECT * FROM workspace_host_profiles WHERE host_id = 'mac'"
+            ).fetchone()
+        )
+        # New canonical moves INTO the stored root's subtree -> the root
+        # becomes an ancestor of the canonical checkout.
+        with self.assertRaisesRegex(ValueError, "canonical workspace_path or an ancestor"):
+            upsert_workspace_host_profile(
+                self.conn,
+                workspace_id="ws",
+                host_id="mac",
+                workspace_path="/host/ws/worktrees/checkout",
+                harness_root="/host/harness",
+            )
+        after = tuple(
+            self.conn.execute(
+                "SELECT * FROM workspace_host_profiles WHERE host_id = 'mac'"
+            ).fetchone()
+        )
+        self.assertEqual(after, before)
+
+
+class MalformedStoredRootsRepairTests(unittest.TestCase):
+    """R3: explicit clear/replace must repair malformed stored roots JSON."""
+
+    def setUp(self) -> None:
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.conn = initialize(":memory:")
+        upsert_workspace(
+            self.conn,
+            workspace_id="ws",
+            name="WS",
+            path=self.tmp.name,
+            harness_root=self.tmp.name,
+        )
+
+    def _corrupt(self) -> None:
+        upsert_workspace_host_profile(
+            self.conn,
+            workspace_id="ws",
+            host_id="mac",
+            workspace_path="/host/ws",
+            harness_root="/host/harness",
+            worktree_roots=["/host/worktrees/a"],
+        )
+        self.conn.execute(
+            "UPDATE workspace_host_profiles SET worktree_roots_json = 'not-json'"
+        )
+        self.conn.commit()
+
+    def test_ordinary_read_still_fails_closed(self) -> None:
+        self._corrupt()
+        with self.assertRaisesRegex(ValueError, "invalid JSON"):
+            get_workspace_host_profile(self.conn, workspace_id="ws", host_id="mac")
+
+    def test_preserve_on_malformed_still_fails_closed(self) -> None:
+        self._corrupt()
+        with self.assertRaisesRegex(ValueError, "invalid JSON"):
+            upsert_workspace_host_profile(
+                self.conn,
+                workspace_id="ws",
+                host_id="mac",
+                workspace_path="/host/ws",
+                harness_root="/host/harness",
+            )
+
+    def test_explicit_clear_repairs_malformed_stored_json(self) -> None:
+        self._corrupt()
+        repaired = upsert_workspace_host_profile(
+            self.conn,
+            workspace_id="ws",
+            host_id="mac",
+            workspace_path="/host/ws",
+            harness_root="/host/harness",
+            worktree_roots=[],
+        )
+        self.assertEqual(repaired.worktree_roots, ())
+        loaded = get_workspace_host_profile(
+            self.conn, workspace_id="ws", host_id="mac"
+        )
+        self.assertIsNotNone(loaded)
+        self.assertEqual(loaded.worktree_roots, ())
+
+    def test_explicit_replace_repairs_malformed_stored_json(self) -> None:
+        self._corrupt()
+        repaired = upsert_workspace_host_profile(
+            self.conn,
+            workspace_id="ws",
+            host_id="mac",
+            workspace_path="/host/ws",
+            harness_root="/host/harness",
+            worktree_roots=["/host/worktrees/b"],
+        )
+        self.assertEqual(repaired.worktree_roots, ("/host/worktrees/b",))
+        loaded = get_workspace_host_profile(
+            self.conn, workspace_id="ws", host_id="mac"
+        )
+        self.assertIsNotNone(loaded)
+        self.assertEqual(loaded.worktree_roots, ("/host/worktrees/b",))
+
+
+class LegacyClaimTransactionGateTests(unittest.TestCase):
+    """R3: the legacy claim containment gate runs inside BEGIN IMMEDIATE and
+    re-reads the CURRENT profile, so a root mutation cannot land between the
+    gate and the CAS; failures roll back."""
+
+    def setUp(self) -> None:
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.sibling = tempfile.TemporaryDirectory()
+        self.addCleanup(self.sibling.cleanup)
+        self.conn = initialize(":memory:")
+        self.control_root = str(Path(self.tmp.name).resolve())
+        self.sibling_root = str(Path(self.sibling.name).resolve())
+        upsert_workspace(
+            self.conn,
+            workspace_id="ws",
+            name="WS",
+            path=self.tmp.name,
+            harness_root=self.tmp.name,
+        )
+        upsert_workspace_host_profile(
+            self.conn,
+            workspace_id="ws",
+            host_id="host1",
+            workspace_path=self.control_root,
+            harness_root=self.control_root,
+            worktree_roots=[self.sibling_root],
+        )
+        register_agent(self.conn, agent_id="agent1", host_id="host1", capabilities={})
+
+    def test_gate_reruns_inside_transaction_and_rolls_back(self) -> None:
+        import coordinate.runtime as runtime_module
+
+        submit_request(
+            self.conn,
+            workspace_id="ws",
+            target_agent="agent1",
+            prompt="quiet",
+            origin={
+                "platform": "discord",
+                "destination": "ch",
+                "message_id": "m-gate",
+                "session_scope_id": "discord:m-gate",
+            },
+            reply={"platform": "discord", "destination": "ch"},
+            worktree_path=f"{self.sibling_root}/issue-18",
+        )
+        upsert_workspace_host_profile(
+            self.conn,
+            workspace_id="ws",
+            host_id="host1",
+            workspace_path=self.control_root,
+            harness_root=self.control_root,
+            worktree_roots=[],
+        )
+
+        calls: list[bool] = []
+        original = runtime_module.get_workspace_host_profile
+
+        def recording(conn_, **kwargs):
+            calls.append(conn_.in_transaction)
+            return original(conn_, **kwargs)
+
+        with patch(
+            "coordinate.runtime.get_workspace_host_profile", side_effect=recording
+        ):
+            with self.assertRaisesRegex(
+                RuntimeError, "worktree containment policy rejected claim"
+            ):
+                claim_job(self.conn, agent_id="agent1")
+
+        self.assertTrue(calls, "claim must re-read the host profile")
+        self.assertTrue(
+            calls[-1],
+            "containment gate profile read must happen inside BEGIN IMMEDIATE",
+        )
+        self.assertFalse(
+            self.conn.in_transaction,
+            "gate failure must roll back the transaction",
+        )
+        job = self.conn.execute("SELECT status, attempt_count FROM jobs").fetchone()
+        self.assertEqual((job["status"], job["attempt_count"]), ("pending", 0))
+        claimed = self.conn.execute(
+            "SELECT COUNT(*) FROM events WHERE event_type = 'job.claimed'"
+        ).fetchone()[0]
+        self.assertEqual(claimed, 0)
+        # The gated job can still be claimed after the root is restored.
+        upsert_workspace_host_profile(
+            self.conn,
+            workspace_id="ws",
+            host_id="host1",
+            workspace_path=self.control_root,
+            harness_root=self.control_root,
+            worktree_roots=[self.sibling_root],
+        )
+        result = claim_job(self.conn, agent_id="agent1")
+        self.assertTrue(result.claimed)
+        self.assertEqual(
+            result.execution_context["worktree_path"],
+            f"{self.sibling_root}/issue-18",
+        )
+
+    def test_same_roots_claim_passes_inside_transaction(self) -> None:
+        import coordinate.runtime as runtime_module
+
+        submit_request(
+            self.conn,
+            workspace_id="ws",
+            target_agent="agent1",
+            prompt="quiet",
+            origin={
+                "platform": "discord",
+                "destination": "ch",
+                "message_id": "m-gate-ok",
+                "session_scope_id": "discord:m-gate-ok",
+            },
+            reply={"platform": "discord", "destination": "ch"},
+            worktree_path=f"{self.sibling_root}/issue-18",
+        )
+        calls: list[bool] = []
+        original = runtime_module.get_workspace_host_profile
+
+        def recording(conn_, **kwargs):
+            calls.append(conn_.in_transaction)
+            return original(conn_, **kwargs)
+
+        with patch(
+            "coordinate.runtime.get_workspace_host_profile", side_effect=recording
+        ):
+            result = claim_job(self.conn, agent_id="agent1")
+        self.assertTrue(result.claimed)
+        self.assertTrue(calls[-1])
+        self.assertFalse(self.conn.in_transaction)
 
 if __name__ == "__main__":
     unittest.main()

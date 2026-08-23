@@ -10,7 +10,11 @@ from .cli_support import open_connection, print_json
 from .db import append_event, list_events, row_to_dict
 from .handoff import prepare_handoff
 from .onboarding import (
+    TaskAdoptRecoveryError,
     TaskCreateRecoveryError,
+    adopt_plan_task,
+    adopt_plan_task_files,
+    adopt_plan_task_record,
     create_plan_task,
     create_plan_task_files,
     create_plan_task_record,
@@ -161,6 +165,115 @@ def handle_task_create_record(args: argparse.Namespace) -> int:
             )
     except ValueError as exc:
         _print_json({"error": {"message": str(exc)}})
+        return 1
+    _print_json({"result": result.to_dict()})
+    return 0
+
+
+def handle_task_adopt(args: argparse.Namespace) -> int:
+    try:
+        payload = json.loads(args.payload_json)
+    except json.JSONDecodeError as exc:
+        print(f"error: invalid --payload-json: {exc}", file=sys.stderr)
+        return 1
+    if not isinstance(payload, dict):
+        print("error: --payload-json must decode to an object", file=sys.stderr)
+        return 1
+    try:
+        with _conn(args) as conn:
+            result = adopt_plan_task(
+                conn,
+                workspace_id=args.workspace_id,
+                task_id=args.task_id,
+                plan_doc=args.plan_doc,
+                owner=args.owner,
+                branch=args.branch,
+                actor=args.actor,
+                target=args.target,
+                payload=payload,
+                idempotency_key=args.idempotency_key,
+                operation_id=args.operation_id,
+                allow_runtime_copy=args.allow_runtime_copy,
+                prepare_only=args.prepare_only,
+            )
+    except TaskAdoptRecoveryError as exc:
+        # File half committed; DB half failed. Emit the same-operation recovery
+        # material as structured JSON and a copyable display command.
+        _print_json({"error": {"message": str(exc), **exc.recovery.to_dict()}})
+        return 1
+    except (SplitOperationError, ValueError) as exc:
+        _print_json({
+            "error": {
+                "message": str(exc),
+                "reason": getattr(exc, "reason", None),
+            }
+        })
+        return 1
+    # --prepare-only returns the read-only prepare dict; the combined path
+    # returns a TaskAdoptResult dataclass.
+    _print_json({"result": result if isinstance(result, dict) else result.to_dict()})
+    return 0
+
+
+def handle_task_adopt_files(args: argparse.Namespace) -> int:
+    try:
+        result = adopt_plan_task_files(
+            workspace_path=args.workspace_path,
+            harness_root=args.harness_root,
+            workspace_id=args.workspace_id,
+            operation_id=args.operation_id,
+            task_id=args.task_id,
+            plan_doc=args.plan_doc,
+            expected_item_fingerprint=args.expected_item_fingerprint,
+            expected_plan_sha256=args.expected_plan_sha256,
+            allow_runtime_copy=args.allow_runtime_copy,
+        )
+    except (SplitOperationError, ValueError) as exc:
+        _print_json({
+            "error": {
+                "message": str(exc),
+                "reason": getattr(exc, "reason", None),
+            }
+        })
+        return 1
+    _print_json({"result": result.to_dict()})
+    return 0
+
+
+def handle_task_adopt_record(args: argparse.Namespace) -> int:
+    try:
+        payload = json.loads(args.payload_json)
+    except json.JSONDecodeError as exc:
+        print(f"error: invalid --payload-json: {exc}", file=sys.stderr)
+        return 1
+    if not isinstance(payload, dict):
+        print("error: --payload-json must decode to an object", file=sys.stderr)
+        return 1
+    try:
+        with _conn(args) as conn:
+            result = adopt_plan_task_record(
+                conn,
+                workspace_id=args.workspace_id,
+                task_id=args.task_id,
+                plan_doc=args.plan_doc,
+                operation_id=args.operation_id,
+                input_fingerprint=args.input_fingerprint,
+                before_fingerprint=args.before_fingerprint,
+                after_fingerprint=args.after_fingerprint,
+                owner=args.owner,
+                branch=args.branch,
+                actor=args.actor,
+                target=args.target,
+                payload=payload,
+                idempotency_key=args.idempotency_key,
+            )
+    except (SplitOperationError, ValueError) as exc:
+        _print_json({
+            "error": {
+                "message": str(exc),
+                "reason": getattr(exc, "reason", None),
+            }
+        })
         return 1
     _print_json({"result": result.to_dict()})
     return 0
@@ -436,6 +549,58 @@ def register_planning_commands(subcommands) -> None:
     task_create_record.add_argument("--payload-json", default="{}")
     task_create_record.add_argument("--idempotency-key")
     task_create_record.set_defaults(handler=handle_task_create_record)
+
+    task_adopt = task_subcommands.add_parser(
+        "adopt",
+        help="Combined explicit legacy first-adoption: bind an existing unbound checklist item into the managed lifecycle (file half first, DB record half second; idempotent; --prepare-only for the read-only expected fingerprints)",
+    )
+    task_adopt.add_argument("workspace_id")
+    task_adopt.add_argument("--task-id", required=True)
+    task_adopt.add_argument("--plan-doc", required=True)
+    task_adopt.add_argument("--owner")
+    task_adopt.add_argument("--branch")
+    task_adopt.add_argument("--actor", default="operator")
+    task_adopt.add_argument("--target", default="worker")
+    task_adopt.add_argument("--payload-json", default="{}")
+    task_adopt.add_argument("--idempotency-key")
+    task_adopt.add_argument("--operation-id", help="Pin the adoption operation id (default: fresh UUIDv4 or reuse the deployed envelope)")
+    task_adopt.add_argument("--allow-runtime-copy", action="store_true", help="Override the /opt runtime-copy guard")
+    task_adopt.add_argument("--prepare-only", action="store_true", help="Read-only: emit the expected item fingerprint and plan digest without mutating anything")
+    task_adopt.set_defaults(handler=handle_task_adopt)
+
+    task_adopt_files = task_subcommands.add_parser(
+        "adopt-files",
+        help="Coding-host half of host-aware adoption: write the task.adopt envelope only (no DB write; requires the prepare-phase expected fingerprints)",
+    )
+    task_adopt_files.add_argument("--workspace-path", required=True)
+    task_adopt_files.add_argument("--harness-root", required=True)
+    task_adopt_files.add_argument("--workspace-id", required=True)
+    task_adopt_files.add_argument("--operation-id", required=True)
+    task_adopt_files.add_argument("--task-id", required=True)
+    task_adopt_files.add_argument("--plan-doc", required=True)
+    task_adopt_files.add_argument("--expected-item-fingerprint", required=True)
+    task_adopt_files.add_argument("--expected-plan-sha256", required=True)
+    task_adopt_files.add_argument("--allow-runtime-copy", action="store_true", help="Override the /opt runtime-copy guard")
+    task_adopt_files.set_defaults(handler=handle_task_adopt_files)
+
+    task_adopt_record = task_subcommands.add_parser(
+        "adopt-record",
+        help="Server half of host-aware adoption: write DB ledger + task mirror + plan.ready only (no checklist write)",
+    )
+    task_adopt_record.add_argument("workspace_id")
+    task_adopt_record.add_argument("--operation-id", required=True)
+    task_adopt_record.add_argument("--input-fingerprint", required=True)
+    task_adopt_record.add_argument("--before-fingerprint", required=True)
+    task_adopt_record.add_argument("--after-fingerprint", required=True)
+    task_adopt_record.add_argument("--task-id", required=True)
+    task_adopt_record.add_argument("--plan-doc", required=True)
+    task_adopt_record.add_argument("--owner")
+    task_adopt_record.add_argument("--branch")
+    task_adopt_record.add_argument("--actor", default="operator")
+    task_adopt_record.add_argument("--target", default="worker")
+    task_adopt_record.add_argument("--payload-json", default="{}")
+    task_adopt_record.add_argument("--idempotency-key")
+    task_adopt_record.set_defaults(handler=handle_task_adopt_record)
 
     task_update_dependencies = task_subcommands.add_parser(
         "update-dependencies",

@@ -25,6 +25,7 @@ from coordinate.split_operations import (
     OPERATION_KIND_TASK_CREATE,
     apply_task_create_files,
     apply_task_create_record,
+    build_task_adopt_envelope,
     build_task_create_envelope,
 )
 
@@ -781,6 +782,62 @@ class SplitOperationProjectionTests(unittest.TestCase):
             "files_applied_at",
         ):
             self.assertNotIn(key, meta, key)
+
+    def test_file_pending_adoption_cannot_create_or_upgrade_task_mirror(self):
+        """reconcile is never a task.adopt record-half shortcut."""
+        item = self._item()
+        item["split_operation"] = build_task_adopt_envelope(
+            operation_id=self.OPERATION_ID,
+            workspace_id="demo",
+            task_id="mvp-001",
+            input_fingerprint="a" * 64,
+            before_fingerprint="b" * 64,
+            after_fingerprint="c" * 64,
+            files_applied_at="2026-07-13T12:00:00Z",
+        )
+        adapter = self._adapter([item])
+
+        for existing in (False, True):
+            with self.subTest(existing=existing):
+                conn = initialize(":memory:")
+                workspace = self._workspace(conn)
+                if existing:
+                    upsert_task_mirror(
+                        conn,
+                        workspace_id="demo",
+                        task_id="mvp-001",
+                        phase="running",
+                        owner=None,
+                        branch=None,
+                        pr=None,
+                        payload={"id": "mvp-001", "status": "doing"},
+                    )
+                tasks_before = [dict(row) for row in conn.execute(
+                    "SELECT * FROM tasks ORDER BY task_id"
+                )]
+                events_before = [dict(row) for row in conn.execute(
+                    "SELECT * FROM events ORDER BY rowid"
+                )]
+
+                with self.assertRaisesRegex(
+                    ReconcileConflictError, "explicit task adopt-record recovery"
+                ):
+                    reconcile_workspace(
+                        conn,
+                        workspace,
+                        adapter=adapter,
+                        refresh=False,
+                        task_id="mvp-001",
+                    )
+
+                self.assertEqual(
+                    [dict(row) for row in conn.execute("SELECT * FROM tasks ORDER BY task_id")],
+                    tasks_before,
+                )
+                self.assertEqual(
+                    [dict(row) for row in conn.execute("SELECT * FROM events ORDER BY rowid")],
+                    events_before,
+                )
 
     def test_existing_reduced_metadata_preserved_idempotently(self):
         """既有六字段 metadata：targeted reconcile 精确保留、重放幂等。"""

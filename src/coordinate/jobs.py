@@ -21,6 +21,7 @@ from .db import (
     mark_job_started,
     row_to_dict,
 )
+from .execution_resources import classify_worktree_raw_path
 from .executor_routing import is_routed_job
 from .execution_leases import release_attempt_lease
 
@@ -257,9 +258,25 @@ def retry_job(
     if is_routed_job(payload):
         raise JobError("routed_runtime_retry_requires_explicit_resubmission")
     payload.pop("result_path", None)
+    # Never copy the stale execution_context snapshot: it is digest-bound to
+    # the old job_id, and the first claim of the new job backfills a fresh
+    # snapshot from current authority.
+    payload.pop("execution_context", None)
     payload["retry_of_job_id"] = job_id
     if reason:
         payload["retry_reason"] = reason
+
+    authoritative_worktree = False
+    if source["worktree_path"]:
+        workspace = get_workspace(conn, source["workspace_id"])
+        if workspace is not None and (
+            classify_worktree_raw_path(workspace.path, source["worktree_path"])
+            == "host_native"
+        ):
+            # The stored path is an already-normalized host-native sibling;
+            # persist it verbatim instead of re-resolving through the control
+            # host. Claim still gates containment against current roots.
+            authoritative_worktree = True
 
     retry = create_job(
         conn,
@@ -271,6 +288,7 @@ def retry_job(
         worktree_path=source["worktree_path"],
         timeout_seconds=source["timeout_seconds"],
         payload=payload,
+        authoritative_worktree_path=authoritative_worktree,
     )
     event = append_event(
         conn,

@@ -9,12 +9,16 @@ from typing import Any
 from .db import Workspace, append_event, upsert_task_mirror
 from .harness import HarnessAdapter
 from .split_operations import (
+    OPERATION_KIND_TASK_ADOPT,
     SPLIT_OPERATION_ENVELOPE_KEYS,
+    STATUS_RECORD_APPLIED,
     SplitOperationError,
+    TARGET_KIND_CHECKLIST_TASK,
     TASK_MIRROR_SPLIT_OPERATION_KEYS,
     project_task_mirror_split_operation,
     validate_task_mirror_split_operation,
 )
+from .task_projection import task_mirror_from_item
 
 
 @dataclass(frozen=True)
@@ -189,6 +193,38 @@ def _reconcile_item(
     # Project the checklist envelope (if any) to the reduced mirror shape
     # before any read-modify-write; a malformed envelope fails closed here.
     projected_operation = _project_split_operation_metadata(item)
+    if (
+        projected_operation is not None
+        and projected_operation["operation_kind"] == OPERATION_KIND_TASK_ADOPT
+    ):
+        operation = conn.execute(
+            """
+            SELECT operation_kind, workspace_id, target_kind, target_id, status
+            FROM split_operations
+            WHERE operation_id = ?
+            """,
+            (projected_operation["operation_id"],),
+        ).fetchone()
+        expected = (
+            OPERATION_KIND_TASK_ADOPT,
+            workspace.id,
+            TARGET_KIND_CHECKLIST_TASK,
+            mirror["task_id"],
+            STATUS_RECORD_APPLIED,
+        )
+        actual = (
+            tuple(operation[field] for field in (
+                "operation_kind", "workspace_id", "target_kind", "target_id", "status"
+            ))
+            if operation is not None
+            else None
+        )
+        if actual != expected:
+            raise ReconcileConflictError(
+                f"task {mirror['task_id']} has a file-pending or conflicting "
+                "task.adopt envelope; complete the explicit task adopt-record "
+                "recovery before reconcile can project it"
+            )
     existing = conn.execute(
         "SELECT * FROM tasks WHERE workspace_id = ? AND task_id = ?",
         (workspace.id, mirror["task_id"]),
@@ -287,20 +323,6 @@ def _reconcile_item(
         )
         event_created = event.created
     return mirror, action, event_created
-
-
-def task_mirror_from_item(item: dict[str, Any]) -> dict[str, Any]:
-    workflow = item.get("workflow") if isinstance(item.get("workflow"), dict) else {}
-    artifacts = item.get("artifacts") if isinstance(item.get("artifacts"), dict) else {}
-    phase = workflow.get("status") or item.get("status")
-    return {
-        "task_id": item["id"],
-        "phase": phase,
-        "owner": item.get("owner"),
-        "branch": workflow.get("branch") or artifacts.get("branch"),
-        "pr": artifacts.get("pr") or artifacts.get("pull_request"),
-        "payload": item,
-    }
 
 
 # The task-mirror split-operation contract (six-key reduced metadata and

@@ -89,5 +89,53 @@
    "item 'task-1' field 'acceptance' must be a non-empty string"
   ],
   "warnings": []
+ },
+ "mode_only_ordinary_todo": {
+  "errors": [],
+  "warnings": []
+ },
+ "mode_only_high_risk_todo": {
+  "errors": [],
+  "warnings": []
+ },
+ "mode_with_status": {
+  "errors": [],
+  "warnings": []
+ },
+ "invalid_workflow_mode": {
+  "errors": [
+   "item 'task-1' workflow.mode must be one of ['high-risk', 'ordinary'], got 'medium'"
+  ],
+  "warnings": []
+ },
+ "null_workflow_mode": {
+  "errors": [
+   "item 'task-1' workflow.mode must be one of ['high-risk', 'ordinary'], got None"
+  ],
+  "warnings": []
+ },
+ "empty_workflow": {
+  "errors": [
+   "item 'task-1' workflow without 'status' must carry exactly 'mode', got keys []"
+  ],
+  "warnings": []
+ },
+ "mode_only_on_doing": {
+  "errors": [
+   "item 'task-1' mode-only workflow requires coarse status 'todo', got 'doing'"
+  ],
+  "warnings": []
+ },
+ "mode_with_fields_no_status": {
+  "errors": [
+   "item 'task-1' mode-only workflow may only carry 'mode', got keys ['branch', 'mode']"
+  ],
+  "warnings": []
+ },
+ "mode_with_updated_at_no_status": {
+  "errors": [
+   "item 'task-1' mode-only workflow may only carry 'mode', got keys ['mode', 'updated_at']"
+  ],
+  "warnings": []
  }
 }

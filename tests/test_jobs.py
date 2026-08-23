@@ -220,7 +220,11 @@ class JobRunnerTests(unittest.TestCase):
                 workspace_id="demo",
                 task_id="mvp-001",
                 runner_profile_id="subprocess",
-                payload={"result_path": "shared-result.json", "purpose": "initial"},
+                payload={
+                    "result_path": "shared-result.json",
+                    "purpose": "initial",
+                    "execution_context": {"stale": "bound to old job_id"},
+                },
             )
             run_job(conn, source["id"])
 
@@ -237,6 +241,9 @@ class JobRunnerTests(unittest.TestCase):
             self.assertEqual(retry_after["payload"]["retry_reason"], "fix prompt")
             self.assertEqual(retry_after["payload"]["purpose"], "initial")
             self.assertNotIn("result_path", retry_after["payload"])
+            # Issue #18: the stale job_id-bound execution_context snapshot must
+            # never be copied; claim backfills a fresh one for the new job.
+            self.assertNotIn("execution_context", retry_after["payload"])
             self.assertEqual(events[-1]["event_type"], "job.retry_requested")
             self.assertEqual(events[-1]["payload"]["source_job_id"], source["id"])
             self.assertEqual(events[-1]["payload"]["retry_job_id"], retry_after["id"])

@@ -76,8 +76,8 @@ def _make_conn() -> sqlite3.Connection:
 class CapacitySchemaTests(unittest.TestCase):
     def test_fresh_initialize_is_v14(self):
         conn = initialize(":memory:")
-        self.assertEqual(conn.execute("PRAGMA user_version").fetchone()[0], 14)
-        self.assertEqual(SCHEMA_VERSION, 14)
+        self.assertEqual(conn.execute("PRAGMA user_version").fetchone()[0], 16)
+        self.assertEqual(SCHEMA_VERSION, 16)
 
     def test_capacity_tables_exist(self):
         conn = _make_conn()
@@ -117,7 +117,7 @@ class CapacitySchemaTests(unittest.TestCase):
         )
         conn.commit()
         migrate(conn)
-        self.assertEqual(conn.execute("PRAGMA user_version").fetchone()[0], 14)
+        self.assertEqual(conn.execute("PRAGMA user_version").fetchone()[0], 16)
         indexes = {
             row["name"]
             for row in conn.execute(

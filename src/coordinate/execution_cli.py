@@ -50,6 +50,7 @@ from .runtime_lease import (
     reap_exact_lease,
     renew_managed_lease,
 )
+from .usage_cli import register_runtime_usage_commands
 
 
 def handle_runtime_capacity_sync(args: argparse.Namespace) -> int:
@@ -381,6 +382,8 @@ def register_runtime_commands(subcommands) -> None:
     )
     runtime_capacity_show.add_argument("agent_id")
     runtime_capacity_show.set_defaults(handler=handle_runtime_capacity_show)
+
+    register_runtime_usage_commands(runtime_subcommands)
 
 
 def handle_runner_add(args: argparse.Namespace) -> int:
