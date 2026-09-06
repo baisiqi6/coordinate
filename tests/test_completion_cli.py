@@ -1577,7 +1577,13 @@ class CompletionCLIMCPTransportTests(unittest.TestCase):
             with capture:
                 code = handle_assignment_mark_done_files(args)
         self.assertEqual(code, 1)
-        self.assertEqual(captured[0]["error"]["reason"], "transport_failed")
+        import importlib.util
+        expected_reason = (
+            "transport_failed"
+            if importlib.util.find_spec("mcp") is not None
+            else "mcp_transport_unavailable"
+        )
+        self.assertEqual(captured[0]["error"]["reason"], expected_reason)
         self.assertNotIn("r5b-leak-probe-secret", stdout.getvalue())
         self.assertNotIn("r5b-leak-probe-secret", stderr.getvalue())
         self.assertNotIn("r5b-leak-probe-secret", json.dumps(captured[0]))

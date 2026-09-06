@@ -29,7 +29,7 @@ Coordinate 刻意将确定性状态机制与可替换判断分离。`operator.py
 |---|---|---|
 | 入口 | `cli.py`, `daemon.py`, `__main__.py` | CLI/API/bot 命令接入和服务生命周期 |
 | Agent 接口 | `agent_interface.py`, `mcp_server.py`, `mcp_cli.py` | bounded agent-facing facade 与 MCP stdio adapter（R1） |
-| Runtime data plane | `runtime_interface.py`, `runtime_http.py`, `runtime_http_cli.py` | 共享 runtime facade 与 loopback HTTP adapter（R2A） |
+| Runtime data plane | `runtime_interface.py`, `runtime_http.py`, `runtime_http_cli.py`, `runtime_contract.py` | 共享 runtime facade、loopback HTTP adapter（R2A）与 agentd/client 能力契约 |
 | 持久化存储 | `schema.py`, `db.py`, `events.py` | SQLite schema、幂等 events、jobs、deliveries、agents、mirrors；`workspace list` / `host-profile list` 走严格只读连接（`mode=ro` + `query_only` + 精确 schema gate，绝不创建/migrate DB） |
 | 项目生命周期 | `assignments.py`, `transitions.py`, `handoff.py`, `plan_gate.py` | 经验证的生命周期转换和任务级交接产物 |
 | Harness 边界 | `harness.py`, `reconcile.py`, `audit.py`, `doctor.py` | 调用 harness mutations、刷新投影、报告 drift |
@@ -55,6 +55,14 @@ Operator 提交意图
 
 Job 的成功结束是证据，不是项目完成。Review、forge 状态、验收和 closeout
 仍是独立的 gate。
+
+### Runtime pairing contract
+
+`GET /v1/runtime/contract` 是 loopback HTTP transport 的只读配对探针。它返回
+`contract_version`、Coordinate 版本、transport 和 capabilities；MultiNexus agentd 在首次
+claim 前验证必需能力（claim fencing、agent reconcile、managed lease、terminal report），
+契约不匹配时直接退出并保持 fail-closed。HTTP transport 明确不提供 recoverable claim，
+恢复仍走受控 CLI/SSH 路径。
 
 ### Harness 生命周期 mutation
 
@@ -205,13 +213,16 @@ schema/handler；Remote 再施加 request-scoped principal/tool/workspace/platfo
 `coordinate runtime-http serve` 是 daemon/bridge/agentd 的 southbound runtime
 data plane，与 MCP 共用同一个 bounded facade：
 
-- 模块：`runtime_interface.py`（共享 7 use case facade）、`runtime_http.py`
+- 模块：`runtime_interface.py`（共享 runtime use case facade）、`runtime_http.py`
   （auth policy + aiohttp server）、`runtime_http_cli.py`（启动面）。
   `AgentInterface.runtime_request_submit` / `runtime_job_get` 委托同一
   `RuntimeInterface`；R1 job-id-only 与 HTTP workspace-bound 两种 job-get 形状
   共享同一个 core，`MESSAGE_JOB_NOT_FOUND` 文本不变。
-- 端点集恰好是真实 consumer 的 7 个 use case：channel resolve、request
-  submit、精确 job get、normal claim、progress、report、managed lease renew。
+- 端点集包含真实 consumer 的业务 use case：channel resolve、request submit、精确 job
+  get、normal claim、progress、report、managed lease renew，以及 agent-scoped read-only
+  claim reconcile。normal claim 可携带可选 `claim_request_id`；新 agentd 必须发送，重复
+  key 只回放同一成功 claim，不能创建第二个 attempt。reconcile 仅用于诊断/辅助，不单独
+  授权新 claim。
   没有 consumer 的 explicit reap/recoverable/operator endpoint 不实现；recovery
   继续走 CLI/SSH，且本节点 server 不暴露 recoverable/reap 端点。
 - 认证：server-local digest-only JSON policy（`--auth-file`），principal

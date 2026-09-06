@@ -102,6 +102,8 @@ PYTHONPATH=src python3 -m coordinate assignment --help
 
 ## 本地安装（fresh install）
 
+运行要求：Python 3.11+。CLI 使用标准库 `tomllib`；旧版元数据的 Python 3.10 声明未覆盖这一实际依赖。
+
 标准 Coordinate 安装只需克隆仓库、创建虚拟环境并从仓库根目录安装：
 
 ```bash

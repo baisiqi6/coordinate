@@ -40,6 +40,7 @@ from .runtime_interface import (
     MESSAGE_UNAVAILABLE,
     RuntimeInterface,
 )
+from .runtime_contract import build_runtime_contract
 
 logger = logging.getLogger("coordinate.runtime_http")
 
@@ -296,6 +297,7 @@ class RuntimeHttpServer:
         app = web.Application(middlewares=[self._auth_middleware])
         app.router.add_get("/healthz", self._handle_healthz)
         app.router.add_get("/readyz", self._handle_readyz)
+        app.router.add_get("/v1/runtime/contract", self._handle_runtime_contract)
         app.router.add_get(
             "/v1/channel-bindings/{platform}/{channel_id}",
             self._handle_channel_binding,
@@ -308,6 +310,9 @@ class RuntimeHttpServer:
         app.router.add_post("/v1/jobs/{job_id}/progress", self._handle_progress)
         app.router.add_post("/v1/jobs/{job_id}/report", self._handle_report)
         app.router.add_post("/v1/jobs/{job_id}/lease/renew", self._handle_renew)
+        app.router.add_get(
+            "/v1/agents/{agent_id}/reconcile", self._handle_reconcile_agent
+        )
         return app
 
     async def start(self, host: str, port: int) -> tuple[Any, Any]:
@@ -517,6 +522,12 @@ class RuntimeHttpServer:
             status=200,
         )
 
+    async def _handle_runtime_contract(self, request: Any) -> Any:
+        return self._render(
+            request,
+            {"ok": True, "data": build_runtime_contract(transport="http"), "error": None},
+        )
+
     # -- bridge endpoints -----------------------------------------------------
 
     async def _handle_channel_binding(self, request: Any) -> Any:
@@ -644,7 +655,7 @@ class RuntimeHttpServer:
         principal = request["principal"]
         self._require_role(principal, "agentd")
         payload = await self._read_json_object(request)
-        self._allow_fields(payload, frozenset({"ttl_seconds", "reap_mode", "reap_reason"}))
+        self._allow_fields(payload, frozenset({"ttl_seconds", "reap_mode", "reap_reason", "claim_request_id"}))
         envelope = await self._call(
             principal,
             lambda interface: interface.claim_job(
@@ -652,6 +663,7 @@ class RuntimeHttpServer:
                 ttl_seconds=payload.get("ttl_seconds"),
                 reap_mode=payload.get("reap_mode"),
                 reap_reason=payload.get("reap_reason"),
+                claim_request_id=payload.get("claim_request_id"),
             ),
         )
         return self._render(request, envelope)
@@ -719,6 +731,21 @@ class RuntimeHttpServer:
                 agent_id=principal.agent_id,
                 ttl_seconds=payload.get("ttl_seconds"),
             ),
+        )
+        return self._render(request, envelope)
+
+    async def _handle_reconcile_agent(self, request: Any) -> Any:
+        principal = request["principal"]
+        self._require_role(principal, "agentd")
+        agent_id = request.match_info["agent_id"]
+        # The URL identity is merely a selector; authority comes from the
+        # authenticated policy principal and may never be substituted by a
+        # caller to inspect another agent's leases.
+        if agent_id != principal.agent_id:
+            raise _HttpError(403, _FORBIDDEN_ENVELOPE)
+        envelope = await self._call(
+            principal,
+            lambda interface: interface.reconcile_agent(agent_id=principal.agent_id),
         )
         return self._render(request, envelope)
 

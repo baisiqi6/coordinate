@@ -10,6 +10,7 @@ implementation).
 """
 from __future__ import annotations
 
+import errno
 import hashlib
 import json
 import os
@@ -20,6 +21,7 @@ from pathlib import Path
 from unittest.mock import patch
 
 from coordinate.checklist_contract import validate_checklist as contract_validate
+from coordinate import checklist_io
 from coordinate.checklist_io import (
     CHECKLIST_LEGACY_NAME,
     CHECKLIST_NEW_NAME,
@@ -217,6 +219,44 @@ class AtomicWriterTests(unittest.TestCase):
                 atomic_write_json(self.target, {"items": []})
         self.assertEqual(self.target.read_text(), "ORIGINAL\n")
         self.assertEqual(list(self.tmp.glob(f".{CHECKLIST_NEW_NAME}.*.tmp")), [])
+
+
+class DirectoryFsyncTests(unittest.TestCase):
+    def test_native_windows_directory_open_eacces_is_unsupported(self) -> None:
+        directory = Path("unused-directory")
+        with (
+            patch.object(checklist_io.os, "name", "nt"),
+            patch.object(checklist_io.os, "open", side_effect=PermissionError(errno.EACCES, "directory open")),
+            patch.object(checklist_io.os, "fsync") as fsync,
+            patch.object(checklist_io.os, "close") as close,
+        ):
+            checklist_io._fsync_dir(directory)
+        fsync.assert_not_called()
+        close.assert_not_called()
+
+    def test_directory_open_does_not_hide_real_io_errors(self) -> None:
+        directory = Path("unused-directory")
+        for platform, error in (("posix", errno.EACCES), ("nt", errno.EIO), ("nt", errno.ENOENT)):
+            with (
+                self.subTest(platform=platform, error=error),
+                patch.object(checklist_io.os, "name", platform),
+                patch.object(checklist_io.os, "open", side_effect=OSError(error, "real failure")),
+            ):
+                with self.assertRaises(OSError) as caught:
+                    checklist_io._fsync_dir(directory)
+                self.assertEqual(caught.exception.errno, error)
+
+    def test_windows_fsync_permission_error_still_propagates_and_closes_fd(self) -> None:
+        directory = Path("unused-directory")
+        with (
+            patch.object(checklist_io.os, "name", "nt"),
+            patch.object(checklist_io.os, "open", return_value=42),
+            patch.object(checklist_io.os, "fsync", side_effect=PermissionError(errno.EACCES, "fsync denied")),
+            patch.object(checklist_io.os, "close") as close,
+        ):
+            with self.assertRaises(PermissionError):
+                checklist_io._fsync_dir(directory)
+        close.assert_called_once_with(42)
 
 
 class CreateEmptyChecklistTests(unittest.TestCase):

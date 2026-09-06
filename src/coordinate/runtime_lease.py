@@ -275,6 +275,83 @@ def _stable_result_key(value: dict[str, Any]) -> str:
     return hashlib.sha256(_json(value).encode("utf-8")).hexdigest()[:16]
 
 
+def claim_request_digest(
+    *,
+    agent_id: str,
+    host_id: str,
+    recoverable: bool,
+    ttl_seconds: int,
+    recovery_reason: str | None,
+    prior_process_stopped: bool | None,
+    reap_mode: str,
+    reap_reason: str | None,
+) -> str:
+    """Return the stable digest for a claim request marker.
+
+    The marker stores this digest rather than caller-controlled paths or job
+    payloads.  Keep the input set explicit so a retry with changed policy
+    parameters cannot silently replay a different claim.
+    """
+    import hashlib
+
+    request = {
+        "agent_id": agent_id,
+        "host_id": host_id,
+        "recoverable": recoverable,
+        "ttl_seconds": ttl_seconds,
+        "recovery_reason": recovery_reason,
+        "prior_process_stopped": prior_process_stopped,
+        "reap_mode": reap_mode,
+        "reap_reason": reap_reason,
+    }
+    return hashlib.sha256(_json(request).encode("utf-8")).hexdigest()
+
+
+def claim_marker_key(agent_id: str, claim_request_id: str) -> str:
+    import hashlib
+
+    canonical = _json([agent_id, claim_request_id])
+    digest = hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+    return f"runtime:claim:{digest}"
+
+
+def _append_claim_request_marker(
+    conn: sqlite3.Connection,
+    *,
+    claim_request_id: str | None,
+    request_digest: str | None,
+    job: sqlite3.Row,
+    agent_id: str,
+    attempt_token: int,
+    lease_id: str | None,
+    ttl_seconds: int,
+) -> None:
+    if claim_request_id is None:
+        return
+    if request_digest is None:
+        raise RuntimeLeaseError("claim_request_id requires request_digest")
+    marker = append_event(
+        conn,
+        workspace_id=job["workspace_id"],
+        event_type="job.claim_request",
+        actor=agent_id,
+        target=agent_id,
+        task_id=job["task_id"],
+        idempotency_key=claim_marker_key(agent_id, claim_request_id),
+        payload={
+            "request_digest": request_digest,
+            "agent_id": agent_id,
+            "job_id": job["id"],
+            "attempt_token": attempt_token,
+            "lease_id": lease_id,
+            "ttl": ttl_seconds,
+        },
+        commit=False,
+    )
+    if not marker.created:
+        raise RuntimeLeaseError("claim replay: marker already exists")
+
+
 def _terminal_event_type(status: str) -> str:
     if status == "timed_out":
         return "job.timed_out"
@@ -951,6 +1028,8 @@ def claim_leased_job(
     prior_process_stopped: bool | None = None,
     reap_mode: str = "global",
     reap_reason: str | None = None,
+    claim_request_id: str | None = None,
+    request_digest: str | None = None,
 ) -> ClaimLeaseResult:
     """Atomic claim: reap, select, context, binding/routing, CAS, lease, event, envelope.
 
@@ -1102,6 +1181,17 @@ def claim_leased_job(
         idempotency_key=f"runtime:job:{job_id}:claimed:{new_attempt_token}",
         payload=event_payload,
         commit=False,
+    )
+
+    _append_claim_request_marker(
+        conn,
+        claim_request_id=claim_request_id,
+        request_digest=request_digest,
+        job=job,
+        agent_id=agent_id,
+        attempt_token=new_attempt_token,
+        lease_id=lease["lease_id"],
+        ttl_seconds=ttl_seconds,
     )
 
     # 10. Build strict v1 lease envelope.

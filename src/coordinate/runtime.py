@@ -53,8 +53,12 @@ from .execution_context import (
     validate_execution_context_snapshot,
 )
 from .execution_leases import (
+    LEASE_DEFAULT_RENEW_INTERVAL_SECONDS,
     LeaseError as LeasePrimitiveError,
     attempt_has_any_lease,
+    build_lease_envelope,
+    require_active_unexpired_lease,
+    _validate_ttl,
 )
 from .runtime_lease import (
     RuntimeLeaseError,
@@ -64,6 +68,9 @@ from .runtime_lease import (
     _validate_utc_timestamp,
     append_terminal_events_and_delivery,
     claim_leased_job,
+    claim_marker_key,
+    claim_request_digest,
+    _append_claim_request_marker,
     release_lease_for_terminal_report,
     require_mutation_authority,
 )
@@ -124,6 +131,7 @@ class RuntimeClaimResult:
     reason: str | None = None
     oldest_blocked_job_id: str | None = None
     oldest_blocked_resource_key: str | None = None
+    replayed: bool = False
 
     def to_dict(self) -> dict[str, Any]:
         result: dict[str, Any] = {
@@ -140,6 +148,8 @@ class RuntimeClaimResult:
             result["oldest_blocked_job_id"] = self.oldest_blocked_job_id
         if self.oldest_blocked_resource_key is not None:
             result["oldest_blocked_resource_key"] = self.oldest_blocked_resource_key
+        if self.replayed:
+            result["replayed"] = True
         return result
 
 
@@ -1345,6 +1355,120 @@ def _replay_routed_request(
     )
 
 
+def _replay_claim_request(
+    conn: sqlite3.Connection,
+    *,
+    claim_request_id: str,
+    request_digest: str,
+    agent_id: str,
+    host_id: str,
+) -> RuntimeClaimResult | None:
+    """Rebuild a prior claim from its event marker without mutating state."""
+    event = conn.execute(
+        "SELECT * FROM events WHERE idempotency_key = ?",
+        (claim_marker_key(agent_id, claim_request_id),),
+    ).fetchone()
+    if event is None:
+        return None
+    if event["event_type"] != "job.claim_request":
+        raise RuntimeError("claim replay: idempotency key conflicts with another event")
+    try:
+        marker = json.loads(event["payload_json"])
+    except (TypeError, json.JSONDecodeError) as exc:
+        raise RuntimeError("claim replay: marker payload is malformed") from exc
+    required = {"request_digest", "agent_id", "job_id", "attempt_token", "lease_id", "ttl"}
+    if not isinstance(marker, dict) or set(marker) != required:
+        raise RuntimeError("claim replay: marker payload is malformed")
+    if marker["request_digest"] != request_digest:
+        raise RuntimeError("claim replay: request digest conflicts")
+    if marker["agent_id"] != agent_id:
+        raise RuntimeError("claim replay: agent conflicts")
+    if (
+        not isinstance(marker["job_id"], str)
+        or not marker["job_id"]
+        or not isinstance(marker["request_digest"], str)
+        or len(marker["request_digest"]) != 64
+        or any(c not in "0123456789abcdef" for c in marker["request_digest"])
+        or not isinstance(marker["agent_id"], str)
+    ):
+        raise RuntimeError("claim replay: marker payload is malformed")
+    try:
+        job = get_job(conn, marker["job_id"])
+    except KeyError as exc:
+        raise RuntimeError("claim replay: marked job is missing") from exc
+    if (
+        event["workspace_id"] != job["workspace_id"]
+        or event["actor"] != agent_id
+        or event["target"] != agent_id
+        or event["task_id"] != job["task_id"]
+    ):
+        raise RuntimeError("claim replay: marker authority is malformed")
+    if job["assigned_agent"] != agent_id:
+        raise RuntimeError("claim replay: marked job agent conflicts")
+    if job["status"] != "running":
+        raise RuntimeError("claim replay: marked job is expired or terminal")
+    attempt_token = marker["attempt_token"]
+    if isinstance(attempt_token, bool) or not isinstance(attempt_token, int) or attempt_token <= 0:
+        raise RuntimeError("claim replay: marker payload is malformed")
+    if job["attempt_count"] != attempt_token:
+        raise RuntimeError("claim replay: marked attempt is stale")
+    ttl_seconds = marker["ttl"]
+    if isinstance(ttl_seconds, bool) or not isinstance(ttl_seconds, int):
+        raise RuntimeError("claim replay: marker payload is malformed")
+    try:
+        _validate_ttl(ttl_seconds)
+    except LeasePrimitiveError as exc:
+        raise RuntimeError("claim replay: marker payload is malformed") from exc
+
+    payload = _job_payload(job)
+    snapshot = payload.get("execution_context")
+    try:
+        context = validate_execution_context_snapshot(
+            snapshot,
+            job_id=job["id"],
+            workspace_id=job["workspace_id"],
+            assigned_agent=agent_id,
+            host_id=host_id,
+        )
+    except (ContextError, TypeError, KeyError) as exc:
+        raise RuntimeError("claim replay: marked execution context is malformed") from exc
+
+    lease_id = marker["lease_id"]
+    execution_lease = None
+    if lease_id is not None:
+        if not isinstance(lease_id, str) or not lease_id:
+            raise RuntimeError("claim replay: marker payload is malformed")
+        try:
+            lease = require_active_unexpired_lease(
+                conn,
+                lease_id=lease_id,
+                job_id=job["id"],
+                attempt_token=attempt_token,
+                agent_id=agent_id,
+            )
+        except LeasePrimitiveError as exc:
+            raise RuntimeError("claim replay: marked lease is missing or expired") from exc
+        if lease["host_id"] != host_id:
+            raise RuntimeError("claim replay: marked lease is missing or expired")
+        execution_lease = build_lease_envelope(
+            lease,
+            server_now=utc_now(),
+            ttl_seconds=ttl_seconds,
+            renew_interval_seconds=LEASE_DEFAULT_RENEW_INTERVAL_SECONDS,
+        )
+    elif attempt_has_any_lease(conn, job["id"], attempt_token):
+        raise RuntimeError("claim replay: legacy marker now has a managed lease")
+
+    return RuntimeClaimResult(
+        job=row_to_dict(job),
+        claimed=True,
+        attempt_token=attempt_token,
+        execution_context=context.to_dict(),
+        execution_lease=execution_lease,
+        replayed=True,
+    )
+
+
 def claim_job(
     conn: sqlite3.Connection,
     *,
@@ -1355,24 +1479,65 @@ def claim_job(
     prior_process_stopped: bool | None = None,
     reap_mode: str = "global",
     reap_reason: str | None = None,
+    claim_request_id: str | None = None,
 ) -> RuntimeClaimResult:
     try:
         _validate_claim_reap_policy(reap_mode=reap_mode, reap_reason=reap_reason)
         agent_id = _validate_id(agent_id, "agent_id")
+        if claim_request_id is not None:
+            claim_request_id = _validate_id(claim_request_id, "claim_request_id")
+            try:
+                _validate_ttl(ttl_seconds)
+            except LeasePrimitiveError as exc:
+                raise RuntimeLeaseError(str(exc)) from exc
     except RuntimeLeaseError as exc:
         raise RuntimeError(str(exc)) from exc
     _require_online_agent(conn, agent_id)
-    if touch_agent_activity(conn, agent_id=agent_id):
-        conn.commit()
     host_id = _agent_host_id(conn, agent_id)
     if not host_id:
         raise RuntimeError(f"agent {agent_id} has no host_id")
+
+    request_digest = None
+    if claim_request_id is not None:
+        request_digest = claim_request_digest(
+            agent_id=agent_id,
+            host_id=host_id,
+            recoverable=recoverable,
+            ttl_seconds=ttl_seconds,
+            recovery_reason=recovery_reason,
+            prior_process_stopped=prior_process_stopped,
+            reap_mode=reap_mode,
+            reap_reason=reap_reason,
+        )
+        replay = _replay_claim_request(
+            conn,
+            claim_request_id=claim_request_id,
+            request_digest=request_digest,
+            agent_id=agent_id,
+            host_id=host_id,
+        )
+        if replay is not None:
+            return replay
+
+    if touch_agent_activity(conn, agent_id=agent_id):
+        conn.commit()
 
     is_typed_agent = resolve_exact_executor_binding(conn, agent_id) is not None
 
     if is_typed_agent:
         conn.execute("BEGIN IMMEDIATE")
         try:
+            if claim_request_id is not None:
+                replay = _replay_claim_request(
+                    conn,
+                    claim_request_id=claim_request_id,
+                    request_digest=request_digest,
+                    agent_id=agent_id,
+                    host_id=host_id,
+                )
+                if replay is not None:
+                    conn.commit()
+                    return replay
             claim_result = claim_leased_job(
                 conn,
                 agent_id=agent_id,
@@ -1384,6 +1549,8 @@ def claim_job(
                 prior_process_stopped=prior_process_stopped,
                 reap_mode=reap_mode,
                 reap_reason=reap_reason,
+                claim_request_id=claim_request_id,
+                request_digest=request_digest,
             )
             conn.commit()
         except RuntimeLeaseError as exc:
@@ -1446,6 +1613,23 @@ def claim_job(
         (*statuses, agent_id),
     ).fetchone()
     if candidate is None:
+        if claim_request_id is not None:
+            conn.execute("BEGIN IMMEDIATE")
+            try:
+                replay = _replay_claim_request(
+                    conn,
+                    claim_request_id=claim_request_id,
+                    request_digest=request_digest,
+                    agent_id=agent_id,
+                    host_id=host_id,
+                )
+                conn.rollback()
+                if replay is not None:
+                    return replay
+            except Exception:
+                if conn.in_transaction:
+                    conn.rollback()
+                raise
         return RuntimeClaimResult(job=None, claimed=False)
 
     workspace = get_workspace(conn, candidate["workspace_id"])
@@ -1500,6 +1684,17 @@ def claim_job(
     now = utc_now()
     conn.execute("BEGIN IMMEDIATE")
     try:
+        if claim_request_id is not None:
+            replay = _replay_claim_request(
+                conn,
+                claim_request_id=claim_request_id,
+                request_digest=request_digest,
+                agent_id=agent_id,
+                host_id=host_id,
+            )
+            if replay is not None:
+                conn.commit()
+                return replay
         # Pending->claimed policy gate, inside the write transaction: re-read
         # the CURRENT profile so a root mutation can never land between the
         # gate and the CAS, and the gate rolls back with the transaction on
@@ -1576,6 +1771,17 @@ def claim_job(
             },
             commit=False,
         )
+        if claim_request_id is not None:
+            _append_claim_request_marker(
+                conn,
+                claim_request_id=claim_request_id,
+                request_digest=request_digest,
+                job=candidate,
+                agent_id=agent_id,
+                attempt_token=int(candidate["attempt_count"]) + 1,
+                lease_id=None,
+                ttl_seconds=ttl_seconds,
+            )
         conn.commit()
     except Exception:
         if conn.in_transaction:

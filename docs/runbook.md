@@ -294,7 +294,7 @@ event type/payload/幂等键，并在 `action in {created, linked}` 时严格验
 repo、branch、commit、head/base、远端 SHA 和 PR URL，然后才 upsert 远端
 `tasks.pr` 列。这就是远端 `merge gate` 读取远端 DB 时能看到 PR 的原因。
 Event 追加和 mirror upsert 在一个 SAVEPOINT 内使用无提交 DB 原语，
-包括在 Python 3.10/3.11 上；它不信任主机 event 字段，也不会在失败后留下半状态。
+在项目支持的 Python 版本上均如此；它不信任主机 event 字段，也不会在失败后留下半状态。
 
 Preflight 耦合：当设置了 `--event-cli-path` 时，主机还会在任何 `gh` 调用之前
 运行远端 `pr publish-preflight`。如果远端返回 `ok=false`，主机会短路并返回
@@ -519,8 +519,15 @@ PYTHONPATH=src python3 -m coordinate \
 PYTHONPATH=src python3 -m coordinate \
   --db data/coordinator.sqlite3 \
   runtime job claim \
-  --agent-id mac-codex
+  --agent-id mac-codex \
+  --claim-request-id <uuid-per-logical-claim>
 ```
+
+`--claim-request-id` 是兼容旧 client 的可选参数，但新 agentd 必须发送。相同 key 且
+参数摘要相同会回放同一个成功 claim；摘要冲突、lease 过期、job 已终态或 marker 损坏返回
+`409 conflict`，不得新建 attempt。只有成功 claim 写入 marker；`queue_empty` 不写 marker，
+下一次轮询使用新 key。Runtime HTTP 的 `POST /v1/jobs/claim` 使用同名 JSON field。只读
+reconcile 可用于诊断，不能单独授权新 claim。
 
 报告结果。如果 `response_text` 存在且原始请求有回复目标，coordinate 会创建
 返回原始平台的 pending delivery：
