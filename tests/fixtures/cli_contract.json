@@ -66,6 +66,7 @@
     "worker delivery",
     "runtime agent register",
     "runtime agent heartbeat",
+    "runtime agent reconcile",
     "runtime agent deactivate",
     "runtime request submit",
     "runtime job claim",
@@ -104,8 +105,8 @@
   ],
   "metadata": {
     "default_db_path_sha256": "853182c0ba6a6dcd1e5a70dcb45bb3fcb80f31d53e26c28f29d4dae861a389b5",
-    "leaf_count": 101,
-    "node_count": 133,
+    "leaf_count": 102,
+    "node_count": 134,
     "prog": "coordinate",
     "top_level_commands": [
       "workspace",
@@ -8326,6 +8327,7 @@
           "choices": [
             "register",
             "heartbeat",
+            "reconcile",
             "deactivate"
           ],
           "const": null,
@@ -8340,7 +8342,7 @@
         }
       ],
       "defaults": {},
-      "help": "usage: coordinate runtime agent [-h] {register,heartbeat,deactivate} ...\n\npositional arguments:\n  {register,heartbeat,deactivate}\n    register            Upsert an agentd or bridge record in the runtime agent registry\n    heartbeat           Mark an already-registered runtime client as online and refresh last-seen\n    deactivate          Deactivate a runtime agent and block it from claiming work\n\noptions:\n  -h, --help            show this help message and exit\n",
+      "help": "usage: coordinate runtime agent [-h] {register,heartbeat,reconcile,deactivate} ...\n\npositional arguments:\n  {register,heartbeat,reconcile,deactivate}\n    register            Upsert an agentd or bridge record in the runtime agent registry\n    heartbeat           Mark an already-registered runtime client as online and refresh last-seen\n    reconcile           Read this agent's active managed leases (read-only)\n    deactivate          Deactivate a runtime agent and block it from claiming work\n\noptions:\n  -h, --help            show this help message and exit\n",
       "path": [
         "runtime",
         "agent"
@@ -8529,6 +8531,51 @@
         "heartbeat"
       ],
       "prog": "coordinate runtime agent heartbeat"
+    },
+    {
+      "actions": [
+        {
+          "action_class": "_HelpAction",
+          "choices": null,
+          "const": null,
+          "default": "==SUPPRESS==",
+          "dest": "help",
+          "help": "show this help message and exit",
+          "metavar": null,
+          "nargs": 0,
+          "option_strings": [
+            "-h",
+            "--help"
+          ],
+          "required": false,
+          "type": null
+        },
+        {
+          "action_class": "_StoreAction",
+          "choices": null,
+          "const": null,
+          "default": null,
+          "dest": "agent_id",
+          "help": null,
+          "metavar": null,
+          "nargs": null,
+          "option_strings": [
+            "--agent-id"
+          ],
+          "required": true,
+          "type": null
+        }
+      ],
+      "defaults": {
+        "handler": "coordinate.execution_cli.handle_runtime_agent_reconcile"
+      },
+      "help": "usage: coordinate runtime agent reconcile [-h] --agent-id AGENT_ID\n\noptions:\n  -h, --help           show this help message and exit\n  --agent-id AGENT_ID\n",
+      "path": [
+        "runtime",
+        "agent",
+        "reconcile"
+      ],
+      "prog": "coordinate runtime agent reconcile"
     },
     {
       "actions": [
@@ -9070,12 +9117,27 @@
           ],
           "required": false,
           "type": null
+        },
+        {
+          "action_class": "_StoreAction",
+          "choices": null,
+          "const": null,
+          "default": null,
+          "dest": "claim_request_id",
+          "help": "Optional idempotency key for claim retries",
+          "metavar": null,
+          "nargs": null,
+          "option_strings": [
+            "--claim-request-id"
+          ],
+          "required": false,
+          "type": null
         }
       ],
       "defaults": {
         "handler": "coordinate.execution_cli.handle_runtime_job_claim"
       },
-      "help": "usage: coordinate runtime job claim [-h] --agent-id AGENT_ID [--recoverable]\n                                    [--recovery-reason RECOVERY_REASON] [--prior-process-stopped]\n                                    [--reap-mode {global,none}] [--reap-reason REAP_REASON]\n\noptions:\n  -h, --help            show this help message and exit\n  --agent-id AGENT_ID\n  --recoverable         Also claim recoverable timed_out jobs (explicit recovery path). Default:\n                        only pending.\n  --recovery-reason RECOVERY_REASON\n                        Audited Operator reason for recovery; required with --recoverable\n  --prior-process-stopped\n                        Operator confirmation that the prior provider process/session has stopped\n  --reap-mode {global,none}\n                        Reap mode: global (default) or none (scoped no-reap)\n  --reap-reason REAP_REASON\n                        Required reason when reap-mode=none\n",
+      "help": "usage: coordinate runtime job claim [-h] --agent-id AGENT_ID [--recoverable]\n                                    [--recovery-reason RECOVERY_REASON] [--prior-process-stopped]\n                                    [--reap-mode {global,none}] [--reap-reason REAP_REASON]\n                                    [--claim-request-id CLAIM_REQUEST_ID]\n\noptions:\n  -h, --help            show this help message and exit\n  --agent-id AGENT_ID\n  --recoverable         Also claim recoverable timed_out jobs (explicit recovery path). Default:\n                        only pending.\n  --recovery-reason RECOVERY_REASON\n                        Audited Operator reason for recovery; required with --recoverable\n  --prior-process-stopped\n                        Operator confirmation that the prior provider process/session has stopped\n  --reap-mode {global,none}\n                        Reap mode: global (default) or none (scoped no-reap)\n  --reap-reason REAP_REASON\n                        Required reason when reap-mode=none\n  --claim-request-id CLAIM_REQUEST_ID\n                        Optional idempotency key for claim retries\n",
       "path": [
         "runtime",
         "job",

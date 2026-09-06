@@ -535,8 +535,8 @@ class ChecklistLock:
 # ---------------------------------------------------------------------------
 
 # errno values that unambiguously mean "this platform cannot open/fsync a
-# directory fd". Ordinary I/O errors (EACCES, EIO, EBADF, ENOENT, ...) must
-# NOT be treated as unsupported: they propagate.
+# directory fd". Windows also reports EACCES when opening a directory through
+# the CRT; that open-only case is handled below. Other I/O errors propagate.
 _DIR_FSYNC_UNSUPPORTED_ERRNOS = frozenset(
     candidate
     for candidate in (
@@ -553,13 +553,16 @@ def _fsync_dir(directory: Path) -> None:
 
     Both the open and the fsync stage apply the same policy: errno values
     that mean "directory fds are unsupported on this platform" hit the
-    controlled fallback; ordinary I/O errors (EACCES, EIO, ...) propagate.
-    The directory fd is always closed.
+    controlled fallback. Native Windows directory-open EACCES also falls back
+    because the CRT cannot open directory fds. POSIX EACCES and errors after
+    a successful open still propagate. The directory fd is always closed.
     """
     try:
         dir_fd = os.open(directory, os.O_RDONLY)
     except OSError as exc:
-        if exc.errno in _DIR_FSYNC_UNSUPPORTED_ERRNOS:
+        if exc.errno in _DIR_FSYNC_UNSUPPORTED_ERRNOS or (
+            os.name == "nt" and exc.errno == errno.EACCES
+        ):
             return  # controlled fallback: platform cannot open a directory fd
         raise
     try:

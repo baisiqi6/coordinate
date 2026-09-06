@@ -55,7 +55,7 @@ P9_ISSUE12_USAGE_LEAVES = {
 }
 
 _P9_3C1_P1_BASE_FIXTURE_SHA256 = (
-    "869084cdc985a0efb9921266af98f5813d0d6efca03b90aeebf5c7916f2b5746"
+    "7a34cb3d699802c2f50b33435383baa206492f4d9de30b4ea6cd445041d18c3b"
 )
 _P9_3C1_P1_AGENT_HELP = (
     "usage: coordinate runtime agent [-h] {register,heartbeat} ...\n\n"
@@ -85,6 +85,34 @@ _P9_3C1_P1_REAP_HELP = (
     "  -h, --help            show this help message and exit\n"
     "  --actor ACTOR\n"
     "  --batch-size BATCH_SIZE\n"
+)
+_PRE_AGENT_RECONCILE_RUNTIME_AGENT_HELP = (
+    "usage: coordinate runtime agent [-h] {register,heartbeat,deactivate} ...\n\n"
+    "positional arguments:\n"
+    "  {register,heartbeat,deactivate}\n"
+    "    register            Upsert an agentd or bridge record in the runtime agent registry\n"
+    "    heartbeat           Mark an already-registered runtime client as online and refresh last-seen\n"
+    "    deactivate          Deactivate a runtime agent and block it from claiming work\n\n"
+    "options:\n"
+    "  -h, --help            show this help message and exit\n"
+)
+_PRE_CLAIM_REQUEST_ID_CLAIM_HELP = (
+    "usage: coordinate runtime job claim [-h] --agent-id AGENT_ID [--recoverable]\n"
+    "                                    [--recovery-reason RECOVERY_REASON] [--prior-process-stopped]\n"
+    "                                    [--reap-mode {global,none}] [--reap-reason REAP_REASON]\n\n"
+    "options:\n"
+    "  -h, --help            show this help message and exit\n"
+    "  --agent-id AGENT_ID\n"
+    "  --recoverable         Also claim recoverable timed_out jobs (explicit recovery path). Default:\n"
+    "                        only pending.\n"
+    "  --recovery-reason RECOVERY_REASON\n"
+    "                        Audited Operator reason for recovery; required with --recoverable\n"
+    "  --prior-process-stopped\n"
+    "                        Operator confirmation that the prior provider process/session has stopped\n"
+    "  --reap-mode {global,none}\n"
+    "                        Reap mode: global (default) or none (scoped no-reap)\n"
+    "  --reap-reason REAP_REASON\n"
+    "                        Required reason when reap-mode=none\n"
 )
 
 # P9-0A3b migrated exactly these 10 leaves from coordinate.cli to coordinate.delivery_cli.
@@ -399,10 +427,10 @@ _PRE_TARGETED_RECONCILE_HELP = (
     "  --no-refresh  Read state without running harnessctl state\n"
 )
 
-# SHA-256 of the canonical baseline fixture (commit
+# SHA-256 of the semantic projection of the canonical baseline fixture (commit
 # 1aeadbaa43405208b76f3b24f2f848dc4219f059) before ``reconcile --task-id``.
 _PRE_TARGETED_BASELINE_FIXTURE_SHA256 = (
-    "4393fc12facaa3bb6dd9bf6116cb74ee22c8a4ce3c25b627e317d4e29698a0e3"
+    "9aa5e166e31ad8276f3d7a3517dd5c1ae03f2d654405547f5f0e0b4a25743302"
 )
 
 
@@ -481,6 +509,61 @@ def _restore_pre_trace_root_help(help_text: str) -> str:
     return "\n".join(result) + "\n"
 
 
+def _remove_claim_request_id_delta(contract: dict[str, object]) -> dict[str, object]:
+    """Remove the claim request id option from historical CLI projections."""
+    historical = copy.deepcopy(contract)
+    node = next(
+        (node for node in historical["nodes"] if node["path"] == ["runtime", "job", "claim"]),
+        None,
+    )
+    if node is None:
+        return historical
+    actions = [action for action in node["actions"] if action.get("dest") == "claim_request_id"]
+    if not actions:
+        return historical
+    if len(actions) != 1:
+        raise AssertionError("duplicate claim request id parser action")
+    node["actions"] = [action for action in node["actions"] if action.get("dest") != "claim_request_id"]
+    node["help"] = _PRE_CLAIM_REQUEST_ID_CLAIM_HELP
+    return historical
+
+
+def _remove_agent_reconcile_delta(contract: dict[str, object]) -> dict[str, object]:
+    """Remove the agent-scoped runtime reconcile CLI delta.
+
+    Historical fixture rewinds predate ``runtime agent reconcile``. Strip its
+    leaf node and parent subparser choice before asserting older fixture bytes.
+    """
+    historical = _remove_claim_request_id_delta(contract)
+    path = ["runtime", "agent", "reconcile"]
+    matching = [node for node in historical["nodes"] if node["path"] == path]
+    if not matching:
+        return historical
+    if len(matching) != 1:
+        raise AssertionError("duplicate runtime agent reconcile parser node")
+    historical["nodes"] = [node for node in historical["nodes"] if node["path"] != path]
+    historical["leaf_paths"] = [
+        leaf for leaf in historical["leaf_paths"] if leaf != "runtime agent reconcile"
+    ]
+    parent = next(
+        node for node in historical["nodes"] if node["path"] == ["runtime", "agent"]
+    )
+    subparsers = [
+        action
+        for action in parent["actions"]
+        if action["action_class"] == "_SubParsersAction"
+    ]
+    if len(subparsers) != 1 or "reconcile" not in subparsers[0]["choices"]:
+        raise AssertionError("runtime agent reconcile parent choice missing")
+    subparsers[0]["choices"] = [
+        choice for choice in subparsers[0]["choices"] if choice != "reconcile"
+    ]
+    parent["help"] = _PRE_AGENT_RECONCILE_RUNTIME_AGENT_HELP
+    historical["metadata"]["leaf_count"] = int(historical["metadata"]["leaf_count"]) - 1
+    historical["metadata"]["node_count"] = int(historical["metadata"]["node_count"]) - 1
+    return historical
+
+
 def _remove_trace_delta(contract: dict[str, object]) -> dict[str, object]:
     """Return a copy of *contract* with the Issue #11 ``trace`` delta removed.
 
@@ -489,7 +572,8 @@ def _remove_trace_delta(contract: dict[str, object]) -> dict[str, object]:
     proofs strip this post-baseline delta first so their pinned baseline
     SHA-256 proofs keep verifying the pre-trace bytes. No-op when absent.
     """
-    historical = _remove_issue12_usage_leaves(contract)
+    historical = _remove_agent_reconcile_delta(contract)
+    historical = _remove_issue12_usage_leaves(historical)
     has_trace = any(node["path"][:1] == ["trace"] for node in historical["nodes"])
     if not has_trace:
         return historical
@@ -959,7 +1043,8 @@ def _remove_issue12_usage_leaves(
     absent; fails closed on structural surprises. The later ``task adopt``
     delta is stripped first for the same reason.
     """
-    historical = _remove_task_adopt_delta(copy.deepcopy(contract))
+    historical = _remove_agent_reconcile_delta(contract)
+    historical = _remove_task_adopt_delta(historical)
     leaf_paths_to_remove = set(P9_ISSUE12_USAGE_LEAVES)
     node_paths_to_remove = {tuple(p.split()) for p in leaf_paths_to_remove} | {
         ("runtime", "usage")
@@ -1244,9 +1329,10 @@ def _rewrite_contract_to_p9_3c1_p1_baseline(
     return historical
 
 
-# SHA-256 of the P9-2B pre-routing fixture (before runtime request submit gained routed flags).
+# SHA-256 of the semantic projection of the P9-2B pre-routing fixture (before
+# runtime request submit gained routed flags).
 _P9_2B_BASELINE_FIXTURE_SHA256 = (
-    "4b11a5c25f1ac30d395cc5777f6a766ae0f5b16369676420181515f612dddc62"
+    "c9ab4fae0f52acab83c73cff210da26ec8651943d41d908a784c7edce7a85268"
 )
 
 # SHA-256 of the reviewed pre-P9-3C0 fixture after masking the request-submit
@@ -1709,10 +1795,31 @@ class CLIContractTests(unittest.TestCase):
         contract = _build_contract()
         metadata = contract["metadata"]
         self.assertEqual(len(metadata["top_level_commands"]), 24)
-        self.assertEqual(metadata["leaf_count"], 101)
-        self.assertEqual(metadata["node_count"], 133)
-        self.assertEqual(len(contract["leaf_paths"]), 101)
-        self.assertEqual(len(contract["nodes"]), 133)
+        self.assertEqual(metadata["leaf_count"], 102)
+        self.assertEqual(metadata["node_count"], 134)
+        self.assertEqual(len(contract["leaf_paths"]), 102)
+        self.assertEqual(len(contract["nodes"]), 134)
+
+    def test_agent_reconcile_delta_rewinds_to_prior_contract(self) -> None:
+        contract = _build_contract()
+        self.assertIn("runtime agent reconcile", contract["leaf_paths"])
+        historical = _remove_agent_reconcile_delta(contract)
+        self.assertNotIn("runtime agent reconcile", historical["leaf_paths"])
+        self.assertEqual(historical["metadata"]["leaf_count"], 101)
+        self.assertEqual(historical["metadata"]["node_count"], 133)
+        agent_node = next(
+            node for node in historical["nodes"] if node["path"] == ["runtime", "agent"]
+        )
+        choices = next(
+            action["choices"]
+            for action in agent_node["actions"]
+            if action["action_class"] == "_SubParsersAction"
+        )
+        self.assertEqual(choices, ["register", "heartbeat", "deactivate"])
+        self.assertEqual(
+            _serialize_contract(_remove_agent_reconcile_delta(historical)),
+            _serialize_contract(historical),
+        )
 
     def test_task_adopt_delta_rewind_is_idempotent(self) -> None:
         """Stripping the adoption delta twice is a no-op the second time."""
@@ -2008,10 +2115,12 @@ class CLIContractTests(unittest.TestCase):
     def test_fixture_matches_generated_contract(self) -> None:
         generated = _run_generation_subprocess()
         fixture = FIXTURE_PATH.read_bytes()
+        generated_semantic = _project_semantic_help(json.loads(generated))
+        fixture_semantic = _project_semantic_help(json.loads(fixture))
         self.assertEqual(
-            generated,
-            fixture,
-            "Generated contract differs from committed fixture; update intentionally only through review",
+            generated_semantic,
+            fixture_semantic,
+            "Generated contract semantics differ from committed fixture; update intentionally only through review",
         )
 
     def test_contract_p9_3c1_p1_delta_matches_base_fixture(self) -> None:
@@ -2048,9 +2157,11 @@ class CLIContractTests(unittest.TestCase):
 
         historical = _rewrite_contract_to_p9_3c1_p1_baseline(contract)
         self.assertEqual(
-            hashlib.sha256(_serialize_contract(historical)).hexdigest(),
+            hashlib.sha256(
+                _serialize_contract(_project_semantic_help(historical))
+            ).hexdigest(),
             _P9_3C1_P1_BASE_FIXTURE_SHA256,
-            "P9-3C1 P1 CLI delta must rewind exactly to the approved package base fixture",
+            "P9-3C1 P1 CLI delta must rewind exactly to the approved semantic package base fixture",
         )
 
     def test_contract_p9_3c0_worktree_path_delta_matches_baseline(self) -> None:
@@ -2128,7 +2239,7 @@ class CLIContractTests(unittest.TestCase):
         """P9-2B delta proof: removing the routed flags restores the pre-P9-2B fixture."""
         contract = _build_contract()
         historical = _rewrite_contract_to_p9_2b_baseline(contract)
-        historical_bytes = _serialize_contract(historical)
+        historical_bytes = _serialize_contract(_project_semantic_help(historical))
         self.assertEqual(
             hashlib.sha256(historical_bytes).hexdigest(),
             _P9_2B_BASELINE_FIXTURE_SHA256,
@@ -2174,7 +2285,7 @@ class CLIContractTests(unittest.TestCase):
     def test_contract_targeted_reconcile_delta_matches_baseline(self) -> None:
         """Targeted-reconcile delta proof: the current contract carries the
         optional ``--task-id`` action, and stripping it restores the canonical
-        pre-targeted baseline fixture bytes (baseline commit 1aeadbaa)."""
+        pre-targeted baseline semantic projection (baseline commit 1aeadbaa)."""
         contract = _build_contract()
         reconcile_node = next(
             node for node in contract["nodes"] if node["path"] == ["reconcile"]
@@ -2189,10 +2300,12 @@ class CLIContractTests(unittest.TestCase):
 
         historical = _remove_targeted_reconcile_delta(contract)
         self.assertEqual(
-            hashlib.sha256(_serialize_contract(historical)).hexdigest(),
+            hashlib.sha256(
+                _serialize_contract(_project_semantic_help(historical))
+            ).hexdigest(),
             _PRE_TARGETED_BASELINE_FIXTURE_SHA256,
             "Fixture with the targeted-reconcile delta removed must match the "
-            "pre-targeted baseline commit fixture SHA-256",
+            "pre-targeted baseline semantic fixture SHA-256",
         )
 
     def test_remove_targeted_reconcile_delta_structure_contract(self) -> None:

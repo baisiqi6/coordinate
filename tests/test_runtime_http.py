@@ -420,6 +420,21 @@ class TransportBehaviorTests(HttpServerTestBase):
         self.assertEqual(json.loads(body)["data"]["status"], "ready")
         self.assertEqual(len(self.created), 1)  # one short-lived probe connection
 
+    def test_runtime_contract_is_authenticated_and_static(self):
+        status, body, _ = self._request(
+            "GET",
+            "/v1/runtime/contract",
+            headers=self._headers("mac-qoder", AGENTD_TOKEN),
+        )
+        self.assertEqual(status, 200)
+        data = json.loads(body)["data"]
+        self.assertEqual(data["contract_version"], 1)
+        self.assertEqual(data["transport"], "http")
+        self.assertTrue(data["capabilities"]["claim_fencing"])
+        self.assertTrue(data["capabilities"]["agent_reconcile"])
+        self.assertFalse(data["capabilities"]["recoverable_claim"])
+        self.assertEqual(len(self.created), 0)
+
     def test_readyz_unavailable_when_db_missing(self):
         broken = RuntimeHttpServer(
             interface=RuntimeInterface(

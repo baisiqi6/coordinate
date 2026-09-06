@@ -10,9 +10,10 @@ does NOT:
 - call ``print``/``print_json``, the CLI ``main()``, shell, SSH or subprocesses;
 - hold process-level mutable business state.
 
-It carries exactly the seven use cases with real consumers (§3 of the R2A
-plan): channel resolve, request submit, job get, normal job claim, progress
-checkpoint, terminal report and managed lease renew. Every public method
+It carries the bounded use cases with real consumers (§3 of the R2A plan):
+channel resolve, request submit, job get, normal job claim, progress
+checkpoint, terminal report, managed lease renew and agent-scoped claim
+authority reconcile. Every public method
 returns the stable envelope::
 
     {"ok": true, "data": {...}, "error": null}
@@ -31,7 +32,8 @@ from dataclasses import dataclass
 from typing import Any, Callable
 
 from .db import get_workspace, resolve_channel_workspace, row_to_dict
-from .execution_leases import LEASE_DEFAULT_TTL_SECONDS
+from .db_support import utc_now
+from .execution_leases import LEASE_DEFAULT_TTL_SECONDS, list_active_leases_for_agent
 from .executor_routing import ExecutorRoutingError, build_routing_request
 from .job_repository import get_job
 from .runtime import (
@@ -77,7 +79,11 @@ MESSAGE_INTERNAL = "internal error"
 # conflicts (fail closed, never silently replaying a different payload).
 # Covers both the plain ``request replay:`` prefix and the context-conflict
 # signature raised in three places by runtime.py.
-_CONFLICT_PREFIXES = ("request replay:", "request replay context conflict:")
+_CONFLICT_PREFIXES = (
+    "request replay:",
+    "request replay context conflict:",
+    "claim replay:",
+)
 
 # Domain error text signatures for known-missing resources, mapped to a static
 # wire message. These signatures are stable domain contract text already
@@ -375,6 +381,7 @@ class RuntimeInterface:
         ttl_seconds: int | None = None,
         reap_mode: str | None = None,
         reap_reason: str | None = None,
+        claim_request_id: str | None = None,
     ) -> dict[str, Any]:
         try:
             if agent_id is None or not str(agent_id).strip():
@@ -401,6 +408,7 @@ class RuntimeInterface:
                     ),
                     reap_mode=reap_mode,
                     reap_reason=reap_reason,
+                    claim_request_id=claim_request_id,
                 )
             return ok_envelope(result.to_dict())
         except Exception as exc:
@@ -519,6 +527,57 @@ class RuntimeInterface:
                     ),
                 )
             return ok_envelope(outcome)
+        except Exception as exc:
+            return error_envelope(*classify_error(exc))
+
+    # -- use case 8: agent-scoped claim-authority reconcile -----------------
+
+    def reconcile_agent(self, *, agent_id: str | None) -> dict[str, Any]:
+        """Read the authenticated agent's minimal active-lease snapshot.
+
+        This is intentionally read-only.  The projection omits resource,
+        path, host and other lease metadata so an uncertain claim can be
+        reconciled without disclosing unrelated execution details.
+        """
+        try:
+            if agent_id is None or not str(agent_id).strip():
+                return error_envelope("invalid_request", "agent_id is required")
+            with closing(self._connection_factory()) as conn:
+                leases = list_active_leases_for_agent(conn, str(agent_id).strip())
+                server_now = utc_now()
+                running_jobs = conn.execute(
+                    "SELECT id, attempt_count, status FROM jobs "
+                    "WHERE assigned_agent = ? AND status = 'running'",
+                    (str(agent_id).strip(),),
+                ).fetchall()
+            active_leases = [
+                {
+                    "job_id": lease["job_id"],
+                    "lease_id": lease["lease_id"],
+                    "attempt_token": lease["attempt_token"],
+                    "status": lease["status"],
+                    "expires_at": lease["expires_at"],
+                    "server_now": server_now,
+                }
+                for lease in leases
+            ]
+            leased_job_ids = {item["job_id"] for item in active_leases}
+            # Legacy/untyped claims have no execution_attempt_leases row. Keep
+            # those running jobs in the authority snapshot so an uncertain
+            # claim can never be mistaken for a clear agent.
+            active_leases.extend(
+                {
+                    "job_id": row["id"],
+                    "lease_id": None,
+                    "attempt_token": row["attempt_count"],
+                    "status": row["status"],
+                    "expires_at": None,
+                    "server_now": server_now,
+                }
+                for row in running_jobs
+                if row["id"] not in leased_job_ids
+            )
+            return ok_envelope({"active_leases": active_leases})
         except Exception as exc:
             return error_envelope(*classify_error(exc))
 

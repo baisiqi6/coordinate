@@ -32,6 +32,8 @@ from .executor_identity import (
     sync_executor_catalog,
 )
 from .executor_routing import ExecutorRoutingError, build_routing_request
+from .execution_leases import list_active_leases_for_agent
+from .db_support import utc_now
 from .jobs import cancel_job, pump_jobs, retry_job, run_job
 from .runner_examples import get_runner_profile_example, list_runner_profile_examples
 from .runtime import (
@@ -210,6 +212,12 @@ def register_runtime_commands(subcommands) -> None:
     runtime_agent_heartbeat.add_argument("--actor", default="runtime")
     runtime_agent_heartbeat.set_defaults(handler=handle_runtime_agent_heartbeat)
 
+    runtime_agent_reconcile = runtime_agent_sub.add_parser(
+        "reconcile", help="Read this agent's active managed leases (read-only)"
+    )
+    runtime_agent_reconcile.add_argument("--agent-id", required=True)
+    runtime_agent_reconcile.set_defaults(handler=handle_runtime_agent_reconcile)
+
     runtime_agent_deactivate = runtime_agent_sub.add_parser(
         "deactivate", help="Deactivate a runtime agent and block it from claiming work"
     )
@@ -286,6 +294,10 @@ def register_runtime_commands(subcommands) -> None:
     runtime_job_claim.add_argument(
         "--reap-reason",
         help="Required reason when reap-mode=none",
+    )
+    runtime_job_claim.add_argument(
+        "--claim-request-id",
+        help="Optional idempotency key for claim retries",
     )
     runtime_job_claim.set_defaults(handler=handle_runtime_job_claim)
 
@@ -605,17 +617,60 @@ def handle_runtime_request_submit(args: argparse.Namespace) -> int:
 
 
 def handle_runtime_job_claim(args: argparse.Namespace) -> int:
+    kwargs = {
+        "agent_id": args.agent_id,
+        "recoverable": args.recoverable,
+        "recovery_reason": args.recovery_reason,
+        "prior_process_stopped": args.prior_process_stopped,
+        "reap_mode": getattr(args, "reap_mode", "global"),
+        "reap_reason": getattr(args, "reap_reason", None),
+    }
+    claim_request_id = getattr(args, "claim_request_id", None)
+    if claim_request_id is not None:
+        kwargs["claim_request_id"] = claim_request_id
     with _conn(args) as conn:
-        result = runtime_claim_job(
-            conn,
-            agent_id=args.agent_id,
-            recoverable=args.recoverable,
-            recovery_reason=args.recovery_reason,
-            prior_process_stopped=args.prior_process_stopped,
-            reap_mode=getattr(args, "reap_mode", "global"),
-            reap_reason=getattr(args, "reap_reason", None),
-        )
+        result = runtime_claim_job(conn, **kwargs)
     _print_json({"result": result.to_dict()})
+    return 0
+
+
+def handle_runtime_agent_reconcile(args: argparse.Namespace) -> int:
+    """Print the minimal active-lease snapshot for one agent."""
+    with _conn(args) as conn:
+        leases = list_active_leases_for_agent(conn, args.agent_id)
+        server_now = utc_now()
+        snapshot = {
+            "active_leases": [
+                {
+                    "job_id": lease["job_id"],
+                    "lease_id": lease["lease_id"],
+                    "attempt_token": lease["attempt_token"],
+                    "status": lease["status"],
+                    "expires_at": lease["expires_at"],
+                    "server_now": server_now,
+                }
+                for lease in leases
+            ]
+        }
+        leased_job_ids = {item["job_id"] for item in snapshot["active_leases"]}
+        running_jobs = conn.execute(
+            "SELECT id, attempt_count, status FROM jobs "
+            "WHERE assigned_agent = ? AND status = 'running'",
+            (args.agent_id,),
+        ).fetchall()
+        snapshot["active_leases"].extend(
+            {
+                "job_id": row["id"],
+                "lease_id": None,
+                "attempt_token": row["attempt_count"],
+                "status": row["status"],
+                "expires_at": None,
+                "server_now": server_now,
+            }
+            for row in running_jobs
+            if row["id"] not in leased_job_ids
+        )
+    _print_json({"result": snapshot})
     return 0
 
 

@@ -228,6 +228,9 @@ class CompletionMCPTransport:
                 "transport refuses an unlisted tool",
                 reason="transport_refused",
             )
+        # Validate the token before importing the optional SDK so
+        # token_missing remains the primary diagnostic on base installs.
+        token = self._token()
         try:
             import mcp  # noqa: F401
         except ImportError:
@@ -238,8 +241,6 @@ class CompletionMCPTransport:
             ) from None
         from mcp import ClientSession
         from mcp.client.streamable_http import streamable_http_client
-
-        token = self._token()
 
         async def _run() -> dict[str, Any]:
             import httpx2

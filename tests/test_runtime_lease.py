@@ -7,6 +7,7 @@ visibility that live in ``runtime_lease.py`` and ``runtime.py``.
 from __future__ import annotations
 
 import dataclasses
+import hashlib
 import json
 import os
 import sqlite3
@@ -275,6 +276,62 @@ class RuntimeLeaseClaimTests(unittest.TestCase):
         self.assertTrue(result.claimed)
         self.assertEqual(result.job["status"], "running")
         self.assertIsNone(result.execution_lease)
+
+    def test_claim_request_marker_replays_legacy_running_claim(self):
+        request = self._submit_exact(target_agent="mac-codex")
+        first = claim_job(self.conn, agent_id="mac-codex", claim_request_id="legacy-poll")
+        replay = claim_job(self.conn, agent_id="mac-codex", claim_request_id="legacy-poll")
+        self.assertEqual(first.job["id"], request.job["id"])
+        self.assertTrue(replay.replayed)
+        self.assertEqual(replay.job["status"], "running")
+        self.assertIsNone(replay.execution_lease)
+
+    def test_claim_request_marker_replays_typed_claim_without_mutation(self):
+        request = self._submit_exact()
+        first = claim_job(self.conn, agent_id="mac-omp", claim_request_id="poll-1")
+        second = claim_job(self.conn, agent_id="mac-omp", claim_request_id="poll-1")
+        self.assertTrue(first.claimed)
+        self.assertTrue(second.claimed)
+        self.assertTrue(second.replayed)
+        self.assertEqual(second.job["id"], request.job["id"])
+        self.assertEqual(second.execution_lease["lease_id"], first.execution_lease["lease_id"])
+        markers = [e for e in list_events(self.conn, "demo") if e["event_type"] == "job.claim_request"]
+        self.assertEqual(len(markers), 1)
+        canonical = json.dumps(["mac-omp", "poll-1"], ensure_ascii=False, separators=(",", ":"))
+        expected_marker_key = "runtime:claim:" + hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+        self.assertEqual(markers[0]["idempotency_key"], expected_marker_key)
+        self.assertEqual(set(json.loads(markers[0]["payload_json"])), {
+            "request_digest", "agent_id", "job_id", "attempt_token", "lease_id", "ttl"
+        })
+
+    def test_claim_request_digest_conflict_and_expired_marker_fail_closed(self):
+        request = self._submit_exact()
+        first = claim_job(self.conn, agent_id="mac-omp", claim_request_id="poll-2")
+        with self.assertRaisesRegex(CoordinateRuntimeError, "claim replay: request digest conflicts"):
+            claim_job(self.conn, agent_id="mac-omp", claim_request_id="poll-2", ttl_seconds=180)
+        lease_id = first.execution_lease["lease_id"]
+        acquired_at = first.execution_lease["acquired_at"]
+        self.conn.execute(
+            "UPDATE execution_attempt_leases SET expires_at = ? WHERE lease_id = ?",
+            (acquired_at, lease_id),
+        )
+        self.conn.commit()
+        with self.assertRaisesRegex(CoordinateRuntimeError, "claim replay: marked lease is missing or expired"):
+            claim_job(self.conn, agent_id="mac-omp", claim_request_id="poll-2")
+
+    def test_claim_request_queue_empty_does_not_write_marker(self):
+        result = claim_job(self.conn, agent_id="mac-omp", claim_request_id="poll-empty")
+        self.assertFalse(result.claimed)
+        self.assertEqual(
+            [e for e in list_events(self.conn) if e["event_type"] == "job.claim_request"], []
+        )
+
+    def test_claim_request_terminal_marker_fails_closed(self):
+        request = self._submit_exact(target_agent="mac-codex")
+        claim_job(self.conn, agent_id="mac-codex", claim_request_id="terminal-poll")
+        mark_job_cancelled(self.conn, job_id=request.job["id"], reason="test")
+        with self.assertRaisesRegex(CoordinateRuntimeError, "claim replay: marked job is expired or terminal"):
+            claim_job(self.conn, agent_id="mac-codex", claim_request_id="terminal-poll")
 
     def test_claim_stores_lease_row(self):
         request = self._submit_exact()
