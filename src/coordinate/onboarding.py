@@ -28,6 +28,7 @@ from .db import (
     append_event,
     get_workspace,
     list_split_operations,
+    list_task_mirrors,
     row_to_dict,
     upsert_task_mirror,
     upsert_workspace,
@@ -1290,6 +1291,53 @@ def _require_readable_plan(plan_path: Path) -> None:
         ) from exc
 
 
+@dataclass(frozen=True)
+class InitHarnessPreview:
+    workspace: Workspace
+    harness_root: str
+    task_id: str
+    plan_doc: str
+    files: list[str]
+    files_existing: list[str]
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "dry_run": True,
+            "workspace": self.workspace.to_dict(),
+            "harness_root": self.harness_root,
+            "task_id": self.task_id,
+            "plan_doc": self.plan_doc,
+            "files": self.files,
+            "files_existing": self.files_existing,
+        }
+
+
+def _preview_file_harness(
+    conn: sqlite3.Connection, workspace: Workspace, root_path: Path,
+    task_id: str, rel_plan: str, title: str | None,
+    checklist_resolved: ResolvedChecklist, checklist_create_new: bool,
+) -> InitHarnessPreview:
+    if not task_id or not (title or task_id).strip():
+        raise ValueError("task_id and resolved title must not be empty")
+    if not checklist_create_new:
+        checklist, _ = load_checklist(root_path, resolved=checklist_resolved)
+        if any(item["id"] == task_id for item in checklist["items"]):
+            raise ValueError(f"task {task_id} already exists in checklist; cannot initialize a new task")
+    if any(task["task_id"] == task_id for task in list_task_mirrors(conn, workspace.id)):
+        raise ValueError(f"task {task_id} already exists in registry; cannot initialize a new task")
+    preserved = [root_path / name for name in (
+        "progress.md", "events.jsonl", "harness-config.json", f"tasks/{task_id}/plan.md",
+    )]
+    # The checklist and derived state are updated even when already present.
+    writes = [checklist_resolved.path, root_path / "harness-state.json"]
+    writes.extend(path for path in preserved if not path.exists())
+    return InitHarnessPreview(
+        workspace=workspace, harness_root=str(root_path), task_id=task_id,
+        plan_doc=rel_plan, files=sorted(str(path) for path in writes),
+        files_existing=sorted(str(path) for path in preserved if path.exists()),
+    )
+
+
 def init_file_harness(
     conn: sqlite3.Connection,
     *,
@@ -1302,7 +1350,8 @@ def init_file_harness(
     status: str = "ready",
     priority: str = "p1",
     actor: str = "operator",
-) -> InitHarnessResult:
+    dry_run: bool = False,
+) -> InitHarnessResult | InitHarnessPreview:
     """Minimal file-backed harness init (coordinate-managed profile).
 
     Creates a validator-passing checklist (new filename by default; a
@@ -1335,6 +1384,11 @@ def init_file_harness(
     validate_workspace_relative_path(rel_plan)
     validate_task_create_contract(phase=status, priority=priority)
     checklist_resolved, checklist_create_new = resolve_checklist_for_init(root_path)
+    if dry_run:
+        return _preview_file_harness(
+            conn, workspace, root_path, task_id, rel_plan, title,
+            checklist_resolved, checklist_create_new,
+        )
 
     now = utc_now()
     rel_root = _relative_to_workspace(workspace, root_path)
