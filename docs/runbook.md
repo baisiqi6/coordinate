@@ -684,3 +684,10 @@ coord-ssh assignment mark-done-record coordinate \
 `mark-done-files` 拒绝变更 `/opt/` 下的任何路径，除非传递
 `--allow-runtime-copy`。`/opt` 树是部署产物，不是开发权威来源。始终在
 coding host 的 git checkout 上运行 `mark-done-files`，然后部署已提交的结果。
+
+
+### 初始化预览（`--dry-run`）
+
+`workspace init-harness --mode minimal --dry-run` 与 full 模式预览均使用已有 registry 的只读连接，不创建或迁移数据库，不写 harness 文件、任务镜像或事件，也不预留任务身份。必须先正常注册 workspace；缺少数据库或 schema 不兼容时退出 1，缺少必需参数也在打开连接前退出 1。
+
+minimal 预览要求 canonical plan 已存在，执行 plan、初始状态、优先级及 checklist 权威预检。成功退出 0，`result.dry_run=true`，`files` 列出将创建/更新的路径，`files_existing` 列出将保留的已有辅助文件，`task_id`/`plan_doc` 表示目标；不返回已创建 task/event/operation。`workspace` 是当前注册事实，`harness_root` 是目标目录。已有同名 checklist task 或 registry mirror 时退出 1 并说明冲突。预览不保证未来写权限或并发状态，实际初始化仍重新校验；去掉 `--dry-run` 后才执行真实操作。

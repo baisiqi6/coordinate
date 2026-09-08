@@ -89,11 +89,14 @@ def handle_workspace_doctor(args: argparse.Namespace) -> int:
 
 
 def handle_workspace_init_harness(args: argparse.Namespace) -> int:
-    with _conn(args) as conn:
+    required = ("source",) if args.mode == "full" else ("root", "task_id", "plan_doc")
+    for name in required:
+        if not getattr(args, name):
+            print(f"error: --{name.replace('_', '-')} is required for {args.mode} mode", file=sys.stderr)
+            return 1
+    connection = _readonly_conn if args.dry_run else _conn
+    with connection(args) as conn:
         if args.mode == "full":
-            if not args.source:
-                print("error: --source is required for full mode", file=sys.stderr)
-                return 1
             result = init_full_harness(
                 conn,
                 workspace_id=args.workspace_id,
@@ -103,15 +106,6 @@ def handle_workspace_init_harness(args: argparse.Namespace) -> int:
             )
             _print_json({"result": result.to_dict()})
         else:
-            if not args.root:
-                print("error: --root is required for minimal mode", file=sys.stderr)
-                return 1
-            if not args.task_id:
-                print("error: --task-id is required for minimal mode", file=sys.stderr)
-                return 1
-            if not args.plan_doc:
-                print("error: --plan-doc is required for minimal mode", file=sys.stderr)
-                return 1
             result = init_file_harness(
                 conn,
                 workspace_id=args.workspace_id,
@@ -122,6 +116,7 @@ def handle_workspace_init_harness(args: argparse.Namespace) -> int:
                 owner=args.owner,
                 status=args.status,
                 actor=args.actor,
+                dry_run=args.dry_run,
             )
             _print_json({"result": result.to_dict()})
     return 0
