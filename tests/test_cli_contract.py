@@ -509,9 +509,22 @@ def _restore_pre_trace_root_help(help_text: str) -> str:
     return "\n".join(result) + "\n"
 
 
+def _remove_review_packet_delta(contract: dict[str, object]) -> dict[str, object]:
+    historical = copy.deepcopy(contract)
+    node = next(n for n in historical["nodes"] if n["path"] == ["assignment", "review-result"])
+    actions = [a for a in node["actions"] if a["dest"] == "reviewed_packet_sha256"]
+    if not actions:
+        return historical
+    assert len(actions) == 1 and actions[0]["required"] is True
+    assert actions[0]["option_strings"] == ["--reviewed-packet-sha256"]
+    node["actions"] = [a for a in node["actions"] if a["dest"] != "reviewed_packet_sha256"]
+    node["help"] = 'usage: coordinate assignment review-result [-h] --task-id TASK_ID --reviewer REVIEWER --decision\n                                           DECISION [--summary SUMMARY] [--actor ACTOR]\n                                           [--idempotency-hint IDEMPOTENCY_HINT]\n                                           workspace_id\n\npositional arguments:\n  workspace_id\n\noptions:\n  -h, --help            show this help message and exit\n  --task-id TASK_ID\n  --reviewer REVIEWER\n  --decision DECISION\n  --summary SUMMARY\n  --actor ACTOR\n  --idempotency-hint IDEMPOTENCY_HINT\n'
+    return historical
+
+
 def _remove_claim_request_id_delta(contract: dict[str, object]) -> dict[str, object]:
     """Remove the claim request id option from historical CLI projections."""
-    historical = copy.deepcopy(contract)
+    historical = _remove_review_packet_delta(contract)
     node = next(
         (node for node in historical["nodes"] if node["path"] == ["runtime", "job", "claim"]),
         None,

@@ -1,6 +1,9 @@
 from __future__ import annotations
 
+import hashlib
+import json
 import logging
+import re
 import sqlite3
 from dataclasses import dataclass
 from datetime import datetime, timezone
@@ -16,7 +19,7 @@ from .completion import (
     terminal_ownership_problem,
 )
 from .checklist_io import ChecklistError, mutate_checklist
-from .db import append_event, get_workspace, row_to_dict
+from .db import append_event, get_event_by_idempotency_key, get_workspace, row_to_dict
 from .harness import HarnessAdapter, HarnessError, HarnessMutationResult
 from .reconcile import reconcile_workspace
 
@@ -608,6 +611,26 @@ class CloseoutTaskResult:
     event_created: bool
 
 
+def _review_input_fingerprint(**inputs) -> str:
+    return hashlib.sha256(
+        json.dumps(inputs, sort_keys=True, ensure_ascii=False, separators=(",", ":")).encode()
+    ).hexdigest()
+
+
+def _review_replay(conn, success_key, failed_key, input_fingerprint):
+    for key in (success_key, failed_key):
+        existing = get_event_by_idempotency_key(conn, key)
+        if existing is not None:
+            event = row_to_dict(existing)
+            if event["payload"].get("input_fingerprint") != input_fingerprint:
+                raise ValueError(
+                    "idempotency hint is already bound to different or legacy "
+                    "review/closeout inputs; use a new hint for this request"
+                )
+            return event
+    return None
+
+
 def closeout_task(
     conn: sqlite3.Connection,
     workspace_id: str,
@@ -618,29 +641,16 @@ def closeout_task(
     idempotency_hint: str | None = None,
     self_test_evidence: str | None = None,
 ) -> CloseoutTaskResult:
-    hint = idempotency_hint or f"{workspace_id}:closeout:{task_id}:{reviewer}:{actor}"
+    input_fingerprint = _review_input_fingerprint(
+        workspace_id=workspace_id, task_id=task_id, reviewer=reviewer, actor=actor,
+        self_test_evidence=self_test_evidence or "",
+    )
+    hint = idempotency_hint or f"{workspace_id}:closeout:{task_id}:v2:{input_fingerprint}"
     success_key = f"{hint}:closeout.requested"
     failed_key = f"{hint}:harness.mutation_failed"
-
-    existing = conn.execute(
-        "SELECT * FROM events WHERE idempotency_key = ?", (success_key,)
-    ).fetchone()
+    existing = _review_replay(conn, success_key, failed_key, input_fingerprint)
     if existing is not None:
-        return CloseoutTaskResult(
-            mutation=None,
-            event=row_to_dict(existing),
-            event_created=False,
-        )
-
-    existing_failed = conn.execute(
-        "SELECT * FROM events WHERE idempotency_key = ?", (failed_key,)
-    ).fetchone()
-    if existing_failed is not None:
-        return CloseoutTaskResult(
-            mutation=None,
-            event=row_to_dict(existing_failed),
-            event_created=False,
-        )
+        return CloseoutTaskResult(mutation=None, event=existing, event_created=False)
 
     if adapter is None:
         workspace = get_workspace(conn, workspace_id)
@@ -674,6 +684,7 @@ def closeout_task(
             conn, workspace_id, task_id, reviewer,
             actor, mutation, success_key,
             self_test_evidence=self_test_evidence,
+            input_fingerprint=input_fingerprint,
         )
         if result.event_created:
             _post_mutation_reconcile(conn, workspace_id, task_id)
@@ -681,7 +692,7 @@ def closeout_task(
 
     return _handle_closeout_failure(
         conn, workspace_id, task_id, reviewer,
-        actor, mutation, failed_key,
+        actor, mutation, failed_key, input_fingerprint,
     )
 
 
@@ -689,12 +700,14 @@ def _handle_closeout_success(
     conn, workspace_id, task_id, reviewer,
     actor, mutation, success_key,
     self_test_evidence: str | None = None,
+    input_fingerprint: str = "",
 ):
     payload = {
         "task_id": task_id,
         "reviewer": reviewer,
         "mutation": mutation.to_dict(),
         "self_test_evidence": self_test_evidence or "",
+        "input_fingerprint": input_fingerprint,
     }
     event_result = append_event(
         conn,
@@ -715,10 +728,11 @@ def _handle_closeout_success(
 
 def _handle_closeout_failure(
     conn, workspace_id, task_id, reviewer,
-    actor, mutation, failed_key,
+    actor, mutation, failed_key, input_fingerprint,
 ):
     payload = {
         "operation": "closeout",
+        "input_fingerprint": input_fingerprint,
         "task_id": task_id,
         "reviewer": reviewer,
         "mutation": mutation.to_dict(),
@@ -759,30 +773,21 @@ def review_result_task(
     summary: str | None = None,
     adapter: HarnessAdapter | None = None,
     idempotency_hint: str | None = None,
+    *,
+    reviewed_packet_sha256: str,
 ) -> ReviewResultTaskResult:
-    hint = idempotency_hint or f"{workspace_id}:review-result:{task_id}:{reviewer}:{decision}:{actor}"
+    if not isinstance(reviewed_packet_sha256, str) or not re.fullmatch("[0-9a-f]{64}", reviewed_packet_sha256):
+        raise ValueError("reviewed_packet_sha256 must be the reviewer's exact lowercase SHA256")
+    input_fingerprint = _review_input_fingerprint(
+        workspace_id=workspace_id, task_id=task_id, reviewer=reviewer, decision=decision,
+        actor=actor, summary=summary, reviewed_packet_sha256=reviewed_packet_sha256,
+    )
+    hint = idempotency_hint or f"{workspace_id}:review-result:{task_id}:v2:{input_fingerprint}"
     success_key = f"{hint}:review.completed"
     failed_key = f"{hint}:harness.mutation_failed"
-
-    existing = conn.execute(
-        "SELECT * FROM events WHERE idempotency_key = ?", (success_key,)
-    ).fetchone()
+    existing = _review_replay(conn, success_key, failed_key, input_fingerprint)
     if existing is not None:
-        return ReviewResultTaskResult(
-            mutation=None,
-            event=row_to_dict(existing),
-            event_created=False,
-        )
-
-    existing_failed = conn.execute(
-        "SELECT * FROM events WHERE idempotency_key = ?", (failed_key,)
-    ).fetchone()
-    if existing_failed is not None:
-        return ReviewResultTaskResult(
-            mutation=None,
-            event=row_to_dict(existing_failed),
-            event_created=False,
-        )
+        return ReviewResultTaskResult(mutation=None, event=existing, event_created=False)
 
     if adapter is None:
         workspace = get_workspace(conn, workspace_id)
@@ -790,7 +795,7 @@ def review_result_task(
             raise ValueError(f"unknown workspace: {workspace_id}")
         adapter = HarnessAdapter(workspace)
 
-    args = [reviewer, decision]
+    args = [reviewer, decision, "--reviewed-packet-sha256", reviewed_packet_sha256]
     if summary:
         args.extend(["--summary", summary])
 
@@ -814,7 +819,7 @@ def review_result_task(
     if mutation.success:
         result = _handle_review_result_success(
             conn, workspace_id, task_id, reviewer, decision, summary,
-            actor, mutation, success_key,
+            actor, mutation, success_key, reviewed_packet_sha256, input_fingerprint,
         )
         if result.event_created:
             _post_mutation_reconcile(conn, workspace_id, task_id)
@@ -822,18 +827,20 @@ def review_result_task(
 
     return _handle_review_result_failure(
         conn, workspace_id, task_id, reviewer, decision, summary,
-        actor, mutation, failed_key,
+        actor, mutation, failed_key, reviewed_packet_sha256, input_fingerprint,
     )
 
 
 def _handle_review_result_success(
     conn, workspace_id, task_id, reviewer, decision, summary,
-    actor, mutation, success_key,
+    actor, mutation, success_key, reviewed_packet_sha256, input_fingerprint,
 ):
     payload = {
         "task_id": task_id,
         "reviewer": reviewer,
         "decision": decision,
+        "reviewed_packet_sha256": reviewed_packet_sha256,
+        "input_fingerprint": input_fingerprint,
         "summary": summary,
         "mutation": mutation.to_dict(),
     }
@@ -856,10 +863,12 @@ def _handle_review_result_success(
 
 def _handle_review_result_failure(
     conn, workspace_id, task_id, reviewer, decision, summary,
-    actor, mutation, failed_key,
+    actor, mutation, failed_key, reviewed_packet_sha256, input_fingerprint,
 ):
     payload = {
         "operation": "review-result",
+        "reviewed_packet_sha256": reviewed_packet_sha256,
+        "input_fingerprint": input_fingerprint,
         "task_id": task_id,
         "reviewer": reviewer,
         "decision": decision,

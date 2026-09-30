@@ -1,0 +1,374 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+HARNESS_ROOT=""
+
+resolve_harness_root() {
+    local root
+    root="$(git rev-parse --show-toplevel 2>/dev/null || pwd)"
+    HARNESS_ROOT="$root/{{HARNESS_ROOT}}"
+}
+
+resolve_harness_root
+
+usage() {
+    cat <<'USAGE'
+Usage: {{SCRIPTS_DIR}}/harnessctl <command> [options]
+
+Checklist item commands:
+  add-item <id> --title TEXT --acceptance TEXT
+                 [--priority p0|p1|p2] [--plan PATH] [--dependency ID]... [--handoff TEXT]
+                 [--mode ordinary|high-risk]
+                               Register a new todo checklist item (no plan scaffold);
+                               --mode writes an explicit mode-only workflow
+  update-item <id> [--title TEXT] [--acceptance TEXT] [--priority p0|p1|p2]
+                 [--plan PATH] [--verification TEXT] [--handoff TEXT]
+                 [--add-dependency ID]... [--remove-dependency ID]...
+                 [--mode ordinary|high-risk]
+                               Update allowed fields of an existing item;
+                               --mode is the sole workflow.mode transition (upgrade
+                               to high-risk, or pre-start classification of a legacy
+                               item as ordinary; downgrades/no-ops/done rejected)
+  migrate-checklist [--ack-managed-profile]
+                               Rename mvp-checklist.json to harness-checklist.json
+
+Workflow commands:
+  assign <item-id> <owner> <session-id> [--actor operator] [--branch BRANCH]
+                               Assign an item and claim a lease without starting implementation
+  accept <item-id> <owner> <session-id> [--branch BRANCH]
+                               Accept an assigned item and move it to running
+  start <item-id> <owner> <session-id> [--force --reason TEXT]
+                               Compatibility shortcut: accept/start item as running
+  release <item-id> <actor> [--force --reason TEXT]
+                               Release ownership and lease
+  decline <item-id> <actor> [--summary TEXT]
+                               Decline an assigned or handed-off item
+  renew-lease <item-id> <owner> <session-id> [--lease-minutes N]
+                               Renew current owner/session lease
+  unblock <item-id> <actor> --decision TEXT [--force --reason TEXT]
+                               Move a blocked item back to todo with an auditable decision
+  handoff <item-id> <target> [--actor operator] [--reason TEXT]
+                               Generate current/handoff-packet.md and event
+  review-result <item-id> <reviewer> <approved|changes_requested|blocked>
+                 --reviewed-packet-sha256 <64-hex> [--summary TEXT]
+                               Record reviewer decision bound to the exact packet bytes read
+  mark-done <item-id> [actor] [--verification TEXT] [--force --reason TEXT]
+                               Mark done only after approved review, unless forced
+
+Packet and state commands:
+  sync <item-id>               Refresh current/task_plan.md from canonical plan
+  state                        Refresh harness-state.json
+  session-init [--skip-checklist] [--skip-typecheck] [--skip-tests]
+                               Run deterministic session bootstrap
+  review <item-id> [reviewer]  Generate current/review-packet.md and request review
+  blocker <item-id> [--actor ACTOR] [--reason TEXT]
+                               Generate current/blocker-packet.md and mark blocked
+  workflow-contract           Print the supported review/closeout input contract (read-only)
+  closeout <item-id> [reviewer] [--self-test-evidence TEXT]
+                               Generate current/closeout-packet.md; does not mark done
+  validate [checklist-path]    Validate the resolved checklist (harness-checklist.json
+                               or mvp-checklist.json); explicit path validates that file
+  doctor                       Health check for harness files (authority, locators, stale current)
+
+Options:
+  -h, --help                   Show this help
+USAGE
+}
+
+cmd="${1:-}"
+
+case "${cmd}" in
+    workflow-contract)
+        printf '%s\n' '{"version":1,"reviewed_packet_sha256":true,"self_test_evidence":true}'
+        ;;
+    add-item)
+        item="${2:-}"
+        [[ -n "${item}" ]] || { usage; exit 1; }
+        shift 2
+        python3 "$SCRIPT_DIR/checklist_items.py" add-item "${item}" "$@"
+        ;;
+    update-item)
+        item="${2:-}"
+        [[ -n "${item}" ]] || { usage; exit 1; }
+        shift 2
+        python3 "$SCRIPT_DIR/checklist_items.py" update-item "${item}" "$@"
+        ;;
+    migrate-checklist)
+        shift || true
+        python3 "$SCRIPT_DIR/checklist_items.py" migrate-checklist "$@"
+        ;;
+    assign)
+        item="${2:-}"
+        owner="${3:-}"
+        session="${4:-}"
+        [[ -n "${item}" && -n "${owner}" && -n "${session}" ]] || { usage; exit 1; }
+        shift 4
+        python3 "$SCRIPT_DIR/workflow_transition.py" assign \
+            --item "${item}" --owner "${owner}" --session "${session}" "$@"
+        ;;
+    accept)
+        item="${2:-}"
+        owner="${3:-}"
+        session="${4:-}"
+        [[ -n "${item}" && -n "${owner}" && -n "${session}" ]] || { usage; exit 1; }
+        shift 4
+        python3 "$SCRIPT_DIR/workflow_transition.py" accept \
+            --item "${item}" --owner "${owner}" --session "${session}" "$@"
+        ;;
+    start)
+        item="${2:-}"
+        owner="${3:-}"
+        session="${4:-}"
+        [[ -n "${item}" && -n "${owner}" && -n "${session}" ]] || { usage; exit 1; }
+        shift 4
+        python3 "$SCRIPT_DIR/activate_item.py" --item "${item}" --owner "${owner}" --session "${session}" "$@"
+        python3 "$SCRIPT_DIR/sync_current_from_item.py" --item "${item}"
+        cat <<'EOF'
+
+Reminder:
+- If the canonical plan was just scaffolded, fill in tasks/<item-id>/plan.md first.
+- Do not start implementation until the canonical plan has been completed and boundary-checked.
+EOF
+        ;;
+    release)
+        item="${2:-}"
+        actor="${3:-}"
+        [[ -n "${item}" && -n "${actor}" ]] || { usage; exit 1; }
+        shift 3
+        python3 "$SCRIPT_DIR/workflow_transition.py" release \
+            --item "${item}" --actor "${actor}" "$@"
+        ;;
+    decline)
+        item="${2:-}"
+        actor="${3:-}"
+        [[ -n "${item}" && -n "${actor}" ]] || { usage; exit 1; }
+        shift 3
+        python3 "$SCRIPT_DIR/workflow_transition.py" decline \
+            --item "${item}" --actor "${actor}" "$@"
+        ;;
+    renew-lease)
+        item="${2:-}"
+        owner="${3:-}"
+        session="${4:-}"
+        [[ -n "${item}" && -n "${owner}" && -n "${session}" ]] || { usage; exit 1; }
+        shift 4
+        python3 "$SCRIPT_DIR/workflow_transition.py" renew-lease \
+            --item "${item}" --owner "${owner}" --session "${session}" "$@"
+        ;;
+    unblock)
+        item="${2:-}"
+        actor="${3:-}"
+        [[ -n "${item}" && -n "${actor}" ]] || { usage; exit 1; }
+        shift 3
+        python3 "$SCRIPT_DIR/workflow_transition.py" unblock \
+            --item "${item}" --actor "${actor}" "$@"
+        ;;
+    handoff)
+        item="${2:-}"
+        target="${3:-}"
+        [[ -n "${item}" && -n "${target}" ]] || { usage; exit 1; }
+        shift 3
+        python3 "$SCRIPT_DIR/prepare_handoff_packet.py" --item "${item}" --target "${target}" "$@"
+        ;;
+    review-result)
+        item="${2:-}"
+        reviewer="${3:-}"
+        decision="${4:-}"
+        [[ -n "${item}" && -n "${reviewer}" && -n "${decision}" ]] || { usage; exit 1; }
+        shift 4
+        python3 "$SCRIPT_DIR/workflow_transition.py" review-result \
+            --item "${item}" --reviewer "${reviewer}" --decision "${decision}" "$@"
+        ;;
+    mark-done)
+        item="${2:-}"
+        actor="operator"
+        [[ -n "${item}" ]] || { usage; exit 1; }
+        if [ $# -ge 3 ] && [[ "${3}" != -* ]]; then
+            actor="${3}"
+            shift 3
+        else
+            shift 2
+        fi
+        python3 "$SCRIPT_DIR/workflow_transition.py" mark-done \
+            --item "${item}" --actor "${actor}" "$@"
+        ;;
+    sync)
+        item="${2:-}"
+        [[ -n "${item}" ]] || { usage; exit 1; }
+        python3 "$SCRIPT_DIR/sync_current_from_item.py" --item "${item}"
+        ;;
+    state)
+        python3 "$SCRIPT_DIR/build_harness_state.py"
+        ;;
+    session-init)
+        shift || true
+        python3 "$SCRIPT_DIR/session_init.py" "$@"
+        ;;
+    review)
+        item="${2:-}"
+        reviewer="${3:-TBD}"
+        [[ -n "${item}" ]] || { usage; exit 1; }
+        python3 "$SCRIPT_DIR/prepare_review_packet.py" --item "${item}" --reviewer "${reviewer}"
+        ;;
+    blocker)
+        item="${2:-}"
+        [[ -n "${item}" ]] || { usage; exit 1; }
+        shift 2
+        python3 "$SCRIPT_DIR/prepare_blocker_packet.py" --item "${item}" "$@"
+        ;;
+    closeout)
+        item="${2:-}"
+        [[ -n "${item}" ]] || { usage; exit 1; }
+        shift 2
+        reviewer="TBD"
+        if [[ $# -gt 0 && "$1" != --* ]]; then
+            reviewer="$1"
+            shift
+        fi
+        python3 "$SCRIPT_DIR/prepare_closeout_packet.py" --item "${item}" --reviewer "${reviewer}" "$@"
+        ;;
+    validate)
+        shift || true
+        if [ $# -gt 0 ]; then
+            CHECKLIST_PATH="$1"
+        else
+            CHECKLIST_PATH="$(python3 "$SCRIPT_DIR/harness_common.py" --resolved-checklist 2>/dev/null)"
+            if [ -z "$CHECKLIST_PATH" ]; then
+                echo "ERROR: could not resolve active checklist (none or dual authority)" >&2
+                exit 1
+            fi
+        fi
+        python3 "$SCRIPT_DIR/validate_checklist.py" "$CHECKLIST_PATH"
+        # canonical schema passed; now run the shared runtime locator check
+        # (project-context rules stay in harness_common, not the schema validator)
+        python3 "$SCRIPT_DIR/harness_common.py" --check-locators "$CHECKLIST_PATH"
+        # derived-artifact freshness is warning-only here; verdict/closeout
+        # gates fail closed separately (review-result / mark-done)
+        python3 "$SCRIPT_DIR/harness_common.py" --check-derived-freshness "$CHECKLIST_PATH"
+        # explicit item reference lint (issue #10) is warning-only too:
+        # unknown refs in canonical markdown never block validate
+        python3 "$SCRIPT_DIR/harness_common.py" --check-item-refs "$CHECKLIST_PATH"
+        ;;
+    doctor)
+        echo "=== Harness Doctor ==="
+        echo ""
+
+        echo "--- Checklist authority ---"
+        NEW_CHECKLIST="$HARNESS_ROOT/harness-checklist.json"
+        LEGACY_CHECKLIST="$HARNESS_ROOT/mvp-checklist.json"
+        if [ -f "$NEW_CHECKLIST" ] && [ -f "$LEGACY_CHECKLIST" ]; then
+            echo "  WARN  dual authority: harness-checklist.json and mvp-checklist.json both exist"
+            echo "  Fix: manually compare both files and keep exactly one authority"
+            echo "       (delete or move the superseded file); only when the legacy file is"
+            echo "       the sole remaining checklist may migrate-checklist be run"
+            DOCTOR_RESOLVED=""
+        elif [ -f "$NEW_CHECKLIST" ]; then
+            echo "  OK  harness-checklist.json (new filename, active)"
+            DOCTOR_RESOLVED="$NEW_CHECKLIST"
+        elif [ -f "$LEGACY_CHECKLIST" ]; then
+            echo "  OK  mvp-checklist.json (legacy filename, active)"
+            DOCTOR_RESOLVED="$LEGACY_CHECKLIST"
+        else
+            echo "  MISS  no checklist: harness-checklist.json / mvp-checklist.json"
+            echo "  Fix: create harness-checklist.json or restore a checklist file"
+            DOCTOR_RESOLVED=""
+        fi
+
+        echo ""
+        echo "--- Required files ---"
+        for f in progress.md; do
+            if [ -f "$HARNESS_ROOT/$f" ]; then
+                echo "  OK  $f"
+            else
+                echo "  MISS  $f"
+            fi
+        done
+
+        echo ""
+        echo "--- Optional runtime files ---"
+        for f in harness-config.json harness-state.json events.jsonl; do
+            if [ -f "$HARNESS_ROOT/$f" ]; then
+                echo "  OK  $f"
+            else
+                echo "  MISS  $f"
+            fi
+        done
+
+        echo ""
+        echo "--- Current pointer ---"
+        if [ -f "$HARNESS_ROOT/current/task_plan.md" ]; then
+            echo "  OK  current/task_plan.md exists"
+        else
+            echo "  MISS  current/task_plan.md"
+        fi
+
+        echo ""
+        echo "--- Canonical plans ---"
+        if [ -d "$HARNESS_ROOT/tasks" ]; then
+            for item_dir in "$HARNESS_ROOT/tasks"/*/; do
+                if [ -f "${item_dir}plan.md" ]; then
+                    echo "  OK  $(basename "$item_dir")/plan.md"
+                else
+                    echo "  MISS  $(basename "$item_dir")/plan.md"
+                fi
+            done
+        else
+            echo "  No tasks/ directory"
+        fi
+
+        echo ""
+        echo "--- Checklist validation ---"
+        if [ -n "$DOCTOR_RESOLVED" ]; then
+            python3 "$SCRIPT_DIR/validate_checklist.py" "$DOCTOR_RESOLVED" || true
+        else
+            echo "  Skipped: no single active checklist to validate (none or dual authority)"
+        fi
+
+        echo ""
+        echo "--- Stale current check ---"
+        if [ -n "$DOCTOR_RESOLVED" ] && [ -f "$HARNESS_ROOT/current/task_plan.md" ]; then
+            # The doing item's canonical plan comes from the shared plan
+            # locator (plan_path / artifacts.plan) via harness_common, never
+            # from a hardcoded tasks/<id>/plan.md default. The checklist path
+            # travels as argv, not as interpolated Python source.
+            if ! DOING_OUT="$(python3 "$SCRIPT_DIR/harness_common.py" --doctor-doing-plan "$DOCTOR_RESOLVED")"; then
+                echo "  ERROR: could not resolve doing item plan (see message above)"
+            elif [ "$DOING_OUT" = "NONE" ]; then
+                echo "  No item in doing status"
+            elif [ "$DOING_OUT" = "AMBIGUOUS" ]; then
+                echo "  WARN: multiple items in doing status"
+            else
+                DOING_ID="$(printf '%s\n' "$DOING_OUT" | sed -n '1p')"
+                DOING_PLAN="$(printf '%s\n' "$DOING_OUT" | sed -n '2p')"
+                if [ -f "$DOING_PLAN" ]; then
+                    echo "  Current item: $DOING_ID (plan: $DOING_PLAN)"
+                else
+                    echo "  WARN: doing item $DOING_ID has no canonical plan at $DOING_PLAN"
+                    echo "  Fix: {{SCRIPTS_DIR}}/harnessctl start $DOING_ID <owner> <session>"
+                fi
+            fi
+        else
+            echo "  Cannot check (missing files)"
+        fi
+
+        echo ""
+        echo "--- init.sh ---"
+        if [ -f "$(git rev-parse --show-toplevel 2>/dev/null || pwd)/init.sh" ]; then
+            echo "  OK  init.sh exists"
+        else
+            echo "  MISS  init.sh (optional - run initializer agent to generate)"
+        fi
+
+        echo ""
+        echo "Doctor complete."
+        ;;
+    -h|--help|help)
+        usage
+        ;;
+    *)
+        echo "Unknown command: ${1:-}"
+        usage
+        exit 1
+        ;;
+esac

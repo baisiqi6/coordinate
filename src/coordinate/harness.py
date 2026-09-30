@@ -74,6 +74,8 @@ class HarnessAdapter:
 
         harnessctl = self._resolve_harnessctl()
         extra = args or []
+        if operation in {"closeout", "review-result"}:
+            self._require_review_contract(harnessctl)
 
         if os.access(harnessctl, os.X_OK):
             command = [str(harnessctl), operation, task_id, *extra]
@@ -105,6 +107,29 @@ class HarnessAdapter:
             stderr=completed.stderr,
             success=completed.returncode == 0,
         )
+
+    def _require_review_contract(self, harnessctl: Path) -> None:
+        """Reject old wrappers before they can silently drop review inputs."""
+        prefix = [str(harnessctl)] if os.access(harnessctl, os.X_OK) else ["bash", str(harnessctl)]
+        result = self.runner(
+            [*prefix, "workflow-contract"], cwd=self.workspace.path,
+            text=True, capture_output=True, check=False,
+        )
+        try:
+            contract = json.loads(result.stdout) if result.returncode == 0 else None
+        except (TypeError, ValueError):
+            contract = None
+        if not isinstance(contract, dict) or not (
+            type(contract.get("version")) is int and contract["version"] == 1
+            and contract.get("reviewed_packet_sha256") is True
+            and contract.get("self_test_evidence") is True
+        ):
+            raise HarnessError(
+                "Incompatible harness review/closeout contract: deploy EXharness "
+                "scripts with workflow-contract v1 (reviewed_packet_sha256 and "
+                "self_test_evidence), then retry with a new idempotency hint. "
+                "No review/closeout mutation was invoked."
+            )
 
     def refresh_state(self) -> dict[str, Any]:
         harnessctl = self._resolve_harnessctl()

@@ -11109,6 +11109,21 @@
           "choices": null,
           "const": null,
           "default": null,
+          "dest": "reviewed_packet_sha256",
+          "help": "SHA256 of the exact packet read by the reviewer",
+          "metavar": null,
+          "nargs": null,
+          "option_strings": [
+            "--reviewed-packet-sha256"
+          ],
+          "required": true,
+          "type": null
+        },
+        {
+          "action_class": "_StoreAction",
+          "choices": null,
+          "const": null,
+          "default": null,
           "dest": "summary",
           "help": null,
           "metavar": null,
@@ -11153,7 +11168,7 @@
       "defaults": {
         "handler": "coordinate.workflow_cli.handle_assignment_review_result"
       },
-      "help": "usage: coordinate assignment review-result [-h] --task-id TASK_ID --reviewer REVIEWER --decision\n                                           DECISION [--summary SUMMARY] [--actor ACTOR]\n                                           [--idempotency-hint IDEMPOTENCY_HINT]\n                                           workspace_id\n\npositional arguments:\n  workspace_id\n\noptions:\n  -h, --help            show this help message and exit\n  --task-id TASK_ID\n  --reviewer REVIEWER\n  --decision DECISION\n  --summary SUMMARY\n  --actor ACTOR\n  --idempotency-hint IDEMPOTENCY_HINT\n",
+      "help": "usage: coordinate assignment review-result [-h] --task-id TASK_ID --reviewer REVIEWER --decision\n                                           DECISION --reviewed-packet-sha256\n                                           REVIEWED_PACKET_SHA256 [--summary SUMMARY]\n                                           [--actor ACTOR] [--idempotency-hint IDEMPOTENCY_HINT]\n                                           workspace_id\n\npositional arguments:\n  workspace_id\n\noptions:\n  -h, --help            show this help message and exit\n  --task-id TASK_ID\n  --reviewer REVIEWER\n  --decision DECISION\n  --reviewed-packet-sha256 REVIEWED_PACKET_SHA256\n                        SHA256 of the exact packet read by the reviewer\n  --summary SUMMARY\n  --actor ACTOR\n  --idempotency-hint IDEMPOTENCY_HINT\n",
       "path": [
         "assignment",
         "review-result"

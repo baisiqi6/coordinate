@@ -1330,7 +1330,7 @@ class CloseoutTaskTests(unittest.TestCase):
 
         self.assertEqual(
             result.event["idempotency_key"],
-            "demo:closeout:mvp-001:reviewer-a:operator:closeout.requested",
+            f"demo:closeout:mvp-001:v2:{result.event['payload']['input_fingerprint']}:closeout.requested",
         )
 
     # --- failure path ---
@@ -1445,7 +1445,7 @@ class ReviewResultTaskTests(unittest.TestCase):
         adapter = self._make_adapter(conn)
 
         review_result_task(
-            conn, "demo", "mvp-001", "reviewer-a", "approved", adapter=adapter,
+            conn, "demo", "mvp-001", "reviewer-a", "approved", reviewed_packet_sha256="a" * 64, adapter=adapter,
         )
 
         self.assertEqual(len(adapter.calls), 1)
@@ -1453,14 +1453,14 @@ class ReviewResultTaskTests(unittest.TestCase):
         self.assertEqual(call["operation"], "review-result")
         self.assertEqual(call["task_id"], "mvp-001")
         self.assertEqual(call["actor"], "operator")
-        self.assertEqual(call["args"], ["reviewer-a", "approved"])
+        self.assertEqual(call["args"], ["reviewer-a", "approved", "--reviewed-packet-sha256", "a" * 64])
 
     def test_success_passes_summary_arg(self):
         conn = self._make_conn()
         adapter = self._make_adapter(conn)
 
         review_result_task(
-            conn, "demo", "mvp-001", "reviewer-a", "approved",
+            conn, "demo", "mvp-001", "reviewer-a", "approved", reviewed_packet_sha256="a" * 64,
             summary="looks good", adapter=adapter,
         )
 
@@ -1468,7 +1468,7 @@ class ReviewResultTaskTests(unittest.TestCase):
         call = adapter.calls[0]
         self.assertEqual(
             call["args"],
-            ["reviewer-a", "approved", "--summary", "looks good"],
+            ["reviewer-a", "approved", "--reviewed-packet-sha256", "a" * 64, "--summary", "looks good"],
         )
 
     # --- success event ---
@@ -1478,7 +1478,7 @@ class ReviewResultTaskTests(unittest.TestCase):
         adapter = self._make_adapter(conn)
 
         result = review_result_task(
-            conn, "demo", "mvp-001", "reviewer-a", "approved", adapter=adapter,
+            conn, "demo", "mvp-001", "reviewer-a", "approved", reviewed_packet_sha256="a" * 64, adapter=adapter,
         )
 
         self.assertIsInstance(result, ReviewResultTaskResult)
@@ -1496,7 +1496,7 @@ class ReviewResultTaskTests(unittest.TestCase):
         adapter = self._make_adapter(conn)
 
         result = review_result_task(
-            conn, "demo", "mvp-001", "reviewer-a", "approved", adapter=adapter,
+            conn, "demo", "mvp-001", "reviewer-a", "approved", reviewed_packet_sha256="a" * 64, adapter=adapter,
         )
 
         self.assertEqual(result.event["actor"], "operator")
@@ -1506,7 +1506,7 @@ class ReviewResultTaskTests(unittest.TestCase):
         adapter = self._make_adapter(conn)
 
         result = review_result_task(
-            conn, "demo", "mvp-001", "reviewer-a", "approved",
+            conn, "demo", "mvp-001", "reviewer-a", "approved", reviewed_packet_sha256="a" * 64,
             actor="codex", adapter=adapter,
         )
 
@@ -1518,7 +1518,7 @@ class ReviewResultTaskTests(unittest.TestCase):
         adapter = self._make_adapter(conn)
 
         result = review_result_task(
-            conn, "demo", "mvp-001", "reviewer-a", "approved", adapter=adapter,
+            conn, "demo", "mvp-001", "reviewer-a", "approved", reviewed_packet_sha256="a" * 64, adapter=adapter,
         )
 
         payload = result.event["payload"]
@@ -1537,13 +1537,13 @@ class ReviewResultTaskTests(unittest.TestCase):
         adapter = self._make_adapter(conn)
 
         first = review_result_task(
-            conn, "demo", "mvp-001", "reviewer-a", "approved", adapter=adapter,
+            conn, "demo", "mvp-001", "reviewer-a", "approved", reviewed_packet_sha256="a" * 64, adapter=adapter,
         )
         self.assertTrue(first.event_created)
         self.assertEqual(len(adapter.calls), 1)
 
         second = review_result_task(
-            conn, "demo", "mvp-001", "reviewer-a", "approved", adapter=adapter,
+            conn, "demo", "mvp-001", "reviewer-a", "approved", reviewed_packet_sha256="a" * 64, adapter=adapter,
         )
         self.assertFalse(second.event_created)
         self.assertIsNone(second.mutation)
@@ -1558,12 +1558,12 @@ class ReviewResultTaskTests(unittest.TestCase):
         adapter = self._make_adapter(conn)
 
         result = review_result_task(
-            conn, "demo", "mvp-001", "reviewer-a", "approved", adapter=adapter,
+            conn, "demo", "mvp-001", "reviewer-a", "approved", reviewed_packet_sha256="a" * 64, adapter=adapter,
         )
 
         self.assertEqual(
             result.event["idempotency_key"],
-            "demo:review-result:mvp-001:reviewer-a:approved:operator:review.completed",
+            f"demo:review-result:mvp-001:v2:{result.event['payload']['input_fingerprint']}:review.completed",
         )
 
     # --- failure path ---
@@ -1573,7 +1573,7 @@ class ReviewResultTaskTests(unittest.TestCase):
         adapter = self._make_adapter(conn, success=False, stderr="item not found")
 
         result = review_result_task(
-            conn, "demo", "mvp-999", "reviewer-a", "approved", adapter=adapter,
+            conn, "demo", "mvp-999", "reviewer-a", "approved", reviewed_packet_sha256="a" * 64, adapter=adapter,
         )
 
         self.assertIsNotNone(result.mutation)
@@ -1588,7 +1588,7 @@ class ReviewResultTaskTests(unittest.TestCase):
         adapter = self._make_adapter(conn, success=False, stderr="item not found")
 
         result = review_result_task(
-            conn, "demo", "mvp-999", "reviewer-a", "approved", adapter=adapter,
+            conn, "demo", "mvp-999", "reviewer-a", "approved", reviewed_packet_sha256="a" * 64, adapter=adapter,
         )
 
         payload = result.event["payload"]
@@ -1605,10 +1605,10 @@ class ReviewResultTaskTests(unittest.TestCase):
         adapter = self._make_adapter(conn, success=False, stderr="error")
 
         first = review_result_task(
-            conn, "demo", "mvp-001", "reviewer-a", "approved", adapter=adapter,
+            conn, "demo", "mvp-001", "reviewer-a", "approved", reviewed_packet_sha256="a" * 64, adapter=adapter,
         )
         second = review_result_task(
-            conn, "demo", "mvp-001", "reviewer-a", "approved", adapter=adapter,
+            conn, "demo", "mvp-001", "reviewer-a", "approved", reviewed_packet_sha256="a" * 64, adapter=adapter,
         )
 
         self.assertTrue(first.event_created)
@@ -1621,10 +1621,10 @@ class ReviewResultTaskTests(unittest.TestCase):
         adapter = self._make_adapter(conn, success=False, stderr="error")
 
         review_result_task(
-            conn, "demo", "mvp-001", "reviewer-a", "approved", adapter=adapter,
+            conn, "demo", "mvp-001", "reviewer-a", "approved", reviewed_packet_sha256="a" * 64, adapter=adapter,
         )
         review_result_task(
-            conn, "demo", "mvp-001", "reviewer-a", "approved", adapter=adapter,
+            conn, "demo", "mvp-001", "reviewer-a", "approved", reviewed_packet_sha256="a" * 64, adapter=adapter,
         )
 
         self.assertEqual(len(adapter.calls), 1)

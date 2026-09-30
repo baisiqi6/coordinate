@@ -39,7 +39,7 @@ _CANONICAL_AST_HASHES = {
     "handle_assignment_blocker": "5e692869bb9ad87bd6c0099a85b201cfbe711163968b494fab271357e2ea3b72",
     "handle_assignment_unblock": "73c59722e4c49205d9056e7a775bb3149e7177b929a0aa86dd014e447afb4d0c",
     "handle_assignment_closeout": "6dc9a56745ea1d437edf53740136ed88c11f630f28100a4956de4d5817de35af",
-    "handle_assignment_review_result": "e6fd179a7a4c0ef1eef6a21240518dfbe9cc8d12e86878de20a3bebdc521473d",
+    "handle_assignment_review_result": "d8fdab484f424925203922d1a0eb675891e48832f1c16e3bf18436f449db7857",
     "handle_assignment_mark_done": "686a82cccdcaba4f82c1de7dc92d2df2d4919f6f122a5f3166799cd3ffc4dcb7",
 }
 
@@ -808,6 +808,7 @@ class WorkflowCLIAssignmentDelegationTests(unittest.TestCase):
     def test_assignment_review_result_passes_summary(self) -> None:
         args = SimpleNamespace(
             workspace_id="ws1", task_id="t1", reviewer="rev", decision="approve",
+            reviewed_packet_sha256="a" * 64,
             summary="looks good", actor="operator", idempotency_hint=None,
         )
         mutation = Mock(to_dict=Mock(return_value={"id": "m1"}))
@@ -826,6 +827,7 @@ class WorkflowCLIAssignmentDelegationTests(unittest.TestCase):
             task_id="t1",
             reviewer="rev",
             decision="approve",
+            reviewed_packet_sha256="a" * 64,
             actor="operator",
             summary="looks good",
             idempotency_hint=None,

@@ -1638,6 +1638,11 @@ def append_event(
         return AppendEventResult(row, False)
 
 
+def get_event_by_idempotency_key(conn: sqlite3.Connection, key: str) -> sqlite3.Row | None:
+    """Read an existing request result without creating or migrating state."""
+    return conn.execute("SELECT * FROM events WHERE idempotency_key = ?", (key,)).fetchone()
+
+
 def get_event(conn: sqlite3.Connection, event_id: str) -> sqlite3.Row:
     row = conn.execute("SELECT * FROM events WHERE id = ?", (event_id,)).fetchone()
     if row is None:

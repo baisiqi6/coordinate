@@ -691,3 +691,61 @@ coding host 的 git checkout 上运行 `mark-done-files`，然后部署已提交
 `workspace init-harness --mode minimal --dry-run` 与 full 模式预览均使用已有 registry 的只读连接，不创建或迁移数据库，不写 harness 文件、任务镜像或事件，也不预留任务身份。必须先正常注册 workspace；缺少数据库或 schema 不兼容时退出 1，缺少必需参数也在打开连接前退出 1。
 
 minimal 预览要求 canonical plan 已存在，执行 plan、初始状态、优先级及 checklist 权威预检。成功退出 0，`result.dry_run=true`，`files` 列出将创建/更新的路径，`files_existing` 列出将保留的已有辅助文件，`task_id`/`plan_doc` 表示目标；不返回已创建 task/event/operation。`workspace` 是当前注册事实，`harness_root` 是目标目录。已有同名 checklist task 或 registry mirror 时退出 1 并说明冲突。预览不保证未来写权限或并发状态，实际初始化仍重新校验；去掉 `--dry-run` 后才执行真实操作。
+
+## Review/closeout contract v1 (Coordinate issue #9)
+
+The normal `assignment review-result` CLI and Python `review_result_task` now
+require the SHA256 of the exact packet the reviewer read. Coordinate passes it
+unchanged to EXharness and records it in `review.completed` and completion
+receipt review evidence. It never calculates a reviewer hash on the reviewer's
+behalf. The applicable entry points here are CLI/Python; this change does not
+add new Remote MCP tools or grants. Existing completion MCP tools retain their
+receipt contract.
+
+```bash
+scripts/harness/harnessctl workflow-contract
+# {"version":1,"reviewed_packet_sha256":true,"self_test_evidence":true}
+coordinate assignment closeout WORKSPACE --task-id TASK --reviewer REVIEWER \
+  --self-test-evidence 'Test command, result, and evidence location' \
+  --idempotency-hint CLOSEOUT_ROUND_ID
+# Reviewer reads the generated packet and supplies its own recorded SHA256:
+coordinate assignment review-result WORKSPACE --task-id TASK --reviewer REVIEWER \
+  --decision approved --reviewed-packet-sha256 REVIEWER_RECORDED_SHA256 \
+  --idempotency-hint REVIEW_REQUEST_ID
+```
+
+Before either mutation, the adapter queries `workflow-contract` without touching
+the task. Old wrappers that can silently drop evidence are rejected with an
+upgrade message. A reported contract is capability compatibility, not task
+acceptance. EXharness still enforces phase, packet hash, source plan hash and
+locator freshness. Nonempty self-test evidence must appear in this round's
+closeout packet; updating it does not overwrite historical `verification`.
+
+Default idempotency keys bind all supplied inputs, including reviewer hash or
+self-test evidence. Repeating the same request returns its recorded outcome.
+Reusing an explicit hint with different inputs (or legacy unbound inputs) fails.
+After fixing a failed prerequisite, use a new explicit hint on the **same task**;
+for a new closeout round, always choose a new closeout hint, even if its evidence
+text is unchanged. A successful replay refers to that historical request; it
+does not approve a newly generated packet. No old failure or success events need
+to be deleted. Newly corrected hashes naturally get a distinct default key.
+
+Release/migration order:
+
+1. Integrate the companion EXharness templates and run its runtime suite.
+   For a project already using the packet-freshness contract, the changed runtime
+   files are `harnessctl` and `prepare_closeout_packet.py`. Inspect the actual
+   canonical project scripts first; older project snapshots also need the
+   matching `workflow_transition.py`/`harness_common.py` freshness support.
+   Keep the project's paths and configuration, review the migration commit and
+   deploy its exact bytes. Do not copy private test fixtures into production.
+2. Release Coordinate from its private canonical repository through the normal
+   reviewed/export/deployment workflow. No schema migration is required. Test
+   the combination in an isolated workspace; updating Coordinate alone is not
+   sufficient for an old project wrapper.
+3. Read back deployed CLI help, `workflow-contract`, and exact script/package
+   hashes. The project Operator then refreshes the existing task state, requests
+   a new closeout packet containing current test evidence, obtains an independent
+   review of that exact packet and continues normal receipt completion.
+   Preserve prior release evidence. Do not synthesize review events, force done,
+   reuse a receipt from another task, or bulk reconcile historical tasks.
