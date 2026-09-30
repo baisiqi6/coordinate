@@ -1,0 +1,15 @@
+{
+  "repository": "baisiqi6/EXharness",
+  "base_commit": "bd581bc84b2db628981552f05ce3df6aa60a03fa",
+  "change": "Coordinate public issue #9 workflow-contract v1 and self-test evidence",
+  "sha256": {
+    "harnessctl": "85a41683e47fff1fda8d4efc92797b16a1bbcba00cf1a46702d6c74762b18099",
+    "harness_common.py": "23305f4339491db09791db3eadc5c532759423b1f493cf65bde15984f6fd7896",
+    "workflow_transition.py": "29dbb7cdcb0622b26276312f15f1aaafb6727d21a05a7d4f54a06478b01f3ceb",
+    "prepare_closeout_packet.py": "b6ba417f8e9edaadb451c5728478e7c1ad0a1793dd8e700f539898cdffaf42d4",
+    "build_harness_state.py": "b473a5051b1a0451269c4ff1631139fe8b482c9eaeabe6aee60611605e0fa14c",
+    "validate_checklist.py": "979236fdb8a82703caf33d9b61ef6250bd6001cc2cf3636044deedca59359d58"
+  },
+  "source_commit": "997559d164a4cf22f1556374b754a02f9873f863",
+  "source_directory": "skills/long-running-project-harness/references/scripts"
+}

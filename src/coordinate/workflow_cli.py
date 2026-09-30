@@ -140,6 +140,8 @@ def register_assignment_commands(subcommands) -> None:
     assignment_review_result.add_argument("--task-id", required=True)
     assignment_review_result.add_argument("--reviewer", required=True)
     assignment_review_result.add_argument("--decision", required=True)
+    assignment_review_result.add_argument("--reviewed-packet-sha256", required=True,
+                                          help="SHA256 of the exact packet read by the reviewer")
     assignment_review_result.add_argument("--summary")
     assignment_review_result.add_argument("--actor", default="operator")
     assignment_review_result.add_argument("--idempotency-hint")
@@ -407,6 +409,7 @@ def handle_assignment_review_result(args: argparse.Namespace) -> int:
             decision=args.decision,
             actor=args.actor,
             summary=args.summary,
+            reviewed_packet_sha256=args.reviewed_packet_sha256,
             idempotency_hint=args.idempotency_hint,
         )
     output = {

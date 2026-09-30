@@ -446,12 +446,16 @@ def _gather_review_evidence(conn, workspace_id, task_id) -> dict[str, Any]:
         return {"not_applicable": True, "reason": "no review.completed event for task"}
     d = row_to_dict(row)
     payload = d.get("payload") or {}
-    return {
+    evidence = {
         "event_id": d.get("id"),
         "decision": payload.get("decision"),
         "reviewer": payload.get("reviewer"),
         "summary": payload.get("summary"),
     }
+
+    if payload.get("reviewed_packet_sha256"):
+        evidence["reviewed_packet_sha256"] = payload["reviewed_packet_sha256"]
+    return evidence
 
 
 def _latest_ci_event(conn, workspace_id, task_id) -> dict[str, Any] | None:

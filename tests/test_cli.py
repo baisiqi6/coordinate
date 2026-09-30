@@ -3331,6 +3331,8 @@ class CliTests(unittest.TestCase):
             harnessctl_path.write_text("#!/bin/bash\necho 'ok'\nexit 0\n")
         else:
             harnessctl_path.write_text("#!/bin/bash\necho 'error' >&2\nexit 1\n")
+        contract_probe = "if [ \"$1\" = workflow-contract ]; then echo '{\"version\":1,\"reviewed_packet_sha256\":true,\"self_test_evidence\":true}'; exit 0; fi\n"
+        harnessctl_path.write_text(harnessctl_path.read_text().replace("#!/bin/bash\n", "#!/bin/bash\n" + contract_probe))
         harnessctl_path.chmod(0o755)
         self.run_cli(
             "--db", db_path,
@@ -3576,6 +3578,8 @@ class CliTests(unittest.TestCase):
             harnessctl_path.write_text("#!/bin/bash\necho 'ok'\nexit 0\n")
         else:
             harnessctl_path.write_text("#!/bin/bash\necho 'error' >&2\nexit 1\n")
+        contract_probe = "if [ \"$1\" = workflow-contract ]; then echo '{\"version\":1,\"reviewed_packet_sha256\":true,\"self_test_evidence\":true}'; exit 0; fi\n"
+        harnessctl_path.write_text(harnessctl_path.read_text().replace("#!/bin/bash\n", "#!/bin/bash\n" + contract_probe))
         harnessctl_path.chmod(0o755)
         self.run_cli(
             "--db", db_path,
@@ -3592,6 +3596,7 @@ class CliTests(unittest.TestCase):
             code, payload = self.run_cli(
                 "--db", db_path,
                 "assignment", "review-result", "demo",
+                "--reviewed-packet-sha256", "a" * 64,
                 "--task-id", "mvp-001",
                 "--reviewer", "alice",
                 "--decision", "approved",
@@ -3612,6 +3617,7 @@ class CliTests(unittest.TestCase):
             _, payload = self.run_cli(
                 "--db", db_path,
                 "assignment", "review-result", "demo",
+                "--reviewed-packet-sha256", "a" * 64,
                 "--task-id", "mvp-001",
                 "--reviewer", "alice",
                 "--decision", "approved",
@@ -3628,6 +3634,7 @@ class CliTests(unittest.TestCase):
             _, payload = self.run_cli(
                 "--db", db_path,
                 "assignment", "review-result", "demo",
+                "--reviewed-packet-sha256", "a" * 64,
                 "--task-id", "mvp-001",
                 "--reviewer", "alice",
                 "--decision", "approved",
@@ -3644,6 +3651,7 @@ class CliTests(unittest.TestCase):
             args = [
                 "--db", db_path,
                 "assignment", "review-result", "demo",
+                "--reviewed-packet-sha256", "a" * 64,
                 "--task-id", "mvp-001",
                 "--reviewer", "alice",
                 "--decision", "approved",
@@ -3671,6 +3679,7 @@ class CliTests(unittest.TestCase):
             code, payload = self.run_cli(
                 "--db", db_path,
                 "assignment", "review-result", "demo",
+                "--reviewed-packet-sha256", "a" * 64,
                 "--task-id", "mvp-001",
                 "--reviewer", "alice",
                 "--decision", "approved",
@@ -3702,6 +3711,7 @@ class CliTests(unittest.TestCase):
             args = [
                 "--db", db_path,
                 "assignment", "review-result", "demo",
+                "--reviewed-packet-sha256", "a" * 64,
                 "--task-id", "mvp-001",
                 "--reviewer", "alice",
                 "--decision", "approved",
@@ -3736,6 +3746,7 @@ class CliTests(unittest.TestCase):
             code, payload = self.run_cli(
                 "--db", db_path,
                 "assignment", "review-result", "demo",
+                "--reviewed-packet-sha256", "a" * 64,
                 "--task-id", "mvp-001",
                 "--reviewer", "alice",
                 "--decision", "approved",
@@ -3770,6 +3781,7 @@ class CliTests(unittest.TestCase):
             code, payload = self.run_cli(
                 "--db", db_path,
                 "assignment", "review-result", "demo",
+                "--reviewed-packet-sha256", "a" * 64,
                 "--task-id", "mvp-001",
                 "--reviewer", "alice",
                 "--decision", "approved",
