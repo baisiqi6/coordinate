@@ -506,6 +506,15 @@ def _session_projection(
         {"source": "jobs.progress_json.session_id", "session_id": stored},
         {"source": "job.progress.session_id", "session_id": progress_session_id},
     ]
+    result = _decode(job["result_json"])
+    timeout = result.get("timeout")
+    # Only these fixed session locators are metadata; never project result content.
+    for source, candidate in (
+        ("jobs.result_json.timeout.session_id", timeout.get("session_id") if isinstance(timeout, dict) else None),
+        ("jobs.result_json.session_id", result.get("session_id")),
+    ):
+        if isinstance(candidate, str) and candidate.strip():
+            sources.append({"source": source, "session_id": candidate.strip()})
     sources = [s for s in sources if s["session_id"]]
     if not sources or len({s["session_id"] for s in sources}) > 1:
         return {"state": "unknown", "sources": sources}

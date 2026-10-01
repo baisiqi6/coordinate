@@ -615,9 +615,15 @@ git push
 coord-ssh assignment mark-done-record coordinate \
   --receipt <receipt_id> --actor operator
 
-# 5. 验证状态。
+# 5. 核验完成事件，并刷新已部署 checklist 的派生 state。
 coord-ssh state coordinate
 coord-ssh event list coordinate
+
+# receipt consumed 不会自动将 task mirror 更新为 closed。
+# 若已核验 done/closed，且只剩当前 task 的 mirror drift，定向收敛后 audit 本 task drift=0。
+# state 刷新与 reconcile 之间不得写入 checklist。
+coord-ssh reconcile coordinate --task-id <task_id> --no-refresh
+coord-ssh workspace audit coordinate --no-refresh
 ```
 
 已配置 R5 Remote MCP principal 的 Agent 日常路径不需要 `coord-ssh`：
@@ -630,6 +636,9 @@ coord-ssh event list coordinate
    `task.done + completion.consumed`。
 5. 用 `coordinate.workspace_audit` / `coordinate.runtime_job_get` 监督；该轻量路径不伪装成完整
    `operator_pending` assignment-action parity。
+
+`consume` 后同样需核验当前 task 的 mirror；若只剩 mirror drift，刷新已部署 checklist/state 后，
+按上述步骤执行 scoped reconcile，并确认 audit 中本 task 的 drift 为 0。
 
 同理，split-host task 创建为：coding host `task create-files` → commit/push/deploy → Remote MCP
 `coordinate.task_create_record`。file half 或 deployed readback 缺失时 DB 保持零 mutation；不得把 checklist
