@@ -94,6 +94,7 @@ def _make_job(
     created_at: str = T0,
     session_id: str | None = None,
     progress: dict | None = None,
+    result: dict | None = None,
 ) -> None:
     payload = _typed_payload(job_id, task_id=task_id) if typed else {"prompt": "SECRET-PROMPT-TEXT"}
     create_job(
@@ -110,7 +111,7 @@ def _make_job(
         UPDATE jobs
         SET status = ?, attempt_count = ?, created_at = ?, updated_at = ?,
             terminal_session_id = ?, progress_json = ?, last_activity_at = ?,
-            started_at = ?, completed_at = ?
+            started_at = ?, completed_at = ?, result_json = ?
         WHERE id = ?
         """,
         (
@@ -123,6 +124,7 @@ def _make_job(
             (progress or {}).get("last_activity_at"),
             T1 if status in {"running", "done", "failed", "timed_out"} else None,
             T3 if status in {"done", "failed"} else None,
+            json.dumps(result) if result is not None else None,
             job_id,
         ),
     )
@@ -538,6 +540,19 @@ class TypedEvidenceTests(TraceFixture):
             attempt_count=1,
             session_id="sess-a",
             progress={"stage": "coding", "summary": "SECRET-PROGRESS-SUMMARY"},
+            result={
+                "session_id": "sess-a",
+                "response_text": "SECRET-RESPONSE-TEXT",
+                "prompt": "SECRET-RESULT-PROMPT",
+                "env": {"token": "SECRET-ENV-TOKEN"},
+                "transcript": "SECRET-TRANSCRIPT",
+                "reasoning": "SECRET-REASONING",
+                "timeout": {
+                    "session_id": "sess-a",
+                    "diagnostic": "SECRET-TIMEOUT-DIAGNOSTIC",
+                    "progress": {"summary": "SECRET-RESULT-PROGRESS"},
+                },
+            },
         )
         _claim(self.conn, "job-priv", 1)
         _progress_event(self.conn, "job-priv")
@@ -546,6 +561,116 @@ class TypedEvidenceTests(TraceFixture):
         self.assertNotIn("SECRET-PROMPT-TEXT", raw)
         self.assertNotIn("SECRET-PROGRESS-SUMMARY", raw)
         self.assertNotIn("prompt", raw)
+        for private in (
+            "SECRET-RESPONSE-TEXT", "SECRET-RESULT-PROMPT", "SECRET-ENV-TOKEN",
+            "SECRET-TRANSCRIPT", "SECRET-REASONING", "SECRET-TIMEOUT-DIAGNOSTIC",
+            "SECRET-RESULT-PROGRESS",
+        ):
+            self.assertNotIn(private, raw)
+
+    def test_result_session_locators_present(self) -> None:
+        _make_job(self.conn, "job-result", status="timed_out", attempt_count=1)
+        session_id = "native-" + "x" * 250
+        for result, source in (
+            ({"timeout": {"session_id": f"  {session_id}  "}}, "jobs.result_json.timeout.session_id"),
+            ({"session_id": f"  {session_id}  "}, "jobs.result_json.session_id"),
+        ):
+            with self.subTest(source=source):
+                self.conn.execute(
+                    "UPDATE jobs SET result_json = ? WHERE id = 'job-result'",
+                    (json.dumps(result),),
+                )
+                self.conn.commit()
+                for trace in (
+                    build_job_trace(self.conn, job_id="job-result", now=NOW),
+                    build_task_trace(self.conn, workspace_id=WS, task_id=TASK, now=NOW),
+                ):
+                    self.assertEqual(trace["execution"]["provider_session"], {
+                        "state": "present", "source": source, "session_id": session_id,
+                    })
+
+    def test_result_session_sources_agree_and_preserve_existing_source(self) -> None:
+        result = {"session_id": "sess-a", "timeout": {"session_id": "sess-a"}}
+        _make_job(self.conn, "job-agree", status="done", result=result)
+        trace = build_job_trace(self.conn, job_id="job-agree", now=NOW)
+        self.assertEqual(trace["execution"]["provider_session"], {
+            "state": "present", "source": "jobs.result_json.timeout.session_id", "session_id": "sess-a",
+        })
+        _make_job(
+            self.conn, "job-all", status="done", session_id="sess-a",
+            progress={"session_id": "sess-a"}, result=result,
+        )
+        _progress_event(self.conn, "job-all", session_id="sess-a")
+        trace = build_job_trace(self.conn, job_id="job-all", now=NOW)
+        self.assertEqual(trace["execution"]["provider_session"], {
+            "state": "present", "source": "jobs.terminal_session_id", "session_id": "sess-a",
+        })
+
+    def test_conflicting_result_session_sources_unknown(self) -> None:
+        _make_job(self.conn, "job-result-conflict", status="done", result={
+            "session_id": "sess-root", "timeout": {"session_id": "sess-timeout"},
+        })
+        trace = build_job_trace(self.conn, job_id="job-result-conflict", now=NOW)
+        self.assertEqual(trace["execution"]["provider_session"], {
+            "state": "unknown",
+            "sources": [
+                {"source": "jobs.result_json.timeout.session_id", "session_id": "sess-timeout"},
+                {"source": "jobs.result_json.session_id", "session_id": "sess-root"},
+            ],
+        })
+
+    def test_result_session_conflicts_with_each_existing_source(self) -> None:
+        for result_index, (result, result_source) in enumerate((
+            ({"session_id": "sess-result"}, "jobs.result_json.session_id"),
+            ({"timeout": {"session_id": "sess-result"}}, "jobs.result_json.timeout.session_id"),
+        )):
+            for source_index, source in enumerate((
+                "jobs.terminal_session_id", "jobs.progress_json.session_id", "job.progress.session_id",
+            )):
+                with self.subTest(result_source=result_source, source=source):
+                    job_id = f"job-conflict-{result_index}-{source_index}"
+                    _make_job(
+                        self.conn, job_id, status="done", result=result,
+                        session_id="sess-existing" if source_index == 0 else None,
+                        progress={"session_id": "sess-existing"} if source_index == 1 else None,
+                    )
+                    if source_index == 2:
+                        _progress_event(self.conn, job_id, session_id="sess-existing")
+                    trace = build_job_trace(self.conn, job_id=job_id, now=NOW)
+                    self.assertEqual(trace["execution"]["provider_session"], {
+                        "state": "unknown",
+                        "sources": [
+                            {"source": source, "session_id": "sess-existing"},
+                            {"source": result_source, "session_id": "sess-result"},
+                        ],
+                    })
+
+    def test_malformed_result_session_values_ignored(self) -> None:
+        _make_job(self.conn, "job-malformed", status="done")
+        malformed = [None, [], 7, "session", {}, {"progress": {"session_id": "nested"}}]
+        for value in (None, False, 7, [], {"private": "SECRET-MALFORMED"}, "", " \t "):
+            malformed.extend((
+                {"session_id": value}, {"timeout": {"session_id": value}},
+            ))
+        malformed.append({"timeout": {"progress": {"session_id": "nested"}}})
+        for raw in ["{broken-json"] + [json.dumps(value) for value in malformed]:
+            with self.subTest(raw=raw):
+                self.conn.execute("UPDATE jobs SET result_json = ? WHERE id = 'job-malformed'", (raw,))
+                self.conn.commit()
+                trace = build_job_trace(self.conn, job_id="job-malformed", now=NOW)
+                self.assertEqual(trace["execution"]["provider_session"], {"state": "unknown", "sources": []})
+                self.assertNotIn("SECRET-MALFORMED", json.dumps(trace))
+        for timeout in (None, [], "invalid", 7):
+            with self.subTest(timeout=timeout):
+                self.conn.execute(
+                    "UPDATE jobs SET result_json = ? WHERE id = 'job-malformed'",
+                    (json.dumps({"session_id": "sess-root", "timeout": timeout}),),
+                )
+                self.conn.commit()
+                trace = build_job_trace(self.conn, job_id="job-malformed", now=NOW)
+                self.assertEqual(trace["execution"]["provider_session"], {
+                    "state": "present", "source": "jobs.result_json.session_id", "session_id": "sess-root",
+                })
 
     def test_legacy_job_marks_snapshots_unknown(self) -> None:
         _make_job(self.conn, "job-legacy", status="running", attempt_count=1, typed=False)
@@ -885,6 +1010,7 @@ class ReadOnlyTests(TraceFixture):
             attempt_count=1,
             session_id="sess-a",
             progress={"stage": "coding"},
+            result={"session_id": "sess-a", "timeout": {"session_id": "sess-a"}},
         )
         _claim(self.conn, "job-ro", 1)
         _progress_event(self.conn, "job-ro")
@@ -905,10 +1031,12 @@ class ReadOnlyTests(TraceFixture):
             )
 
     def test_reopen_produces_equivalent_projection(self) -> None:
-        _make_job(self.conn, "job-re", status="running", attempt_count=1, session_id="sess-a")
+        _make_job(self.conn, "job-re", status="running", attempt_count=1, result={"session_id": "sess-a"})
         _claim(self.conn, "job-re", 1)
+        _progress_event(self.conn, "job-re", session_id=None)
         _lease(self.conn, "job-re")
         first = build_task_trace(self.conn, workspace_id=WS, task_id=TASK, now=NOW)
+        self.assertEqual(first["execution"]["provider_session"]["source"], "jobs.result_json.session_id")
         self.conn.close()
         reopened = initialize(self.db_path)
         try:
@@ -1006,7 +1134,10 @@ class TraceCLITests(unittest.TestCase):
             payload=_typed_payload("job-cli"),
             job_id="job-cli",
         )
-        conn.execute("UPDATE jobs SET status = 'running', attempt_count = 1 WHERE id = 'job-cli'")
+        conn.execute(
+            "UPDATE jobs SET status = 'running', attempt_count = 1, result_json = ? WHERE id = 'job-cli'",
+            (json.dumps({"session_id": "sess-cli"}),),
+        )
         conn.commit()
         conn.close()
 
@@ -1027,6 +1158,9 @@ class TraceCLITests(unittest.TestCase):
         self.assertEqual(document["trace"]["contract_version"], 1)
         self.assertEqual(document["trace"]["query"]["kind"], "task")
         self.assertEqual(document["trace"]["execution"]["selection"]["job_id"], "job-cli")
+        self.assertEqual(document["trace"]["execution"]["provider_session"], {
+            "state": "present", "source": "jobs.result_json.session_id", "session_id": "sess-cli",
+        })
 
     def test_trace_job_prints_only_trace_json(self) -> None:
         code, out, err = self._run("trace", "job", "job-cli")
@@ -1036,6 +1170,9 @@ class TraceCLITests(unittest.TestCase):
         self.assertEqual(document["trace"]["query"]["kind"], "job")
         self.assertEqual(document["trace"]["execution"]["selection"]["kind"], "exact")
         self.assertEqual(document["trace"]["execution"]["selection"]["job_id"], "job-cli")
+        self.assertEqual(document["trace"]["execution"]["provider_session"], {
+            "state": "present", "source": "jobs.result_json.session_id", "session_id": "sess-cli",
+        })
 
     def test_unknown_ids_exit_nonzero_with_error(self) -> None:
         for argv in (
