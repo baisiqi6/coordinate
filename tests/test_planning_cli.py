@@ -74,6 +74,7 @@ PLANNING_LEAF_PATHS = {
     "plan approve",
     "plan reject",
     "operator pending",
+    "operator task",
 }
 
 
@@ -247,7 +248,9 @@ class PlanningRegistrationTests(unittest.TestCase):
         parser = build_parser()
         handlers = self._leaf_handlers(parser)
         planning_handlers = {p: h for p, h in handlers.items() if p in PLANNING_LEAF_PATHS}
-        self.assertEqual(len(planning_handlers), 16)
+        self.assertEqual(len(planning_handlers), 17)
+        self.assertIs(planning_handlers["operator task"],
+                      coordinate.planning_cli.handle_operator_task)
         for path, handler in planning_handlers.items():
             with self.subTest(path=path):
                 self.assertEqual(handler.__module__, "coordinate.planning_cli")

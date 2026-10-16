@@ -509,8 +509,39 @@ def _restore_pre_trace_root_help(help_text: str) -> str:
     return "\n".join(result) + "\n"
 
 
-def _remove_review_packet_delta(contract: dict[str, object]) -> dict[str, object]:
+# Captured before Coordinate #13/#14: preserve historical CLI delta proofs.
+_PRE_OPERATOR_FEEDBACK_HELP = {('assignment', 'blocker'): 'usage: coordinate assignment blocker [-h] --task-id TASK_ID [--actor ACTOR] [--reason REASON]\n                                     [--idempotency-hint IDEMPOTENCY_HINT]\n                                     workspace_id\n\npositional arguments:\n  workspace_id\n\noptions:\n  -h, --help            show this help message and exit\n  --task-id TASK_ID\n  --actor ACTOR\n  --reason REASON\n  --idempotency-hint IDEMPOTENCY_HINT\n', ('operator',): 'usage: coordinate operator [-h] {pending} ...\n\npositional arguments:\n  {pending}\n    pending   List tasks awaiting operator action\n\noptions:\n  -h, --help  show this help message and exit\n'}
+
+
+def _remove_operator_feedback_delta(contract: dict[str, object]) -> dict[str, object]:
     historical = copy.deepcopy(contract)
+    path = ["operator", "task"]
+    matches = [node for node in historical["nodes"] if node["path"] == path]
+    if matches:
+        if len(matches) != 1 or historical["leaf_paths"].count("operator task") != 1:
+            raise AssertionError("unexpected operator task parser delta")
+        parent = next(n for n in historical["nodes"] if n["path"] == ["operator"])
+        actions = [a for a in parent["actions"] if a["action_class"] == "_SubParsersAction"]
+        if len(actions) != 1 or actions[0]["choices"] != ["pending", "task"]:
+            raise AssertionError("unexpected operator parent choices")
+        actions[0]["choices"] = ["pending"]
+        parent["help"] = _PRE_OPERATOR_FEEDBACK_HELP[("operator",)]
+        historical["nodes"] = [n for n in historical["nodes"] if n["path"] != path]
+        historical["leaf_paths"].remove("operator task")
+        historical["metadata"]["leaf_count"] -= 1
+        historical["metadata"]["node_count"] -= 1
+    blocker = next(n for n in historical["nodes"] if n["path"] == ["assignment", "blocker"])
+    options = [a for a in blocker["actions"] if a["dest"] == "unblock_owner"]
+    if options:
+        if len(options) != 1 or options[0]["option_strings"] != ["--unblock-owner"]:
+            raise AssertionError("unexpected unblock owner parser delta")
+        blocker["actions"] = [a for a in blocker["actions"] if a["dest"] != "unblock_owner"]
+        blocker["help"] = _PRE_OPERATOR_FEEDBACK_HELP[("assignment", "blocker")]
+    return historical
+
+
+def _remove_review_packet_delta(contract: dict[str, object]) -> dict[str, object]:
+    historical = _remove_operator_feedback_delta(contract)
     node = next(n for n in historical["nodes"] if n["path"] == ["assignment", "review-result"])
     actions = [a for a in node["actions"] if a["dest"] == "reviewed_packet_sha256"]
     if not actions:
@@ -1808,10 +1839,26 @@ class CLIContractTests(unittest.TestCase):
         contract = _build_contract()
         metadata = contract["metadata"]
         self.assertEqual(len(metadata["top_level_commands"]), 24)
-        self.assertEqual(metadata["leaf_count"], 102)
-        self.assertEqual(metadata["node_count"], 134)
-        self.assertEqual(len(contract["leaf_paths"]), 102)
-        self.assertEqual(len(contract["nodes"]), 134)
+        self.assertEqual(metadata["leaf_count"], 103)
+        self.assertEqual(metadata["node_count"], 135)
+        self.assertEqual(len(contract["leaf_paths"]), 103)
+        self.assertEqual(len(contract["nodes"]), 135)
+
+    def test_operator_feedback_delta_rewinds_to_prior_contract(self):
+        contract = _build_contract()
+        node = next(n for n in contract["nodes"] if n["path"] == ["operator", "task"])
+        self.assertEqual(node["defaults"]["handler"], "coordinate.planning_cli.handle_operator_task")
+        self.assertEqual([a["dest"] for a in node["actions"] if a["required"]],
+                         ["workspace_id", "task_id"])
+        blocker = next(n for n in contract["nodes"] if n["path"] == ["assignment", "blocker"])
+        action = next(a for a in blocker["actions"] if a["dest"] == "unblock_owner")
+        self.assertEqual(action["option_strings"], ["--unblock-owner"])
+        self.assertEqual(action["default"], "human")
+        self.assertFalse(action["required"])
+        historical = _remove_operator_feedback_delta(contract)
+        self.assertEqual(hashlib.sha256(_serialize_contract(_project_semantic_help(historical))).hexdigest(),
+                         "5fb26a4d84139cf9606050b4fa0af76e1ca29f88d8855da57ca94988dedd552c")
+        self.assertEqual(_remove_operator_feedback_delta(historical), historical)
 
     def test_agent_reconcile_delta_rewinds_to_prior_contract(self) -> None:
         contract = _build_contract()

@@ -113,6 +113,8 @@ def register_assignment_commands(subcommands) -> None:
     assignment_blocker.add_argument("--task-id", required=True)
     assignment_blocker.add_argument("--actor", default="operator")
     assignment_blocker.add_argument("--reason")
+    assignment_blocker.add_argument("--unblock-owner", default="human",
+                                    help="Who must decide how to unblock the task (default: human)")
     assignment_blocker.add_argument("--idempotency-hint")
     assignment_blocker.set_defaults(handler=handle_assignment_blocker)
 
@@ -335,6 +337,7 @@ def handle_assignment_blocker(args: argparse.Namespace) -> int:
             task_id=args.task_id,
             actor=args.actor,
             reason=args.reason,
+            unblock_owner=args.unblock_owner,
             idempotency_hint=args.idempotency_hint,
         )
     output = {

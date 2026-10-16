@@ -18,7 +18,7 @@ from .completion import (
     release_terminal_ownership,
     terminal_ownership_problem,
 )
-from .checklist_io import ChecklistError, mutate_checklist
+from .checklist_io import ChecklistError, mutate_checklist, resolve_harness_root
 from .db import append_event, get_event_by_idempotency_key, get_workspace, row_to_dict
 from .harness import HarnessAdapter, HarnessError, HarnessMutationResult
 from .reconcile import reconcile_workspace
@@ -337,6 +337,7 @@ def blocker_task(
     reason: str | None = None,
     adapter: HarnessAdapter | None = None,
     idempotency_hint: str | None = None,
+    unblock_owner: str = "human",
 ) -> BlockerTaskResult:
     hint = idempotency_hint or f"{workspace_id}:blocker:{task_id}:{actor}"
     success_key = f"{hint}:blocker.raised"
@@ -362,13 +363,16 @@ def blocker_task(
             event_created=False,
         )
 
+    if not isinstance(unblock_owner, str) or not unblock_owner.strip():
+        raise ValueError("unblock_owner must be a non-empty string")
+
     if adapter is None:
         workspace = get_workspace(conn, workspace_id)
         if workspace is None:
             raise ValueError(f"unknown workspace: {workspace_id}")
         adapter = HarnessAdapter(workspace)
 
-    args = ["--actor", actor]
+    args = ["--actor", actor, "--unblock-owner", unblock_owner]
     if reason:
         args.extend(["--reason", reason])
 
@@ -392,7 +396,7 @@ def blocker_task(
     if mutation.success:
         result = _handle_blocker_success(
             conn, workspace_id, task_id, reason,
-            actor, mutation, success_key,
+            actor, mutation, success_key, unblock_owner,
         )
         if result.event_created:
             _post_mutation_reconcile(conn, workspace_id, task_id)
@@ -400,17 +404,18 @@ def blocker_task(
 
     return _handle_blocker_failure(
         conn, workspace_id, task_id, reason,
-        actor, mutation, failed_key,
+        actor, mutation, failed_key, unblock_owner,
     )
 
 
 def _handle_blocker_success(
     conn, workspace_id, task_id, reason,
-    actor, mutation, success_key,
+    actor, mutation, success_key, unblock_owner,
 ):
     payload = {
         "task_id": task_id,
         "reason": reason,
+        "unblock_owner": unblock_owner,
         "mutation": mutation.to_dict(),
     }
     event_result = append_event(
@@ -432,12 +437,13 @@ def _handle_blocker_success(
 
 def _handle_blocker_failure(
     conn, workspace_id, task_id, reason,
-    actor, mutation, failed_key,
+    actor, mutation, failed_key, unblock_owner,
 ):
     payload = {
         "operation": "blocker",
         "task_id": task_id,
         "reason": reason,
+        "unblock_owner": unblock_owner,
         "mutation": mutation.to_dict(),
         "stderr": mutation.stderr,
         "exit_code": mutation.exit_code,
@@ -1225,6 +1231,8 @@ def mark_done_files(
             "mark_done_files requires either receipt evidence (normal path) "
             "or a non-empty repair_reason (repair-only path)"
         )
+
+    harness_root = str(resolve_harness_root(workspace_path, harness_root))
 
     # /opt guard — refuse to mutate deploy-derived copies
     if not allow_runtime_copy:

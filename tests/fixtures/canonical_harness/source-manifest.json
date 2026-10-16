@@ -7,9 +7,22 @@
     "harness_common.py": "23305f4339491db09791db3eadc5c532759423b1f493cf65bde15984f6fd7896",
     "workflow_transition.py": "29dbb7cdcb0622b26276312f15f1aaafb6727d21a05a7d4f54a06478b01f3ceb",
     "prepare_closeout_packet.py": "b6ba417f8e9edaadb451c5728478e7c1ad0a1793dd8e700f539898cdffaf42d4",
-    "build_harness_state.py": "b473a5051b1a0451269c4ff1631139fe8b482c9eaeabe6aee60611605e0fa14c",
-    "validate_checklist.py": "979236fdb8a82703caf33d9b61ef6250bd6001cc2cf3636044deedca59359d58"
+    "build_harness_state.py": "7a09ea3ad41f85731f9a428f049534db27036f131b6f9788d2e230507219ec79",
+    "validate_checklist.py": "979236fdb8a82703caf33d9b61ef6250bd6001cc2cf3636044deedca59359d58",
+    "prepare_blocker_packet.py": "cfb023181ecc99426cec3b0f5077f5fc7a48bf8f265b1de0438b39ded399b0f2"
   },
   "source_commit": "997559d164a4cf22f1556374b754a02f9873f863",
-  "source_directory": "skills/long-running-project-harness/references/scripts"
+  "source_directory": "skills/long-running-project-harness/references/scripts",
+  "additional_sources": {
+    "prepare_blocker_packet.py": {
+      "base_commit": "1c471a9d9187988286079487cde0d9d39467f107",
+      "change": "EXharness #33 recovery summary and effective BLOCKER target",
+      "reason": "Official Coordinate #13/#14 consumer parity"
+    },
+    "build_harness_state.py": {
+      "base_commit": "1c471a9d9187988286079487cde0d9d39467f107",
+      "change": "EXharness #33 recovery summary and effective BLOCKER target",
+      "reason": "Official Coordinate #13/#14 consumer parity"
+    }
+  }
 }

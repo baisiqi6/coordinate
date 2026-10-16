@@ -20,6 +20,7 @@ from .completion import (
     prepare_completion_receipt,
 )
 from .transitions import mark_done_files, mark_done_record
+from .checklist_io import resolve_harness_root
 from .cli_support import open_connection, print_json
 
 # Compatibility aliases so handlers read like the originals.
@@ -303,8 +304,10 @@ def _run_mark_done_files_receipt(args: argparse.Namespace, receipt_id: str) -> A
             reason="invalid_preflight",
         )
 
+    harness_root = str(resolve_harness_root(args.workspace_path, args.harness_root))
     fps = compute_mark_done_fingerprints(
-        harness_root=args.harness_root, task_id=claim_task,
+        harness_root=harness_root,
+        task_id=claim_task,
     )
 
     # Reserve: authorized -> claimed, recording before + expected-after. The
@@ -345,7 +348,7 @@ def _run_mark_done_files_receipt(args: argparse.Namespace, receipt_id: str) -> A
     )
     result = mark_done_files(
         workspace_path=args.workspace_path,
-        harness_root=args.harness_root,
+        harness_root=harness_root,
         task_id=claim_task,
         actor=args.actor,
         verification=args.verification,
