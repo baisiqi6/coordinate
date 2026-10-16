@@ -417,6 +417,19 @@ class WorkflowCLIBodyProofTests(unittest.TestCase):
                     canon, ensure_ascii=False, sort_keys=True, separators=(",", ":")
                 ).encode("utf-8")
                 actual_hash = hashlib.sha256(payload).hexdigest()
+                if name == "handle_assignment_blocker":
+                    # #13 adds exactly one forwarding keyword; preserve the original proof.
+                    self.assertEqual(actual_hash, "b53d8fd97427c52b705f019eb6a959fec41a1630494dda0e3a9d08177f92ab04")
+                    import copy
+                    original = copy.deepcopy(func)
+                    call = next(n for n in ast.walk(original) if isinstance(n, ast.Call)
+                                and isinstance(n.func, ast.Name) and n.func.id == "blocker_task")
+                    keyword = next(k for k in call.keywords if k.arg == "unblock_owner")
+                    self.assertEqual(ast.dump(keyword.value), ast.dump(ast.parse("args.unblock_owner", mode="eval").body))
+                    call.keywords.remove(keyword)
+                    payload = json.dumps(self._canonicalize(original), ensure_ascii=False,
+                                         sort_keys=True, separators=(",", ":")).encode("utf-8")
+                    actual_hash = hashlib.sha256(payload).hexdigest()
                 self.assertEqual(
                     actual_hash,
                     expected_hash,
@@ -723,7 +736,7 @@ class WorkflowCLIAssignmentDelegationTests(unittest.TestCase):
     def test_assignment_blocker_mutation_failure_returns_one(self) -> None:
         args = SimpleNamespace(
             workspace_id="ws1", task_id="t1", actor="operator",
-            reason="blocked", idempotency_hint=None,
+            reason="blocked", idempotency_hint=None, unblock_owner="human",
         )
         mutation = Mock(to_dict=Mock(return_value={"id": "m1"}))
         result = self._make_assignment_result(mutation=mutation, mutation_failed=True)

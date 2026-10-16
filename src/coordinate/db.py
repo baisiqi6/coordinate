@@ -1428,6 +1428,52 @@ def list_task_mirrors(conn: sqlite3.Connection, workspace_id: str | None = None)
     return conn.execute("SELECT * FROM tasks ORDER BY workspace_id, task_id").fetchall()
 
 
+def get_task_mirror(conn: sqlite3.Connection, workspace_id: str, task_id: str) -> sqlite3.Row | None:
+    return conn.execute(
+        "SELECT * FROM tasks WHERE workspace_id = ? AND task_id = ?",
+        (workspace_id, task_id),
+    ).fetchone()
+
+
+def list_task_recovery_events(
+    conn: sqlite3.Connection, workspace_id: str, task_id: str, *, limit: int = 21,
+) -> list[sqlite3.Row]:
+    """Read a bounded task ledger window, newest insertion first."""
+    return conn.execute(
+        """SELECT rowid AS event_rowid, * FROM events
+           WHERE workspace_id = ? AND task_id = ? ORDER BY rowid DESC LIMIT ?""",
+        (workspace_id, task_id, limit),
+    ).fetchall()
+
+
+def latest_task_assignment(
+    conn: sqlite3.Connection, workspace_id: str, task_id: str,
+) -> sqlite3.Row | None:
+    return conn.execute(
+        """SELECT rowid AS event_rowid, * FROM events
+           WHERE workspace_id = ? AND task_id = ? AND event_type = 'assignment.accepted'
+           ORDER BY rowid DESC LIMIT 1""",
+        (workspace_id, task_id),
+    ).fetchone()
+
+
+def latest_task_decision(
+    conn: sqlite3.Connection, workspace_id: str, task_id: str,
+) -> sqlite3.Row | None:
+    """Find explicitly declared feedback without a lifecycle-type whitelist.
+
+    json_type includes an explicit JSON null: malformed/unknown newer feedback
+    must remain visible instead of reviving an older approval.
+    """
+    return conn.execute(
+        """SELECT rowid AS event_rowid, * FROM events
+           WHERE workspace_id = ? AND task_id = ?
+             AND json_type(payload_json, '$.decision') IS NOT NULL
+           ORDER BY rowid DESC LIMIT 1""",
+        (workspace_id, task_id),
+    ).fetchone()
+
+
 @dataclass(frozen=True)
 class SplitOperation:
     operation_id: str

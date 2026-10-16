@@ -97,6 +97,7 @@
     "assignment mark-done-files",
     "assignment mark-done-record",
     "operator pending",
+    "operator task",
     "mcp serve",
     "runtime-http serve",
     "trace task",
@@ -105,8 +106,8 @@
   ],
   "metadata": {
     "default_db_path_sha256": "853182c0ba6a6dcd1e5a70dcb45bb3fcb80f31d53e26c28f29d4dae861a389b5",
-    "leaf_count": 102,
-    "node_count": 134,
+    "leaf_count": 103,
+    "node_count": 135,
     "prog": "coordinate",
     "top_level_commands": [
       "workspace",
@@ -10757,6 +10758,21 @@
           "action_class": "_StoreAction",
           "choices": null,
           "const": null,
+          "default": "human",
+          "dest": "unblock_owner",
+          "help": "Who must decide how to unblock the task (default: human)",
+          "metavar": null,
+          "nargs": null,
+          "option_strings": [
+            "--unblock-owner"
+          ],
+          "required": false,
+          "type": null
+        },
+        {
+          "action_class": "_StoreAction",
+          "choices": null,
+          "const": null,
           "default": null,
           "dest": "idempotency_hint",
           "help": null,
@@ -10772,7 +10788,7 @@
       "defaults": {
         "handler": "coordinate.workflow_cli.handle_assignment_blocker"
       },
-      "help": "usage: coordinate assignment blocker [-h] --task-id TASK_ID [--actor ACTOR] [--reason REASON]\n                                     [--idempotency-hint IDEMPOTENCY_HINT]\n                                     workspace_id\n\npositional arguments:\n  workspace_id\n\noptions:\n  -h, --help            show this help message and exit\n  --task-id TASK_ID\n  --actor ACTOR\n  --reason REASON\n  --idempotency-hint IDEMPOTENCY_HINT\n",
+      "help": "usage: coordinate assignment blocker [-h] --task-id TASK_ID [--actor ACTOR] [--reason REASON]\n                                     [--unblock-owner UNBLOCK_OWNER]\n                                     [--idempotency-hint IDEMPOTENCY_HINT]\n                                     workspace_id\n\npositional arguments:\n  workspace_id\n\noptions:\n  -h, --help            show this help message and exit\n  --task-id TASK_ID\n  --actor ACTOR\n  --reason REASON\n  --unblock-owner UNBLOCK_OWNER\n                        Who must decide how to unblock the task (default: human)\n  --idempotency-hint IDEMPOTENCY_HINT\n",
       "path": [
         "assignment",
         "blocker"
@@ -12032,7 +12048,8 @@
         {
           "action_class": "_SubParsersAction",
           "choices": [
-            "pending"
+            "pending",
+            "task"
           ],
           "const": null,
           "default": null,
@@ -12046,7 +12063,7 @@
         }
       ],
       "defaults": {},
-      "help": "usage: coordinate operator [-h] {pending} ...\n\npositional arguments:\n  {pending}\n    pending   List tasks awaiting operator action\n\noptions:\n  -h, --help  show this help message and exit\n",
+      "help": "usage: coordinate operator [-h] {pending,task} ...\n\npositional arguments:\n  {pending,task}\n    pending       List tasks awaiting operator action\n    task          Read-only recovery summary for one task\n\noptions:\n  -h, --help      show this help message and exit\n",
       "path": [
         "operator"
       ],
@@ -12093,6 +12110,61 @@
         "pending"
       ],
       "prog": "coordinate operator pending"
+    },
+    {
+      "actions": [
+        {
+          "action_class": "_HelpAction",
+          "choices": null,
+          "const": null,
+          "default": "==SUPPRESS==",
+          "dest": "help",
+          "help": "show this help message and exit",
+          "metavar": null,
+          "nargs": 0,
+          "option_strings": [
+            "-h",
+            "--help"
+          ],
+          "required": false,
+          "type": null
+        },
+        {
+          "action_class": "_StoreAction",
+          "choices": null,
+          "const": null,
+          "default": null,
+          "dest": "workspace_id",
+          "help": null,
+          "metavar": null,
+          "nargs": null,
+          "option_strings": [],
+          "required": true,
+          "type": null
+        },
+        {
+          "action_class": "_StoreAction",
+          "choices": null,
+          "const": null,
+          "default": null,
+          "dest": "task_id",
+          "help": null,
+          "metavar": null,
+          "nargs": null,
+          "option_strings": [],
+          "required": true,
+          "type": null
+        }
+      ],
+      "defaults": {
+        "handler": "coordinate.planning_cli.handle_operator_task"
+      },
+      "help": "usage: coordinate operator task [-h] workspace_id task_id\n\npositional arguments:\n  workspace_id\n  task_id\n\noptions:\n  -h, --help    show this help message and exit\n",
+      "path": [
+        "operator",
+        "task"
+      ],
+      "prog": "coordinate operator task"
     },
     {
       "actions": [

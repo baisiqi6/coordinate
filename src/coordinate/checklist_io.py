@@ -84,6 +84,14 @@ class ResolvedChecklist:
     kind: Literal["new", "legacy"]
 
 
+def resolve_harness_root(workspace_path: str | Path, harness_root: str | Path) -> Path:
+    """Resolve coding-host relative roots from their explicit workspace."""
+    root = Path(harness_root)
+    if not root.is_absolute():
+        root = Path(workspace_path) / root
+    return root.resolve()
+
+
 def checklist_candidates(harness_root: str | Path) -> dict[str, Path]:
     """Both possible checklist filenames; used by doctor for diagnosis only."""
     root = Path(harness_root)

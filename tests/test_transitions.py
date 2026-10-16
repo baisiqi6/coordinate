@@ -625,7 +625,7 @@ class BlockerTaskTests(unittest.TestCase):
         self.assertEqual(call["actor"], "operator")
         self.assertEqual(
             call["args"],
-            ["--actor", "operator", "--reason", "stuck on dependency"],
+            ["--actor", "operator", "--unblock-owner", "human", "--reason", "stuck on dependency"],
         )
 
     def test_success_without_reason_omits_reason_arg(self):
@@ -636,7 +636,7 @@ class BlockerTaskTests(unittest.TestCase):
 
         self.assertEqual(
             adapter.calls[0]["args"],
-            ["--actor", "operator"],
+            ["--actor", "operator", "--unblock-owner", "human"],
         )
 
     # --- success event ---
@@ -678,7 +678,7 @@ class BlockerTaskTests(unittest.TestCase):
 
         self.assertEqual(result.event["actor"], "codex")
         self.assertEqual(adapter.calls[0]["actor"], "codex")
-        self.assertEqual(adapter.calls[0]["args"], ["--actor", "codex"])
+        self.assertEqual(adapter.calls[0]["args"], ["--actor", "codex", "--unblock-owner", "human"])
 
     def test_success_payload_contains_required_fields(self):
         conn = self._make_conn()

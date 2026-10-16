@@ -6,7 +6,7 @@ import os
 import sys
 from pathlib import Path
 
-from .cli_support import open_connection, print_json
+from .cli_support import open_connection, open_readonly_connection, print_json
 from .db import append_event, list_events, row_to_dict
 from .handoff import prepare_handoff
 from .onboarding import (
@@ -19,7 +19,7 @@ from .onboarding import (
     create_plan_task_files,
     create_plan_task_record,
 )
-from .operator import list_pending_actions, pending_snapshot_metadata
+from .operator import build_task_summary, list_pending_actions, pending_snapshot_metadata
 from .plan_gate import approve_plan, reject_plan, review_request_plan
 from .split_operations import SplitOperationError
 from .task_dependencies import (
@@ -462,6 +462,13 @@ def handle_operator_pending(args: argparse.Namespace) -> int:
     return 0
 
 
+def handle_operator_task(args: argparse.Namespace) -> int:
+    with open_readonly_connection(args) as conn:
+        summary = build_task_summary(conn, args.workspace_id, args.task_id)
+    _print_json({"task_summary": summary})
+    return 0
+
+
 def register_planning_commands(subcommands) -> None:
     """Register the event, task, and plan parsers in their canonical positions."""
     event = subcommands.add_parser("event", help="Append or inspect normalized events")
@@ -730,3 +737,8 @@ def register_operator_command(subcommands) -> None:
     operator_pending = operator_subcommands.add_parser("pending", help="List tasks awaiting operator action")
     operator_pending.add_argument("workspace_id")
     operator_pending.set_defaults(handler=handle_operator_pending)
+
+    operator_task = operator_subcommands.add_parser("task", help="Read-only recovery summary for one task")
+    operator_task.add_argument("workspace_id")
+    operator_task.add_argument("task_id")
+    operator_task.set_defaults(handler=handle_operator_task)

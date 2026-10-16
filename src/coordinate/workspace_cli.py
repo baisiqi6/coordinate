@@ -257,7 +257,7 @@ def handle_workspace_host_profile_list(args: argparse.Namespace) -> int:
 
 
 def handle_state(args: argparse.Namespace) -> int:
-    with _conn(args) as conn:
+    with (_readonly_conn(args) if args.no_refresh else _conn(args)) as conn:
         workspace = get_workspace(conn, args.workspace_id)
     if workspace is None:
         print(f"error: unknown workspace: {args.workspace_id}", file=sys.stderr)
@@ -270,6 +270,8 @@ def handle_state(args: argparse.Namespace) -> int:
             "workspace": workspace.to_dict(),
             "state": state,
             "authoritative": fresh,
+            "authority_scope": "checklist_cache",
+            "coordinate_ledger_included": False,
             "stale_reasons": reasons,
         }
         _print_json(output)

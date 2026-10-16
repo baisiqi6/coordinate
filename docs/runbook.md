@@ -19,6 +19,28 @@ scripts/harness/harnessctl session-init
   或 task mirror，不联网。契约以 `coordinate trace --help` 与
   `src/coordinate/trace_projection.py` 为准。
 
+## 人工协调任务的只读恢复（Issue #14）
+
+`coordinate operator task WORKSPACE_ID TASK_ID` 输出 `task_summary`，从已有 task mirror
+和该任务的事件账本读取，不刷新文件、不迁移 DB、不创建 job；任务没有 job 或 PR 也可恢复。
+入口使用严格只读、existing-only 连接，缺 DB 或不兼容 schema 时拒绝执行。
+
+- `roles.current_executor` 只表示活动租约执行人；`last_executor` 引用历史 lease 或最近
+  `assignment.accepted`。`unblock_owner` 是解除阻塞人，三者不等于长期责任 Operator。
+- 没有明确责任来源时 `responsibility.state=unknown`，附原 plan/blocker packet 路径。
+  先核对这些约定；不要因为 owner=null 或责任未知重复派发。
+- `latest_feedback` 读取最新显式顶层 `decision`，包括人工 `domain.review` 等任意事件类型，
+  并展示摘要与 evidence locator。未知决策仍显示 unknown 与事件来源，不猜测授权或改 phase。
+- `recent_events` 最多 20 条，按 ledger 插入顺序；`snapshot.events_truncated` 明示截断。
+  最新显式反馈与历史受理独立查询，不会被窗口中的噪声遮蔽。摘要限 500 字符、locator 最多
+  8 条且每条限 512 字符，截断由 `truncated` 标记；完整证据仍以原事件/文件为准。
+- `snapshot` 分开记录 mirror 时间和最新 task ledger cursor。`mirror_may_be_stale=true`、
+  `harness_refreshed=false` 不表示实时文件已经校验。`operator pending=[]` 也不表示无阻塞或已完成。
+
+`state WORKSPACE_ID --no-refresh` 保留原 `authoritative` 含义，同时标记
+`authority_scope=checklist_cache`、`coordinate_ledger_included=false`：true 只证明缓存与
+当前 checklist 指纹一致，不证明已经包含最新领域反馈。发现新反馈后先读原事件，不自动提交或解阻塞。
+
 ## 本地 fresh install
 
 标准安装步骤：
@@ -570,6 +592,10 @@ Host-aware mark-done 将 coding host 对 resolver-selected canonical checklist
   它不会消费仅 `claimed` 的回执。
 
 ### 标准完成流程
+
+`mark-done-files` 的相对 `--harness-root` 以 `--workspace-path` 为基准，
+与调用命令的当前目录无关。指纹检查、文件写入和 runtime-copy 保护使用同一解析结果；
+绝对路径仍可用于仓库外的 sidecar harness。
 
 以下命令块是 legacy CLI/SSH compatibility 流程，仍可用于没有 Remote MCP principal 的环境：
 

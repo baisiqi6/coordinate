@@ -137,6 +137,10 @@ _R5B_CHANGED_FUNCTIONS = frozenset({
     "_lookup_receipt_for_preflight",
 })
 
+# #15 normalizes the coding-host root once, before fingerprint and mutation.
+_C15_CURRENT_HASHES = dict(_R5B_CURRENT_HASHES)
+_C15_CURRENT_HASHES["_run_mark_done_files_receipt"] = "7a27b97ca2e23bbdebe76299fe946c3795b51f1a51eed19a3ac9941aa2fe49f0"
+
 
 class CompletionCLIOwnershipTests(unittest.TestCase):
     """Ownership and alias tests for the P9-0A4a extraction."""
@@ -308,7 +312,7 @@ class CompletionCLIBodyProofTests(unittest.TestCase):
             node.name: node for node in ast.walk(tree)
             if isinstance(node, ast.FunctionDef)
         }
-        for name, expected_hash in _R5B_CURRENT_HASHES.items():
+        for name, expected_hash in _C15_CURRENT_HASHES.items():
             with self.subTest(name=name):
                 func = functions[name]
                 canon = self._canonicalize(func)
@@ -922,6 +926,31 @@ class CompletionCLIBodyProofTests(unittest.TestCase):
         ast.fix_missing_locations(func)
 
     @staticmethod
+    def _rewind_c15_delta(tree: ast.AST) -> ast.AST:
+        """Remove only #15's root normalization and its two call-site uses."""
+        import copy
+        rewound = copy.deepcopy(tree)
+        func = next(n for n in ast.walk(rewound) if isinstance(n, ast.FunctionDef)
+                    and n.name == "_run_mark_done_files_receipt")
+        expected = ast.parse("harness_root = str(resolve_harness_root(args.workspace_path, args.harness_root))").body[0]
+        assignments = [n for n in func.body if isinstance(n, ast.Assign)
+                       and any(isinstance(t, ast.Name) and t.id == "harness_root" for t in n.targets)]
+        if len(assignments) != 1 or ast.dump(assignments[0]) != ast.dump(expected):
+            raise AssertionError("unexpected #15 root normalization")
+        func.body.remove(assignments[0])
+        calls = [n for n in ast.walk(func) if isinstance(n, ast.Call)
+                 and isinstance(n.func, ast.Name)
+                 and n.func.id in {"compute_mark_done_fingerprints", "mark_done_files"}]
+        if len(calls) != 2:
+            raise AssertionError("unexpected #15 root consumers")
+        for call in calls:
+            keyword = next(k for k in call.keywords if k.arg == "harness_root")
+            if ast.dump(keyword.value) != ast.dump(ast.Name(id="harness_root", ctx=ast.Load())):
+                raise AssertionError("unexpected #15 root argument")
+            keyword.value = ast.parse("args.harness_root", mode="eval").body
+        return rewound
+
+    @staticmethod
     def _rewind_r5b_delta(tree: ast.AST) -> ast.AST:
         """Return a copy of *tree* with the R5B semantic delta removed.
 
@@ -941,7 +970,7 @@ class CompletionCLIBodyProofTests(unittest.TestCase):
         """
         import copy
 
-        rewound = copy.deepcopy(tree)
+        rewound = CompletionCLIBodyProofTests._rewind_c15_delta(tree)
         function_nodes = {
             node.name: node for node in ast.walk(rewound)
             if isinstance(node, ast.FunctionDef)
@@ -1080,6 +1109,13 @@ class CompletionCLIBodyProofTests(unittest.TestCase):
     def _load_completion_cli_ast(self) -> ast.AST:
         source = Path(coordinate.completion_cli.__file__).read_text(encoding="utf-8")
         return ast.parse(source)
+
+    def test_c15_delta_recovers_exact_r5b_hashes(self) -> None:
+        rewound = self._rewind_c15_delta(self._load_completion_cli_ast())
+        functions = {n.name: n for n in ast.walk(rewound) if isinstance(n, ast.FunctionDef)}
+        for name, expected in _R5B_CURRENT_HASHES.items():
+            with self.subTest(name=name):
+                self.assertEqual(self._hash_function(functions[name]), expected)
 
     def _find_function(self, tree: ast.AST, name: str) -> ast.FunctionDef:
         for node in ast.walk(tree):

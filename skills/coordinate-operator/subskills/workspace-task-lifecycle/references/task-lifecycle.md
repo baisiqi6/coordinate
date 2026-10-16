@@ -91,3 +91,19 @@ commit/deploy → `mark-done-record`。未知项目没有 exact-commit deploymen
 full reconcile 检查 workspace；`reconcile --task-id TASK` 只用于 completion receipt 已 consumed、目标 task
 只剩 mirror drift、且 checklist/state 已显式刷新时。它不能掩盖目标自身 branch/PR/publish conflict，也不
 修改 out-of-scope 历史 drift。部分失败按输出中的同一 operation/receipt 重放，不重新生成 authority。
+
+## 无历史会话恢复人工协调任务
+
+先运行 `coordinate operator task WORKSPACE TASK`：这是仅查询 task mirror 和 task-scoped ledger
+的严格只读入口，不 refresh harness、迁移 DB、创建 job 或改 phase。无需 runtime job / PR。
+查最新反馈用 `latest_feedback` 的显式 decision、summary、evidence_locators 与原事件 ID；领域
+review 的未知 decision 保持 unknown，不从自由文本猜 verdict 或下一条授权命令。
+
+当前活动执行人、历史受理人、解除阻塞人分开显示并附 source。`responsibility=unknown` 时读取
+原 plan/blocker packet 与 assignment 约定；不把 last_executor、事件作者或 unblock_owner 自动
+当作责任 Operator，不因 owner=null 重复派发。阻塞后释放 owner/session/lease 的现有语义不变。
+
+`recent_events` 为最近 20 条，截断显式标记；最新反馈与最近 assignment 独立查询，不受窗口
+噪声影响。mirror 时间与 ledger cursor 分开，清单 mirror 仍可能过时。空 pending 不是完成证明。
+`state --no-refresh` 中 `authoritative=true` 只在 `authority_scope=checklist_cache` 范围成立，
+`coordinate_ledger_included=false`，不能证明包含最新账本反馈。
