@@ -79,7 +79,7 @@ Coordinate 区分四个操作环境：
 - Event policy、delivery outbox 以及 Discord/KOOK/stdout 可见消息。
 - GitHub branch、PR、CI、review 与 merge gate 证据。
   - Operator pending、projection drift 和恢复诊断。
-- 面向 agent 的 MCP stdio / private Remote MCP 接口（共用 12 个 tool schema；包括窄的
+- 面向 agent 的 MCP stdio / private Remote MCP 接口（共用 15 个 tool schema；包括窄的
   `coordinate.channel_create` provisioning request）。
 - 面向 daemon/bridge/agentd 的 loopback runtime HTTP data plane（R2A：
   `coordinate runtime-http serve`，受认证的 7 个 use case，仅监听 loopback）。
@@ -169,6 +169,31 @@ coordinator_db_path = "/Users/<you>/projects/coordinate/data/coordinator.sqlite3
 - `coordinator_db_path` 必须是**绝对路径**，并且只能由当前这台宿主机上的进程访问；
 - 不要把本地 SQLite 文件挂载给多台宿主机共享，也不要使用相对路径依赖运行时当前目录；
 - 生产部署通常使用 `coord-ssh` / `coord-local` 这类 wrapper 做远程或受控调用，本地 console script 路径仅用于单台 coding host 的直接运行。
+
+## 项目频道工具
+
+现有 Remote MCP 增加 `coordinate.channel_read`、`coordinate.channel_send` 和
+`coordinate.channel_wait`。三个工具都使用 `{"input": {...}}`，要求 `workspace_id`、
+`channel_id`，且仅支持已绑定到该 workspace 的 Discord 普通服务器文字频道。
+服务端沿用现有 `DISCORD_BOT_TOKEN`；客户端不能指定发送身份、凭据、Agent 或桌面会话。
+
+认证 policy 必须显式授予对应 tool、workspace 与 `discord` platform。
+stdio 虽公布相同 schema，但缺少 Remote MCP principal 时拒绝这三个操作。
+read/wait 直接读取平台，不改已有任务、session、上下文缓存或共享已读位置。
+
+- `read`：默认最近 20 条；`after_cursor` 可读后续页，`limit` 为 1–100。
+  游标绑定 workspace/channel，调用者各自保存；不代表完整历史存档。
+- `send`：必填 `text` 和 `send_key`，可选同频道 `reply_to_message_id`。
+  正文不超过 1800 UTF-16 code units。相同 key 必须使用完全相同参数。
+  `delivery_uncertain` 表示可能已经发送；沿用原 key 查询，不能自动换 key 重发。
+- `wait`：必填 `after_cursor`，默认等待 20 秒，最多 30 秒。
+  正常到期返回 `status=timeout`；网络或权限错误不会冒充空消息。
+
+工具消息使用固定 content 标题与 embed 正文，禁用 mentions。
+`channel_io.v1` 投递由一次发送路径管理，通用 pump/recover 不会重发。
+升级时应先让所有发送/恢复进程采用此保护，再授予新工具权限。
+部署前用一条已知的非本 bot 消息验证正文可读；不能用空列表证明历史权限正常。
+这些工具不唤醒桌面会话；Codex/DSH 接入另作测试会话验收。
 
 ## 本地开发
 

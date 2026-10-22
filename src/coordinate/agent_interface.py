@@ -145,9 +145,13 @@ class AgentInterface:
         *,
         connection_factory: Callable[[], sqlite3.Connection],
         actor: str = "mcp",
+        channel_service: Any | None = None,
+        principal_provider: Callable[[], Any] | None = None,
     ) -> None:
         self._connection_factory = connection_factory
         self._actor = actor
+        self._channel_service = channel_service
+        self._principal_provider = principal_provider
         self._runtime = RuntimeInterface(
             connection_factory=connection_factory, actor=actor
         )
@@ -164,6 +168,33 @@ class AgentInterface:
             return initialize(db_path)
 
         return cls(connection_factory=_factory, actor=config.actor)
+
+    def _channel_context(self) -> tuple[Any, Any]:
+        principal = self._principal_provider() if self._principal_provider else None
+        if principal is None:
+            return None, None
+        if self._channel_service is None:
+            from .channel_messages import ChannelMessageService
+            self._channel_service = ChannelMessageService(self._connection_factory)
+        return self._channel_service, principal
+
+    def channel_read(self, input: dict[str, Any]) -> dict[str, Any]:
+        service, principal = self._channel_context()
+        if principal is None:
+            return error_envelope("forbidden", "forbidden")
+        return service.read(input, principal)
+
+    def channel_send(self, input: dict[str, Any]) -> dict[str, Any]:
+        service, principal = self._channel_context()
+        if principal is None:
+            return error_envelope("forbidden", "forbidden")
+        return service.send(input, principal)
+
+    async def channel_wait(self, input: dict[str, Any]) -> dict[str, Any]:
+        service, principal = self._channel_context()
+        if principal is None:
+            return error_envelope("forbidden", "forbidden")
+        return await service.wait(input, principal)
 
     # -- tool 1: operator_pending ------------------------------------------
 

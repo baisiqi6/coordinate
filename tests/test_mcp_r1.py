@@ -1554,6 +1554,9 @@ class MCPServerToolContractTests(unittest.TestCase):
         "coordinate.completion_apply",
         "coordinate.completion_consume",
         "coordinate.channel_create",
+        "coordinate.channel_read",
+        "coordinate.channel_send",
+        "coordinate.channel_wait",
     ]
 
     def setUp(self):
@@ -1588,11 +1591,11 @@ class MCPServerToolContractTests(unittest.TestCase):
         )
         self.server = build_mcp_server(interface)
 
-    def test_exactly_twelve_tools(self):
+    def test_exactly_fifteen_tools(self):
         tools = asyncio.run(self.server.list_tools())
         names = [t.name for t in tools]
         self.assertEqual(sorted(names), sorted(self.EXPECTED_TOOLS))
-        self.assertEqual(len(names), 12)
+        self.assertEqual(len(names), 15)
 
     def test_annotations_per_tool(self):
         tools = asyncio.run(self.server.list_tools())
@@ -2047,6 +2050,9 @@ class R5BShapeMiddlewareTests(unittest.TestCase):
                 "coordinate.completion_apply",
                 "coordinate.completion_consume",
                 "coordinate.channel_create",
+                "coordinate.channel_read",
+                "coordinate.channel_send",
+                "coordinate.channel_wait",
             }),
         )
         # The remote unwrap recognizes exactly the shared set.
@@ -2408,7 +2414,7 @@ class StdioSubprocessTests(unittest.TestCase):
             tools_message = json.loads(tools_line)
             self.assertEqual(tools_message.get("id"), 2)
             names = [t["name"] for t in tools_message["result"]["tools"]]
-            self.assertEqual(len(names), 12)
+            self.assertEqual(len(names), 15)
             self.assertEqual(sorted(names), sorted(MCPServerToolContractTests.EXPECTED_TOOLS))
         finally:
             self._assert_clean_stderr(proc)

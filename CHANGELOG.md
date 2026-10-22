@@ -1,5 +1,11 @@
 # 变更日志
 
+## [0.5.0] — 2026-10-21
+
+- 新增现有 Remote MCP 的项目频道 read/send/有界 wait，严格校验 principal 与 workspace/channel 授权，使用独立游标。
+- 发送复用 events/deliveries；同 key 改参报冲突，未知结果不自动重发。固定 content 与 embed 正文、禁用 mentions，隔离既有 handoff/report/lifecycle 解析。
+- 无 schema 迁移。升级所有发送/恢复进程以保护 channel_io.v1 后，再授予新工具权限。桌面自动唤醒不包含在本工具中。
+
 ## [0.4.4] — 2026-10-16
 
 - 修复 assignment blocker 未透传 --unblock-owner 的问题，默认仍为 human，保留解除阻塞权限和幂等规则。

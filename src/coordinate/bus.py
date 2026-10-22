@@ -12,6 +12,7 @@ from typing import Any, Callable, Protocol, TextIO
 
 from .db import (
     get_delivery,
+    is_channel_delivery,
     list_deliveries,
     mark_delivery_failed,
     mark_delivery_sending,
@@ -23,6 +24,10 @@ from .db import (
 
 class BusError(RuntimeError):
     pass
+
+
+class ChannelDeliveryRejected(BusError):
+    """The platform definitively rejected a one-shot request before delivery."""
 
 
 class MessageBus(Protocol):
@@ -65,6 +70,7 @@ class DiscordBus:
         self.token = token
         self.api_base = api_base.rstrip("/")
         self.http_post = http_post or post_json
+        self.channel_http_post = http_post or post_channel_json
 
     @classmethod
     def from_env(cls) -> "DiscordBus":
@@ -77,13 +83,22 @@ class DiscordBus:
         )
 
     def send(self, *, destination: str, payload: dict[str, Any], message_key: str) -> str:
+        channel_io = payload.get("purpose") == "channel_io.v1"
         body: dict[str, Any] = {
-            "content": discord_content(payload),
-            "allowed_mentions": {"parse": []},
+            "content": "[multinexus-channel]" if channel_io else discord_content(payload),
+            "allowed_mentions": {"parse": [], "replied_user": False} if channel_io else {"parse": []},
         }
         _add_embeds(body, payload)
-        response = self.http_post(
-            f"{self.api_base}/channels/{destination}/messages",
+        if channel_io and payload.get("reply_to_message_id") is not None:
+            body["message_reference"] = {
+                "message_id": payload["reply_to_message_id"],
+                "channel_id": destination,
+                "fail_if_not_exists": True,
+            }
+        post = self.channel_http_post if channel_io else self.http_post
+        api_base = "https://discord.com/api/v10" if channel_io else self.api_base
+        response = post(
+            f"{api_base}/channels/{destination}/messages",
             {
                 "Authorization": f"Bot {self.token}",
                 "Content-Type": "application/json",
@@ -216,6 +231,8 @@ def send_delivery(
     max_attempts: int = 3,
 ) -> SendDeliveryResult:
     delivery = get_delivery(conn, delivery_id)
+    if is_channel_delivery(delivery):
+        raise BusError("channel one-shot delivery cannot use generic send")
     if delivery["status"] not in {"pending", "failed"}:
         raise BusError(
             f"delivery {delivery_id} is {delivery['status']}; only pending/failed deliveries can be sent"
@@ -253,6 +270,7 @@ def pump_deliveries(
     pending = list_deliveries(conn, status="pending", platform=platform)
     retryable_failed = list_deliveries(conn, status="failed", platform=platform)
     retryable = pending + retryable_failed
+    retryable = [delivery for delivery in retryable if not is_channel_delivery(delivery)]
     if platform is None:
         # ``none`` is a durable audit sink used when another component already
         # delivered the visible reply.  An unscoped transport pump must not
@@ -341,4 +359,22 @@ def post_json(url: str, headers: dict[str, str], body: dict[str, Any]) -> dict[s
         raise BusError(f"http response was not valid JSON: {exc}") from exc
     if not isinstance(value, dict):
         raise BusError("http response must decode to an object")
+    return value
+
+
+def post_channel_json(url: str, headers: dict[str, str], body: dict[str, Any]) -> dict[str, Any]:
+    """One bounded POST; ambiguous failures deliberately remain unretryable."""
+    encoded = json.dumps(body, ensure_ascii=False).encode("utf-8")
+    request = urllib.request.Request(url, data=encoded, headers=headers, method="POST")
+    try:
+        with urllib.request.urlopen(request, timeout=5) as response:
+            value = json.loads(response.read().decode("utf-8"))
+    except urllib.error.HTTPError as exc:
+        if 400 <= exc.code < 500 and exc.code != 408:
+            raise ChannelDeliveryRejected("Discord rejected the channel message") from exc
+        raise BusError("Discord channel delivery outcome is unknown") from exc
+    except (urllib.error.URLError, TimeoutError, OSError, ValueError) as exc:
+        raise BusError("Discord channel delivery outcome is unknown") from exc
+    if not isinstance(value, dict):
+        raise BusError("Discord channel delivery outcome is unknown")
     return value

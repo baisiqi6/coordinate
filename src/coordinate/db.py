@@ -1270,6 +1270,9 @@ def recover_sending_deliveries(
         "SELECT * FROM deliveries WHERE " + " AND ".join(where) + " ORDER BY rowid",
         params,
     ).fetchall()
+    # One-shot sends may already exist on the platform. Recovery must never
+    # turn their ambiguous outcome into permission for a second POST.
+    rows = [row for row in rows if not is_channel_delivery(row)]
     now = utc_now()
     for row in rows:
         conn.execute(
@@ -1282,6 +1285,141 @@ def recover_sending_deliveries(
         )
     conn.commit()
     return [get_delivery(conn, row["id"]) for row in rows]
+
+
+def is_channel_delivery(delivery: sqlite3.Row | dict[str, Any]) -> bool:
+    return json.loads(delivery["payload_json"]).get("purpose") == "channel_io.v1"
+
+
+class ChannelIdempotencyConflict(ValueError):
+    pass
+
+
+class ChannelBindingForbidden(ValueError):
+    pass
+
+
+@dataclass(frozen=True)
+class ChannelDeliveryReservation:
+    delivery: sqlite3.Row
+    claimed: bool
+
+
+def inspect_channel_delivery(
+    conn: sqlite3.Connection, *, message_key: str, fingerprint: str,
+    workspace_id: str, platform: str, channel_id: str,
+) -> sqlite3.Row | None:
+    """Read a strict replay before validating a possibly deleted reply target."""
+    binding = resolve_channel_workspace(conn, platform=platform, channel_id=channel_id)
+    if binding is None or binding.workspace_id != workspace_id:
+        raise ChannelBindingForbidden("forbidden")
+    prior = conn.execute("SELECT * FROM deliveries WHERE message_key = ?", (message_key,)).fetchone()
+    if prior is not None:
+        existing = json.loads(prior["payload_json"])
+        if (existing.get("purpose") != "channel_io.v1"
+                or existing.get("fingerprint") != fingerprint
+                or prior["platform"] != platform or prior["destination"] != channel_id):
+            raise ChannelIdempotencyConflict("idempotency_conflict")
+    return prior
+
+
+def reserve_channel_delivery(
+    conn: sqlite3.Connection,
+    *,
+    actor: str,
+    workspace_id: str,
+    platform: str,
+    channel_id: str,
+    message_key: str,
+    fingerprint: str,
+    payload: dict[str, Any],
+) -> ChannelDeliveryReservation:
+    """Audit, create and claim exactly once in a short writer transaction.
+
+    Existing reservations, including pending or ambiguous sending rows, are
+    read-only replays. No caller is allowed to steal or retry their POST.
+    """
+    if conn.in_transaction:
+        raise ValueError("channel reservation requires a fresh connection")
+    conn.execute("BEGIN IMMEDIATE")
+    try:
+        prior = inspect_channel_delivery(
+            conn, message_key=message_key, fingerprint=fingerprint,
+            workspace_id=workspace_id, platform=platform, channel_id=channel_id,
+        )
+        if prior is not None:
+            conn.commit()
+            return ChannelDeliveryReservation(prior, False)
+        audit = append_event(
+            conn, event_type="channel.message.requested", actor=actor,
+            workspace_id=workspace_id, target=f"{platform}:{channel_id}",
+            idempotency_key=f"{message_key}:requested",
+            payload={"purpose": "channel_io.v1", "fingerprint": fingerprint}, commit=False,
+        )
+        if not audit.created:
+            # A matching delivery would already have returned above. An
+            # orphaned/conflicting audit is not authority for another POST.
+            raise ChannelIdempotencyConflict("idempotency_conflict")
+        row, created = create_delivery(
+            conn, platform=platform, destination=channel_id, message_key=message_key,
+            payload={**payload, "purpose": "channel_io.v1", "fingerprint": fingerprint,
+                     "actor": actor, "workspace_id": workspace_id},
+            event_id=audit.row["id"], commit=False,
+        )
+        if not created:
+            raise ChannelIdempotencyConflict("idempotency_conflict")
+        claimed = conn.execute(
+            "UPDATE deliveries SET status='sending', attempt_count=attempt_count+1, updated_at=? "
+            "WHERE id=? AND status='pending'", (utc_now(), row["id"]),
+        ).rowcount
+        if claimed != 1:
+            raise RuntimeError("channel delivery claim failed")
+        sending = get_delivery(conn, row["id"])
+        conn.commit()
+        return ChannelDeliveryReservation(sending, True)
+    except BaseException:
+        conn.rollback()
+        raise
+
+
+def finish_channel_delivery(
+    conn: sqlite3.Connection,
+    delivery_id: str,
+    *,
+    platform_message_id: str | None = None,
+    rejected: bool = False,
+) -> sqlite3.Row:
+    """Persist a definite channel result and its audit event atomically."""
+    if rejected == (platform_message_id is not None):
+        raise ValueError("exactly one channel outcome is required")
+    if conn.in_transaction:
+        raise ValueError("channel receipt requires a fresh connection")
+    conn.execute("BEGIN IMMEDIATE")
+    try:
+        row = get_delivery(conn, delivery_id)
+        if not is_channel_delivery(row) or row["status"] != "sending":
+            raise ValueError("channel delivery is not sending")
+        payload = json.loads(row["payload_json"])
+        outcome = "rejected" if rejected else "sent"
+        append_event(
+            conn, event_type=f"channel.message.{outcome}", actor=payload["actor"],
+            workspace_id=payload["workspace_id"], target=f"{row['platform']}:{row['destination']}",
+            causation_id=row["event_id"], idempotency_key=f"{row['message_key']}:{outcome}",
+            payload={"purpose": "channel_io.v1", "delivery_id": delivery_id,
+                     "platform_message_id": platform_message_id}, commit=False,
+        )
+        conn.execute(
+            "UPDATE deliveries SET status=?, platform_message_id=?, last_error=?, updated_at=? "
+            "WHERE id=? AND status='sending'",
+            ("dead" if rejected else "sent", platform_message_id,
+             "delivery_rejected" if rejected else None, utc_now(), delivery_id),
+        )
+        receipt = get_delivery(conn, delivery_id)
+        conn.commit()
+        return receipt
+    except BaseException:
+        conn.rollback()
+        raise
 
 
 def create_task_group(

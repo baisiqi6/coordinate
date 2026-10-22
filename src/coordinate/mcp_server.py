@@ -31,7 +31,7 @@ import json
 import logging
 from typing import Any, Callable
 
-from pydantic import BaseModel, ConfigDict
+from pydantic import BaseModel, ConfigDict, Field, ValidationError
 
 from . import __version__
 from .agent_interface import AgentInterface
@@ -49,6 +49,10 @@ TOOL_COMPLETION_CLAIM = "coordinate.completion_claim"
 TOOL_COMPLETION_APPLY = "coordinate.completion_apply"
 TOOL_COMPLETION_CONSUME = "coordinate.completion_consume"
 TOOL_CHANNEL_CREATE = "coordinate.channel_create"
+TOOL_CHANNEL_READ = "coordinate.channel_read"
+TOOL_CHANNEL_SEND = "coordinate.channel_send"
+TOOL_CHANNEL_WAIT = "coordinate.channel_wait"
+CHANNEL_IO_TOOLS = frozenset({TOOL_CHANNEL_READ, TOOL_CHANNEL_SEND, TOOL_CHANNEL_WAIT})
 
 TYPED_INPUT_TOOLS: frozenset[str] = frozenset(
     {
@@ -60,7 +64,7 @@ TYPED_INPUT_TOOLS: frozenset[str] = frozenset(
         TOOL_COMPLETION_CONSUME,
         TOOL_CHANNEL_CREATE,
     }
-)
+) | CHANNEL_IO_TOOLS
 
 # Single authority for the eleven tool names shared by stdio (R1) and the
 # remote streamable HTTP adapter (R3): registration, policy validation and
@@ -193,12 +197,44 @@ class ChannelCreateInput(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
 
+class ChannelScopeInput(BaseModel):
+    workspace_id: str
+    channel_id: str
+    platform: str = "discord"
+
+    model_config = ConfigDict(extra="forbid", strict=True)
+
+
+class ChannelReadInput(ChannelScopeInput):
+    after_cursor: str | None = None
+    limit: int = Field(default=20, ge=1, le=100)
+
+
+class ChannelSendInput(ChannelScopeInput):
+    text: str
+    send_key: str
+    reply_to_message_id: str | None = None
+
+
+class ChannelWaitInput(ChannelScopeInput):
+    after_cursor: str
+    limit: int = Field(default=20, ge=1, le=100)
+    timeout_seconds: int = Field(default=20, ge=0, le=30)
+
+
+_CHANNEL_INPUT_MODELS = {
+    TOOL_CHANNEL_READ: ChannelReadInput,
+    TOOL_CHANNEL_SEND: ChannelSendInput,
+    TOOL_CHANNEL_WAIT: ChannelWaitInput,
+}
+
+
 class Envelope(BaseModel):
     """Stable R1 envelope published as every tool's output schema."""
 
     ok: bool
     data: Any | None
-    error: dict[str, str] | None
+    error: dict[str, Any] | None
 
 
 # Shared typed-input call-shape gate (one registration for stdio and remote).
@@ -212,10 +248,14 @@ _R5B_SHAPE_ERROR_ENVELOPE: dict[str, Any] = {
 }
 
 
-def _r5b_shape_error_result() -> Any:
+def _r5b_shape_error_result(tool_name: str | None = None) -> Any:
     from mcp.types import CallToolResult, TextContent
 
     envelope = dict(_R5B_SHAPE_ERROR_ENVELOPE)
+    if tool_name in CHANNEL_IO_TOOLS:
+        envelope = {"ok": False, "data": None, "error": {
+            "code": "invalid_input", "message": "invalid input",
+        }}
     return CallToolResult(
         content=[
             TextContent(
@@ -247,9 +287,14 @@ async def _typed_shape_middleware(ctx: Any, call_next: Callable[[Any], Any]) -> 
         return await call_next(ctx)
     arguments = params.get("arguments")
     if not isinstance(arguments, dict) or set(arguments) != {"input"}:
-        return _r5b_shape_error_result()
+        return _r5b_shape_error_result(name)
     if not isinstance(arguments.get("input"), dict):
-        return _r5b_shape_error_result()
+        return _r5b_shape_error_result(name)
+    if name in _CHANNEL_INPUT_MODELS:
+        try:
+            _CHANNEL_INPUT_MODELS[name].model_validate(arguments["input"])
+        except ValidationError:
+            return _r5b_shape_error_result(name)
     return await call_next(ctx)
 
 
@@ -332,6 +377,11 @@ def build_mcp_server(
         read_only_hint=False,
         destructive_hint=False,
         idempotent_hint=True,
+        open_world_hint=True,
+    )
+    channel_read_annotations = ToolAnnotations(
+        title="Read Discord channel messages",
+        read_only_hint=True,
         open_world_hint=True,
     )
 
@@ -480,6 +530,35 @@ def build_mcp_server(
                 idempotency_key=input.idempotency_key,
             ),
         )
+        return _result(envelope)
+
+    @server.tool(name=TOOL_CHANNEL_READ, title="Read bound Discord channel",
+                 description="Read a recent or forward page of platform messages. Requires an authenticated remote principal and an exact workspace channel binding.",
+                 annotations=channel_read_annotations)
+    def channel_read(input: ChannelReadInput) -> Envelope:
+        return _result(_guarded_call(
+            TOOL_CHANNEL_READ,
+            lambda: _current_interface().channel_read(input.model_dump(exclude_none=True)),
+        ))
+
+    @server.tool(name=TOOL_CHANNEL_SEND, title="Send one channel message",
+                 description="Send one bounded text message using a required send_key. Reuse that key to inspect uncertain outcomes; never automatically replay with a fresh key.",
+                 annotations=provision)
+    def channel_send(input: ChannelSendInput) -> Envelope:
+        return _result(_guarded_call(
+            TOOL_CHANNEL_SEND,
+            lambda: _current_interface().channel_send(input.model_dump(exclude_none=True)),
+        ))
+
+    @server.tool(name=TOOL_CHANNEL_WAIT, title="Wait for channel messages",
+                 description="Wait at most 30 seconds for messages after the caller's cursor. No subscription, task, session wakeup, or persistent read position is created.",
+                 annotations=channel_read_annotations)
+    async def channel_wait(input: ChannelWaitInput) -> Envelope:
+        try:
+            envelope = await _current_interface().channel_wait(input.model_dump(exclude_none=True))
+        except Exception:
+            logger.exception("unexpected error in MCP tool %s", TOOL_CHANNEL_WAIT)
+            envelope = dict(_INTERNAL_ENVELOPE)
         return _result(envelope)
 
     # -- R5B: task create record half + completion receipt lifecycle ---------
