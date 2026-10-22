@@ -53,7 +53,7 @@ from dataclasses import dataclass, field
 from typing import Any, Callable
 
 from .agent_interface import AgentInterface
-from .mcp_server import MCP_TOOL_NAMES, TOOL_CHANNEL_CREATE, TYPED_INPUT_TOOLS
+from .mcp_server import MCP_TOOL_NAMES, TOOL_CHANNEL_CREATE, TYPED_INPUT_TOOLS, CHANNEL_IO_TOOLS
 from .policy_common import (
     AuthPolicyError,
     constant_time_digest_equals,
@@ -92,7 +92,7 @@ _WORKSPACE_SCOPED_TOOLS = frozenset(
         "coordinate.completion_consume",
         TOOL_CHANNEL_CREATE,
     }
-)
+) | CHANNEL_IO_TOOLS
 
 def _typed_input_args(name: str, args: dict[str, Any]) -> dict[str, Any] | None:
     """Unwrap the single typed ``input`` argument of an R5B tool.
@@ -303,6 +303,8 @@ def load_mcp_auth_policy(path: str) -> McpAuthPolicy:
 
 def make_interface_provider(
     connection_factory: Callable[[], Any],
+    *,
+    channel_service: Any | None = None,
 ) -> Callable[[], AgentInterface]:
     """Build the request-scoped facade provider for ``build_mcp_server``.
 
@@ -311,6 +313,10 @@ def make_interface_provider(
     and the shared must-exist connection factory.
     """
 
+    if channel_service is None:
+        from .channel_messages import ChannelMessageService
+        channel_service = ChannelMessageService(connection_factory)
+
     def _provider() -> AgentInterface:
         principal = get_request_principal()
         if principal is None:
@@ -318,7 +324,8 @@ def make_interface_provider(
                 "remote MCP tool invoked without an authenticated principal"
             )
         return AgentInterface(
-            connection_factory=connection_factory, actor=principal.actor
+            connection_factory=connection_factory, actor=principal.actor,
+            channel_service=channel_service, principal_provider=get_request_principal,
         )
 
     return _provider
@@ -746,6 +753,12 @@ def build_remote_mcp_app(
                     return _forbidden_result()
             if name == TOOL_CHANNEL_CREATE and "discord" not in principal.platforms:
                 return _forbidden_result()
+            if name in CHANNEL_IO_TOOLS:
+                platform = args.get("platform", "discord")
+                if not isinstance(platform, str) or platform not in principal.platforms:
+                    return _forbidden_result()
+                # The channel service owns exact binding checks. In particular,
+                # wait must reserve capacity and start its deadline before DB IO.
             if name == "coordinate.runtime_request_submit":
                 denied = await _submit_denied(principal, args)
                 if denied is not None:

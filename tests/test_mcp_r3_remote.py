@@ -884,7 +884,7 @@ class RemoteMCPAppIntegrationTests(unittest.TestCase):
 
         remote_tools = asyncio.run(_dump(server_remote))
         stdio_tools = asyncio.run(_dump(server_stdio))
-        self.assertEqual(len(remote_tools), 12)
+        self.assertEqual(len(remote_tools), 15)
         self.assertEqual(
             sorted(t["name"] for t in remote_tools),
             sorted(t["name"] for t in stdio_tools),
