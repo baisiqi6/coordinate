@@ -1,5 +1,12 @@
 # 变更日志
 
+## [0.6.0] — 2026-10-22
+
+- 新增 Agent 实例绑定的身份切片：认证 principal 固定 canonical Agent/Bot；频道 read/send/有界 wait 使用各自的凭据上下文，核对实际 Bot 身份和发送结果 author。
+- 频道工具升级后要求显式配置 `channel_agent_id` 及服务端身份凭据映射；缺失或不匹配时拒绝操作，不回退全局 Bot。非频道工具继续兼容。
+- 发送回执保留身份快照；旧记录不改写归属，未知结果和身份漂移不自动重发。无 schema 迁移，不新增队列或数据库。
+- 原生桌面往返、真实 Discord author 与 Windows 验收仍需独立执行；源码测试和发布不构成这些验收。
+
 ## [0.5.0] — 2026-10-21
 
 - 新增现有 Remote MCP 的项目频道 read/send/有界 wait，严格校验 principal 与 workspace/channel 授权，使用独立游标。

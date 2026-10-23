@@ -175,7 +175,8 @@ coordinator_db_path = "/Users/<you>/projects/coordinate/data/coordinator.sqlite3
 现有 Remote MCP 增加 `coordinate.channel_read`、`coordinate.channel_send` 和
 `coordinate.channel_wait`。三个工具都使用 `{"input": {...}}`，要求 `workspace_id`、
 `channel_id`，且仅支持已绑定到该 workspace 的 Discord 普通服务器文字频道。
-服务端沿用现有 `DISCORD_BOT_TOKEN`；客户端不能指定发送身份、凭据、Agent 或桌面会话。
+服务端通过认证 policy 的 `channel_agent_id` 固定发送 Agent；客户端不能指定发送身份、凭据、Agent 或桌面会话。
+新操作不会回退到 `DISCORD_BOT_TOKEN`。
 
 认证 policy 必须显式授予对应 tool、workspace 与 `discord` platform。
 stdio 虽公布相同 schema，但缺少 Remote MCP principal 时拒绝这三个操作。
@@ -194,6 +195,47 @@ read/wait 直接读取平台，不改已有任务、session、上下文缓存或
 升级时应先让所有发送/恢复进程采用此保护，再授予新工具权限。
 部署前用一条已知的非本 bot 消息验证正文可读；不能用空列表证明历史权限正常。
 这些工具不唤醒桌面会话；Codex/DSH 接入另作测试会话验收。
+
+### 服务端频道身份配置
+
+在现有 auth policy client 条目增加可选字段 `"channel_agent_id": "example-agent"`。
+它必须与 canonical Agent registry ID 相同；桌面 executor ID 不等同于此 ID。
+省略或设为 null 不影响已有非频道工具，但不允许新的频道 read/send/wait。
+
+服务进程设置 `COORDINATE_CHANNEL_IDENTITIES_FILE=/absolute/service/channel-identities.json`：
+
+```json
+{
+  "version": 1,
+  "registry_path": "/absolute/deployment/agent-registry.toml",
+  "credentials": {
+    "example-agent": {"token_file": "/absolute/service/secrets/example-agent"}
+  }
+}
+```
+
+这里只保存凭据文件引用。Bot ID 从已有 `parse_agents_toml` 读取的 canonical registry
+获得，要求有效的 `[registry]` id/version/hash、无解析错误、唯一 Discord ID 且 Agent enabled。
+旧 registry 条目省略 `enabled` 时默认 true。配置拒绝未知/重复 JSON key、相对路径及内联 token。
+配置与 token 文件须为服务用户或 root 拥有的普通私有文件（例如 mode 0600）。
+服务启动时验证并冻结配置和 registry；变更须受控重启。缺少配置仅禁用新的频道操作，
+配置损坏则启动失败。Token 在每次新操作开始读取一次，read/send/wait 同一操作始终使用该 token。
+
+每个新操作先以 `GET /users/@me` 校验实际 Bot ID 和 bot 标记，再查频道权限。
+发送还必须核对 POST 响应 author 后才记录 sent。`sender_unbound` 表示 policy 未绑定；
+`sender_unavailable` 表示配置、凭据或身份查询不可用；`sender_identity_mismatch` 表示实际身份不符。
+这些错误均不发送。POST 后无法确认作者或保存结果时返回 `delivery_uncertain`，只能用原 key 查询。
+
+新 receipt 增加 `sender_identity`、`actual_author_bot_id`、`identity_status`、`binding_current`。
+身份 snapshot 包含 version、client_id、agent_id、discord_user_id，以及 registry_source_id/version/hash；
+不含凭据引用。仅确认 sent 才标记 verified；未知/拒绝结果为 unconfirmed。
+重放先检查已有授权和 ledger，不读 token 或访问 Discord。当前 client/Agent/Bot tuple 变化或解绑时，
+返回 `idempotency_conflict` 和原 receipt，`binding_current=false`；token 轮换或无关 roster 更新不改变 key。
+历史无 snapshot 行保持原样，并显示 `legacy_unattributed`，不追认其发送身份。
+通用 outbox 仍不能重试频道行。
+
+固定入口和 mode 0600 不提供同一 Unix UID 下的恶意进程隔离。实际部署、服务重启、凭据采用
+及真实频道作者 ID 验收仍是独立操作，不由本地测试代替。
 
 ## 本地开发
 

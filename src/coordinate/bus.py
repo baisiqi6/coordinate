@@ -66,7 +66,9 @@ class DiscordBus:
         token: str,
         api_base: str = "https://discord.com/api/v10",
         http_post: HttpPost | None = None,
+        expected_bot_id: str | None = None,
     ) -> None:
+        self._expected_bot_id = expected_bot_id
         self.token = token
         self.api_base = api_base.rstrip("/")
         self.http_post = http_post or post_json
@@ -84,6 +86,10 @@ class DiscordBus:
 
     def send(self, *, destination: str, payload: dict[str, Any], message_key: str) -> str:
         channel_io = payload.get("purpose") == "channel_io.v1"
+        snapshot = payload.get("sender_identity") if channel_io else None
+        if channel_io and (snapshot is not None or self._expected_bot_id is not None):
+            if not isinstance(snapshot, dict) or snapshot.get("discord_user_id") != self._expected_bot_id:
+                raise BusError("channel sender binding does not match transport")
         body: dict[str, Any] = {
             "content": "[multinexus-channel]" if channel_io else discord_content(payload),
             "allowed_mentions": {"parse": [], "replied_user": False} if channel_io else {"parse": []},
@@ -106,6 +112,13 @@ class DiscordBus:
             },
             body,
         )
+        if channel_io and snapshot is not None:
+            from .discord_history import _snowflake
+            author = response.get("author")
+            if (not isinstance(author, dict) or author.get("id") != self._expected_bot_id
+                    or author.get("bot") is not True):
+                raise BusError("channel response author is unconfirmed")
+            _snowflake(response.get("id"))
         message_id = response.get("id")
         if not message_id:
             raise BusError("discord response did not include message id")
