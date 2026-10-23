@@ -7,7 +7,8 @@ import re
 from dataclasses import dataclass
 from typing import Any, Callable
 
-from .bus import ChannelDeliveryRejected, DiscordBus, MessageBus
+from .bus import ChannelDeliveryRejected, MessageBus
+from .channel_identity import ChannelIdentityResolver, MESSAGES
 from .db import (
     ChannelBindingForbidden, ChannelIdempotencyConflict, finish_channel_delivery,
     inspect_channel_delivery, reserve_channel_delivery, resolve_channel_workspace,
@@ -15,6 +16,7 @@ from .db import (
 
 _FORMAT_VERSION = "channel_io.v1"
 _MESSAGES = {
+    **MESSAGES,
     "invalid_input": "invalid input",
     "forbidden": "forbidden",
     "unsupported_platform": "unsupported platform",
@@ -96,42 +98,68 @@ def _authorize(request: _SendInput, principal: Any, connection_factory: Callable
         conn.close()
 
 
-def _identity(request: _SendInput, actor: str) -> tuple[str, str]:
+def _identity(request: _SendInput, actor: str, sender_identity: dict | None = None) -> tuple[str, str]:
     scope = [actor, request.workspace_id, request.platform, request.channel_id]
-    return ("channel-io:" + _hash([*scope, request.send_key]),
-            _hash([*scope, request.text, request.reply_to_message_id, _FORMAT_VERSION]))
+    content = [*scope, request.text, request.reply_to_message_id, _FORMAT_VERSION]
+    if sender_identity is not None:
+        content.append([sender_identity[key] for key in ("client_id", "agent_id", "discord_user_id")])
+    return ("channel-io:" + _hash([*scope, request.send_key]), _hash(content))
 
 
-def _receipt(row: Any, *, replayed: bool) -> dict[str, Any]:
-    if row["status"] == "sent" and row["platform_message_id"]:
-        return {"ok": True, "data": {
-            "delivery_id": row["id"], "message_id": row["platform_message_id"].removeprefix("discord:"),
-            "status": "sent", "replayed": replayed,
-        }, "error": None}
-    if row["status"] == "dead":
-        return _error("delivery_rejected", {"delivery_id": row["id"], "status": "rejected"})
-    return _error("delivery_uncertain", {"delivery_id": row["id"], "status": "unknown"})
+def _receipt(row: Any, *, replayed: bool, binding_current: bool = False) -> dict[str, Any]:
+    snapshot = json.loads(row["payload_json"]).get("sender_identity")
+    sent = row["status"] == "sent" and bool(row["platform_message_id"])
+    data = {
+        "delivery_id": row["id"],
+        "message_id": row["platform_message_id"].removeprefix("discord:") if sent else None,
+        "status": "sent" if sent else "rejected" if row["status"] == "dead" else "unknown",
+        "replayed": replayed,
+        "sender_identity": snapshot,
+        "actual_author_bot_id": snapshot["discord_user_id"] if snapshot and sent else None,
+        "identity_status": "legacy_unattributed" if snapshot is None else "verified" if sent else "unconfirmed",
+        "binding_current": binding_current if snapshot else False,
+    }
+    if sent:
+        return {"ok": True, "data": data, "error": None}
+    return _error("delivery_rejected" if row["status"] == "dead" else "delivery_uncertain", data)
 
 
 class ChannelSender:
-    def __init__(self, connection_factory: Callable, history: Any = None, bus: MessageBus | None = None):
+    def __init__(self, connection_factory: Callable, history: Any = None, bus: MessageBus | None = None, *, identity_resolver=None):
         self.connection_factory = connection_factory
         self.history = history
         self.bus = bus
+        self.identity_resolver = identity_resolver if identity_resolver is not None else ChannelIdentityResolver.from_env()
 
     def send(self, input: dict[str, Any], principal: Any) -> dict[str, Any]:
-        """Reserve once, release SQLite, POST once, and durably save the result."""
+        """Inspect without transport; otherwise reserve once and POST in one context."""
         if principal is None:
             return _error("forbidden")
         try:
             request = _parse_input(input)
             _authorize(request, principal, self.connection_factory)
-            history = self._validate_channel(request)
-            replay = self._inspect(request, principal.actor)
+            # Historical explicitly injected fixtures retain their legacy contract.
+            legacy = self.history is not None and self.bus is not None and getattr(principal, "channel_agent_id", None) is None
+            if legacy:
+                self._validate_channel(request, self.history)
+            replay = self._inspect(request, principal)
             if replay is not None:
-                return _receipt(replay, replayed=True)
+                return replay
+            context = None if legacy else self.identity_resolver.resolve(principal)
+            history = self.history if legacy else context.history
+            adapter = self.bus if legacy else context.bus
+            snapshot = None if legacy else context.sender_identity.snapshot()
+            if not legacy:
+                self._validate_channel(request, history)
             self._validate_reply(request, history)
-            reservation = self._reserve(request, principal.actor)
+            try:
+                reservation = self._reserve(request, principal.actor, snapshot)
+            except ChannelIdempotencyConflict:
+                # A different binding/content may have won since the first inspection.
+                replay = self._inspect(request, principal)
+                if replay is not None:
+                    return replay
+                raise
         except (_InputError, ChannelBindingForbidden, ChannelIdempotencyConflict) as exc:
             code = getattr(exc, "code", None)
             if isinstance(exc, ChannelBindingForbidden):
@@ -143,19 +171,19 @@ class ChannelSender:
             return _error(getattr(exc, "code", "upstream_unavailable")
                           if getattr(exc, "code", "") in _MESSAGES else "upstream_unavailable")
         if not reservation.claimed:
-            return _receipt(reservation.delivery, replayed=True)
-        return self._post_reserved(reservation.delivery)
+            return self._row_receipt(reservation.delivery, principal, replayed=True)
+        return self._post_reserved(reservation.delivery, adapter, principal)
 
-    def _validate_channel(self, request: _SendInput) -> Any:
-        history = self.history
-        if history is None:
-            from .discord_history import DiscordHistory
-            history = DiscordHistory.from_env()
+    def _row_receipt(self, row, principal, *, replayed):
+        snapshot = json.loads(row["payload_json"]).get("sender_identity")
+        return _receipt(row, replayed=replayed,
+                        binding_current=self.identity_resolver.binding_current(principal, snapshot))
+
+    def _validate_channel(self, request: _SendInput, history: Any) -> None:
         validate = getattr(history, "validate_send_channel", None) or getattr(history, "validate_channel", None)
         if validate is None:
             raise _InputError("upstream_unavailable")
         validate(request.channel_id, timeout=5)
-        return history
 
     def _validate_reply(self, request: _SendInput, history: Any) -> None:
         if request.reply_to_message_id is not None:
@@ -164,20 +192,34 @@ class ChannelSender:
                     or reply.get("id") != request.reply_to_message_id):
                 raise _InputError("invalid_input")
 
-    def _inspect(self, request: _SendInput, actor: str):
-        key, fingerprint = _identity(request, actor)
+    def _inspect(self, request: _SendInput, principal: Any):
+        key, _ = _identity(request, principal.actor)
         conn = self.connection_factory()
         try:
-            return inspect_channel_delivery(conn, message_key=key, fingerprint=fingerprint,
-                                            workspace_id=request.workspace_id,
-                                            platform=request.platform, channel_id=request.channel_id)
+            row = conn.execute("SELECT * FROM deliveries WHERE message_key = ?", (key,)).fetchone()
+            if row is None:
+                return None
+            snapshot = json.loads(row["payload_json"]).get("sender_identity")
+            _, fingerprint = _identity(request, principal.actor, snapshot)
+            receipt = self._row_receipt(row, principal, replayed=True)
+            try:
+                inspect_channel_delivery(conn, message_key=key, fingerprint=fingerprint,
+                                         workspace_id=request.workspace_id,
+                                         platform=request.platform, channel_id=request.channel_id)
+            except ChannelIdempotencyConflict:
+                return _error("idempotency_conflict", receipt["data"])
+            if snapshot is not None and not receipt["data"]["binding_current"]:
+                return _error("idempotency_conflict", receipt["data"])
+            return receipt
         finally:
             conn.close()
 
-    def _reserve(self, request: _SendInput, actor: str):
-        key, fingerprint = _identity(request, actor)
+    def _reserve(self, request: _SendInput, actor: str, snapshot: dict | None):
+        key, fingerprint = _identity(request, actor, snapshot)
         payload = {"text": "[multinexus-channel]", "embeds": [{"description": request.text}],
                    "reply_to_message_id": request.reply_to_message_id}
+        if snapshot is not None:
+            payload["sender_identity"] = snapshot
         conn = self.connection_factory()
         try:
             return reserve_channel_delivery(
@@ -188,22 +230,21 @@ class ChannelSender:
         finally:
             conn.close()
 
-    def _post_reserved(self, row: Any) -> dict[str, Any]:
+    def _post_reserved(self, row: Any, adapter: MessageBus, principal: Any) -> dict[str, Any]:
         rejected = False
         platform_message_id = None
         try:
-            adapter = self.bus or DiscordBus.from_env()
             platform_message_id = adapter.send(
                 destination=row["destination"], payload=json.loads(row["payload_json"]),
                 message_key=row["message_key"],
             )
             if (not isinstance(platform_message_id, str)
                     or not re.fullmatch(r"discord:[0-9]{1,20}", platform_message_id)):
-                return _receipt(row, replayed=False)
+                return self._row_receipt(row, principal, replayed=False)
         except ChannelDeliveryRejected:
             rejected = True
         except Exception:
-            return _receipt(row, replayed=False)
+            return self._row_receipt(row, principal, replayed=False)
         try:
             conn = self.connection_factory()
             try:
@@ -212,8 +253,8 @@ class ChannelSender:
             finally:
                 conn.close()
         except Exception:
-            return _receipt(row, replayed=False)
-        return _receipt(saved, replayed=False)
+            return self._row_receipt(row, principal, replayed=False)
+        return self._row_receipt(saved, principal, replayed=False)
 
 
 def send_channel_message(input, principal, connection_factory, history=None, bus=None):

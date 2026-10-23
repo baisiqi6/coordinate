@@ -12,7 +12,8 @@ from contextlib import closing
 from typing import Any, Callable
 
 from coordinate import db
-from coordinate.discord_history import DiscordHistory, DiscordHistoryDeadline, DiscordHistoryError, _snowflake
+from coordinate.channel_identity import ChannelIdentityResolver
+from coordinate.discord_history import DiscordHistoryDeadline, DiscordHistoryError, _snowflake
 
 Envelope = dict[str, Any]
 _COMMON = {"workspace_id", "platform", "channel_id"}
@@ -81,19 +82,21 @@ def _input(value: dict, operation: str) -> dict:
 
 
 class ChannelMessageService:
-    def __init__(self, connection_factory: Callable, history=None, sender=None, *, clock: Callable = time.monotonic, sleep: Callable = asyncio.sleep):
+    def __init__(self, connection_factory: Callable, history=None, sender=None, *, clock: Callable = time.monotonic, sleep: Callable = asyncio.sleep, identity_resolver=None):
         self._connection_factory = connection_factory
         self._history_adapter = history
         self._sender = sender
+        self._identity_resolver = identity_resolver if identity_resolver is not None else ChannelIdentityResolver.from_env()
         self._clock, self._sleep = clock, sleep
         self._wait_lock = threading.Lock()
         self._wait_total = 0
         self._wait_principals: dict[str, int] = {}
 
-    def _history(self):
-        if self._history_adapter is None:
-            self._history_adapter = DiscordHistory.from_env()
-        return self._history_adapter
+    def _history(self, principal=None):
+        # Trusted explicit legacy history injection is only for unbound fixtures.
+        if self._history_adapter is not None and getattr(principal, "channel_agent_id", None) is None:
+            return self._history_adapter
+        return self._identity_resolver.resolve(principal).history
 
     def _authorize_grants(self, request: dict, principal, operation: str) -> None:
         if principal is None or f"coordinate.channel_{operation}" not in principal.tools or request["workspace_id"] not in principal.workspace_ids or request["platform"] not in principal.platforms:
@@ -106,8 +109,8 @@ class ChannelMessageService:
         if binding is None or binding.workspace_id != request["workspace_id"]:
             raise DiscordHistoryError("forbidden", "Forbidden.")
 
-    def _page(self, request: dict, timeout: float) -> dict:
-        return self._history().read_page(request["channel_id"], after_message_id=request.get("after_message_id"), limit=request["limit"], timeout=timeout)
+    def _page(self, request: dict, timeout: float, history) -> dict:
+        return history.read_page(request["channel_id"], after_message_id=request.get("after_message_id"), limit=request["limit"], timeout=timeout)
 
     def _result(self, request: dict, page: dict) -> Envelope:
         messages = page["messages"]
@@ -118,7 +121,8 @@ class ChannelMessageService:
         try:
             request = _input(input, "read")
             self._authorize(request, principal, "read")
-            page = self._page(request, 30)
+            history = self._history(principal)
+            page = self._page(request, 30, history)
             self._authorize(request, principal, "read")
             return self._result(request, page)
         except DiscordHistoryError as exc:
@@ -130,7 +134,7 @@ class ChannelMessageService:
             self._authorize(request, principal, "send")
             if self._sender is None:
                 from coordinate.channel_delivery import ChannelSender
-                self._sender = ChannelSender(self._connection_factory, history=self._history_adapter)
+                self._sender = ChannelSender(self._connection_factory, history=self._history_adapter, identity_resolver=self._identity_resolver)
             return self._sender.send(input, principal)
         except DiscordHistoryError as exc:
             return _failure(exc)
@@ -165,7 +169,7 @@ class ChannelMessageService:
         if self._clock() > deadline:
             raise DiscordHistoryDeadline()
 
-    async def _wait_loop(self, request: dict, principal, deadline: float) -> Envelope:
+    async def _wait_loop(self, request: dict, principal, deadline: float, history) -> Envelope:
         first = True
         result = None
         while True:
@@ -180,7 +184,7 @@ class ChannelMessageService:
                 if budget <= 0:
                     raise DiscordHistoryDeadline()
                 try:
-                    page = await asyncio.wait_for(asyncio.to_thread(self._page, request, budget), timeout=budget)
+                    page = await asyncio.wait_for(asyncio.to_thread(self._page, request, budget, history), timeout=budget)
                 except TimeoutError:
                     raise DiscordHistoryDeadline() from None
                 await self._wait_authorize(request, principal, deadline)
@@ -211,7 +215,14 @@ class ChannelMessageService:
             self._authorize_grants(request, principal, "wait")
             key = self._claim_wait(principal)
             await self._wait_authorize(request, principal, deadline)
-            return await self._wait_loop(request, principal, deadline)
+            budget = deadline - self._clock()
+            if budget <= 0:
+                raise DiscordHistoryDeadline()
+            try:
+                history = await asyncio.wait_for(asyncio.to_thread(self._history, principal), timeout=budget)
+            except TimeoutError:
+                raise DiscordHistoryDeadline() from None
+            return await self._wait_loop(request, principal, deadline, history)
         except DiscordHistoryError as exc:
             return _failure(exc)
         finally:

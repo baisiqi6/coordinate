@@ -22,6 +22,7 @@ class AgentEntry:
     display_name: str
     discord_user_id: str
     agent_type: str  # "managed" or "external"
+    enabled: bool = True
 
 
 @dataclass(frozen=True)
@@ -152,6 +153,11 @@ def _process_entry(
         return
     seen_ids[agent_id] = agent_type
 
+    enabled = raw.get("enabled", True)
+    if type(enabled) is not bool:
+        errors.append(f"{agent_type} entry has invalid enabled value")
+        return
+
     display_name = str(raw.get("display_name", agent_id)).strip() or agent_id
     discord_user_id = raw.get("discord_user_id")
 
@@ -178,4 +184,5 @@ def _process_entry(
         display_name=display_name,
         discord_user_id=discord_user_id_str,
         agent_type=agent_type,
+        enabled=enabled,
     ))

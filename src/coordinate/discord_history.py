@@ -52,9 +52,10 @@ def _unavailable() -> DiscordHistoryError:
 
 
 class DiscordHistory:
-    def __init__(self, token: str, *, request_json: Callable | None = None, clock: Callable = time.monotonic):
+    def __init__(self, token: str, *, request_json: Callable | None = None, clock: Callable = time.monotonic, expected_bot_id: str | None = None):
         if not isinstance(token, str) or not token:
             raise DiscordHistoryError("upstream_unavailable", "Discord reader is not configured.")
+        self._expected_bot_id = expected_bot_id
         self._token = token
         self._request_json = request_json or self._http_get
         self._clock = clock
@@ -106,6 +107,17 @@ class DiscordHistory:
         return self._clock() + timeout
 
     def _capabilities(self, channel_id: str, deadline: float, required: int) -> dict:
+        me = None
+        if self._expected_bot_id is not None:
+            from .channel_identity import sender_error
+            try:
+                me = self._get("/users/@me", deadline, dict)
+            except DiscordHistoryDeadline:
+                raise
+            except DiscordHistoryError:
+                raise sender_error("sender_unavailable") from None
+            if me.get("id") != self._expected_bot_id or me.get("bot") is not True:
+                raise sender_error("sender_identity_mismatch")
         channel = self._get(f"/channels/{_snowflake(channel_id)}", deadline, dict)
         if channel.get("id") != channel_id:
             raise _unavailable()
@@ -113,7 +125,8 @@ class DiscordHistory:
             raise DiscordHistoryError("unsupported_channel_type", "Only ordinary guild text channels are supported.")
         try:
             guild_id = _snowflake(channel["guild_id"])
-            me = self._get("/users/@me", deadline, dict)
+            if me is None:
+                me = self._get("/users/@me", deadline, dict)
             bot_id = _snowflake(me["id"])
             guild = self._get(f"/guilds/{guild_id}", deadline, dict)
             member = self._get(f"/guilds/{guild_id}/members/{bot_id}", deadline, dict)

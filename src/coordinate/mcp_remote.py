@@ -154,6 +154,8 @@ class McpPrincipal:
     platforms: frozenset[str] = field(default_factory=frozenset)
     tools: frozenset[str] = field(default_factory=frozenset)
 
+    channel_agent_id: str | None = None
+
     @property
     def actor(self) -> str:
         """Fixed derived actor; callers can never override it."""
@@ -248,6 +250,7 @@ def load_mcp_auth_policy(path: str) -> McpAuthPolicy:
                 {
                     "client_id",
                     "token_sha256",
+                    "channel_agent_id",
                     "workspace_ids",
                     "platforms",
                     "tools",
@@ -291,12 +294,17 @@ def load_mcp_auth_policy(path: str) -> McpAuthPolicy:
                 f"client {client_id!r} grants unknown tool(s): "
                 f"{sorted(unknown_tools)[0]}"
             )
+        from .channel_identity import valid_agent_id
+        channel_agent_id = entry.get("channel_agent_id")
+        if channel_agent_id is not None and not valid_agent_id(channel_agent_id):
+            raise AuthPolicyError("channel_agent_id must be a normalized registry ID")
         parsed[digest] = McpPrincipal(
             client_id=client_id,
             token_sha256=digest,
             workspace_ids=workspace_ids,
             platforms=platforms,
             tools=tools,
+            channel_agent_id=channel_agent_id,
         )
     return McpAuthPolicy(clients=parsed)
 
